@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="HOP Phase 0 spike"
+        android:textStyle="bold"
+        android:textSize="18sp"
+        android:paddingBottom="8dp" />
+
+    <!--
+    Core flow: pick a post, then send it — on either phone, regardless of
+    which one ends up negotiated as WiFi Direct group owner. Just these two
+    taps is enough to see a post appear on the other phone; everything below
+    this is Phase 0 measurement tooling, not part of the core loop.
+    -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Send a post"
+        android:textStyle="bold"
+        android:paddingTop="8dp" />
+
+    <Button
+        android:id="@+id/btnPickMedia"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Pick Post" />
+
+    <Button
+        android:id="@+id/btnConnectTransfer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Send to Nearby Phone" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Diagnostics (Phase 0 measurements only — not needed to send a post)"
+        android:textStyle="bold"
+        android:paddingTop="16dp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnAdvertise"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="BLE Advertise" />
+
+        <Button
+            android:id="@+id/btnScan"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="BLE Scan" />
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btnDiscoverWifi"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="WiFi Direct Discover (populates the density test below)" />
+
+    <Button
+        android:id="@+id/btnDensityRotationTest"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Density Rotation Test" />
+
+    <Button
+        android:id="@+id/btnLoopbackTest"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Loopback Test (1 Phone, No WiFi Direct)" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="12dp">
+
+        <TextView
+            android:id="@+id/logView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </ScrollView>
+</LinearLayout>

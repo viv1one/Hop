@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider paths for the Phase 0 end-to-end upload -> transfer -> view spike.
+
+    Scoped narrowly to one cacheDir subdirectory — never a persistent gallery
+    location, per BUILD_PLAN.md Phase 0's "no persistence" scope:
+      - received-clips/ posts decoded off an inbound WiFi Direct Frame, written
+                         here so the system photo/video viewer can be granted
+                         read access to view them (see
+                         WifiDirectSpike.receivePayload).
+
+    The outbound/picked side needs no entry here: the Android Photo Picker
+    grants this app temporary read access to the picked content:// URI
+    directly, so posting no longer needs a FileProvider-backed cache file
+    (v1 posting is upload-from-device-media only — PRD §4.1, §8 — there is no
+    in-app camera writing a file here anymore).
+
+    Do not widen this to a broader cache-path or external-files-path without
+    re-checking the "no persistence" constraint above.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="received_clips" path="received-clips/" />
+</paths>
