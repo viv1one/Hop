@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.hop.crypto.AttestationProviderTest" tests="2" skipped="0" failures="0" errors="0" timestamp="2026-08-18T15:21:28.105Z" hostname="Vivone.local" time="0.031">
+  <properties/>
+  <testcase name="stub provider is not a source of Sybil resistance by itself()" classname="com.hop.crypto.AttestationProviderTest" time="0.019"/>
+  <testcase name="stub provider always passes()" classname="com.hop.crypto.AttestationProviderTest" time="0.008"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

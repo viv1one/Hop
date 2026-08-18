@@ -9,6 +9,12 @@ plugins {
 // included as a subproject of that build — do not add a repositories{} block here.
 
 dependencies {
+    // EncryptedFrameCodec depends on crypto/'s ContentEncryption and DecayKeyStore
+    // to encrypt/decrypt payloads before they hit the wire (ADR 0001: protocol/
+    // depends on crypto/, never the reverse). Frame.kt itself stays free of this
+    // dependency — it's a pure wire envelope over opaque bytes.
+    implementation(project(":crypto"))
+
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     // kotlin.test assertion helpers (assertEquals/assertFailsWith/etc.), wired to

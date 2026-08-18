@@ -15,6 +15,7 @@ import java.io.File
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
@@ -94,6 +95,27 @@ class WifiDirectSpike(
     private var pollingGroupMembership = false
 
     /**
+     * Identifies the group formation [onConnected] last actually acted on
+     * (started a server/client for), as `"$isGroupOwner:$groupOwnerAddress"`.
+     * WIFI_P2P_CONNECTION_CHANGED_ACTION can fire more than once for the same
+     * real connection (observed on real hardware: group-owner side received
+     * two groupFormed=true events for one client joining) — without this
+     * guard, [onConnected] called [runServer] twice for the same group,
+     * and the second bind to [TRANSFER_PORT] failed with EADDRINUSE.
+     */
+    @Volatile
+    private var activeGroupKey: String? = null
+
+    /**
+     * The group owner's listening socket, held here (rather than only as a
+     * local val in [runServer]) so [stopServer] can close it from another
+     * thread to unblock a pending [ServerSocket.accept] call and end the
+     * accept loop — the only way to interrupt a blocking accept() in Java.
+     */
+    @Volatile
+    private var activeServerSocket: ServerSocket? = null
+
+    /**
      * Queues [bytes] (a real post picked from the device media library) with its
      * real SHA-256 [clipHash] and its [contentType] to be sent on the next
      * [sendPayload] call, instead of the default random test payload. Cleared
@@ -118,6 +140,54 @@ class WifiDirectSpike(
         })
     }
 
+    @Volatile
+    private var continuousDiscoveryActive = false
+
+    /**
+     * Design answer to the bilateral-rediscovery problem found during real-
+     * hardware testing: after any WiFi Direct teardown, a peer only reappears
+     * in this device's scan cache once a fresh discoverPeers() cycle runs —
+     * and Android's own discovery window only lasts on the order of ~12s
+     * before it needs reissuing. Two phones each tapping "Discover" once,
+     * seconds apart, routinely missed each other's overlap window entirely.
+     *
+     * One side alone can't fix this — WiFi Direct discovery requires the
+     * other device to be actively discoverable too, and nothing on this
+     * device can make that happen remotely. What this device CAN control is
+     * its own half: stay in a discovering state continuously instead of a
+     * single burst, for as long as the app is in the foreground, so whenever
+     * the *other* phone's own discovery window is open, this one is too. That
+     * matches the product's existing posture (BUILD_PLAN.md's Phase 3 iOS
+     * note: "open the app to see what's nearby," not ambient background
+     * scanning) rather than inventing new always-on background behavior.
+     *
+     * A real fix that doesn't depend on both users tapping a button at
+     * compatible moments would use BLE (already continuous/low-power here)
+     * as a presence layer that triggers WiFi Direct discovery on both sides
+     * once mutual BLE visibility is confirmed — that's real protocol design
+     * work for Phase 1/2, not something to build into throwaway Phase 0 spike
+     * code (per hop-dev's "build in phase order"). This is the Phase-0-scoped
+     * mitigation: maximize overlap odds, don't solve the protocol problem.
+     */
+    @SuppressLint("MissingPermission")
+    fun startContinuousDiscovery(intervalMs: Long = 10_000) {
+        if (continuousDiscoveryActive) return
+        continuousDiscoveryActive = true
+        onLog("Continuous WiFi Direct discovery started (every ${intervalMs}ms) — leave both phones' apps open")
+        Thread {
+            while (continuousDiscoveryActive) {
+                discoverPeers()
+                Thread.sleep(intervalMs)
+            }
+        }.start()
+    }
+
+    fun stopContinuousDiscovery() {
+        if (!continuousDiscoveryActive) return
+        continuousDiscoveryActive = false
+        onLog("Continuous WiFi Direct discovery stopped")
+    }
+
     @SuppressLint("MissingPermission")
     fun connectTo(device: WifiP2pDevice) {
         val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
@@ -135,17 +205,29 @@ class WifiDirectSpike(
     /**
      * Call from the WIFI_P2P_CONNECTION_CHANGED_ACTION receiver on every
      * connection-changed event (group formed, torn down, or otherwise
-     * changed). Offers [info] to [connectionEvents] unconditionally so a
-     * background poller (density rotation test) can observe it, then
-     * preserves the original single-peer "Connect + Transfer" behavior below
-     * unchanged.
+     * changed). Offers [info] to [connectionEvents] unconditionally — every
+     * raw event, including redundant ones — so a background poller (density
+     * rotation test) can observe every state change, then acts on the
+     * group-formed case below only once per actual group, guarded by
+     * [activeGroupKey].
      */
     fun onConnected(info: WifiP2pInfo) {
         connectionEvents.offer(info)
         if (!info.groupFormed) {
+            activeGroupKey = null
             stopGroupMembershipPolling()
+            stopServer()
             return
         }
+        val groupKey = "${info.isGroupOwner}:${info.groupOwnerAddress?.hostAddress}"
+        if (groupKey == activeGroupKey) {
+            // Same group formation already being handled — WIFI_P2P_CONNECTION_
+            // CHANGED_ACTION can fire more than once for one real connection.
+            // Acting on it again would double-bind the transfer port (owner
+            // side) or open a second redundant client socket.
+            return
+        }
+        activeGroupKey = groupKey
         if (info.isGroupOwner) {
             runServer()
             // This device is group owner — start tracking how many clients
@@ -207,13 +289,44 @@ class WifiDirectSpike(
         }
         Thread {
             onLog("Density rotation test starting: ${peers.size} peer(s), ${perPeerTimeoutMs}ms timeout each")
+            // Ensure a clean slate before the first attempt. If this device is
+            // already in a group (e.g. left over from an earlier manual "Send
+            // to Nearby Phone" test), connecting to that same peer again won't
+            // produce a fresh WIFI_P2P_CONNECTION_CHANGED_ACTION — nothing
+            // actually changes — so the poll() below would time out on a peer
+            // that's genuinely reachable. Observed on real hardware: the first
+            // peer in the list was already connected, and the test reported a
+            // false "FAILED or timed out" for it.
+            onLog("Density rotation test: clearing any existing group first")
+            teardownGroup()
+            connectionEvents.clear()
             val results = mutableListOf<DensityRotationResult>()
             for ((index, device) in peers.withIndex()) {
                 connectionEvents.clear() // drop any stale event from a prior iteration
                 val label = "[${index + 1}/${peers.size}] ${device.deviceName} ${device.deviceAddress}"
+
+                // Re-discover rather than reusing the WifiP2pDevice snapshot passed
+                // into this call. Observed on real hardware: right after a
+                // teardownGroup(), the peer this device just disconnected from
+                // drops out of the P2P framework's own scan cache ("WiFi Direct
+                // peers found: 0") until a fresh discoverPeers() cycle repopulates
+                // it — connecting with the stale object then fails immediately
+                // with a generic error (reason 0), not a timeout. This also makes
+                // each loop iteration a more honest measurement of real rotation
+                // cost: a real multi-peer rotation would need to re-discover
+                // between peers too, not reuse a scan from minutes earlier.
+                onLog("Density rotation $label: refreshing peer list")
+                val freshPeers = discoverPeersBlocking()
+                val freshDevice = freshPeers.find { it.deviceAddress == device.deviceAddress }
+                if (freshDevice == null) {
+                    onLog("Density rotation $label: not visible in a fresh scan — skipping")
+                    results += DensityRotationResult(device, success = false, connectSetupMs = 0)
+                    continue
+                }
+
                 onLog("Density rotation $label: connecting")
                 val startedAtMs = System.currentTimeMillis()
-                connectTo(device)
+                connectTo(freshDevice)
                 val info = try {
                     connectionEvents.poll(perPeerTimeoutMs, TimeUnit.MILLISECONDS)
                 } catch (e: InterruptedException) {
@@ -230,6 +343,33 @@ class WifiDirectSpike(
             }
             logDensityRotationSummary(results)
         }.start()
+    }
+
+    /**
+     * Kicks off a fresh WiFi Direct scan and blocks (on the caller's thread —
+     * always called from the rotation test's own background thread, never the
+     * main thread) for [scanWindowMs] to let it populate, then returns the
+     * P2P framework's current peer list. Real scans are asynchronous with no
+     * single "done" signal short of a WIFI_P2P_PEERS_CHANGED_ACTION broadcast,
+     * which this class doesn't receive directly (MainActivity's receiver
+     * does) — a fixed wait window is simpler and adequate for spike code.
+     */
+    @SuppressLint("MissingPermission")
+    private fun discoverPeersBlocking(scanWindowMs: Long = 12_000): List<WifiP2pDevice> {
+        manager.discoverPeers(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {}
+            override fun onFailure(reason: Int) =
+                onLog("Density rotation: peer re-discovery failed to start: reason $reason")
+        })
+        Thread.sleep(scanWindowMs)
+        val latch = CountDownLatch(1)
+        var result: List<WifiP2pDevice> = emptyList()
+        manager.requestPeers(channel) { list ->
+            result = list.deviceList.toList()
+            latch.countDown()
+        }
+        latch.await(3, TimeUnit.SECONDS)
+        return result
     }
 
     /**
@@ -358,18 +498,54 @@ class WifiDirectSpike(
         }.start()
     }
 
+    /**
+     * Accepts and serves every client that joins this device's WiFi Direct
+     * group, not just the first. The original version called `server.accept()`
+     * once and let the `.use {}` block close the socket right after — fine for
+     * a single pair of phones, but it meant a 3rd, 4th, ... phone joining the
+     * same group (the group-owner fan-in case [startGroupMembershipPolling]
+     * measures) would show up in the membership poll yet never actually
+     * receive anything, since nothing was listening for their connection
+     * anymore. Looping accept() and handing each socket to [handleConnection]
+     * on its own threads fixes that — each client gets its own send/receive
+     * pair, all reading the same [pendingClip]/synthetic-fallback state.
+     */
     private fun runServer() {
+        if (activeServerSocket != null) return
         Thread {
             try {
-                ServerSocket(TRANSFER_PORT).use { server ->
-                    onLog("Transfer server listening on port $TRANSFER_PORT")
-                    val socket: Socket = server.accept()
+                val server = ServerSocket(TRANSFER_PORT)
+                activeServerSocket = server
+                onLog("Transfer server listening on port $TRANSFER_PORT")
+                while (true) {
+                    val socket = try {
+                        server.accept()
+                    } catch (e: SocketException) {
+                        // Expected: stopServer() closes the socket to unblock accept()
+                        // once this device's group is torn down. Not an error.
+                        break
+                    }
+                    onLog("Transfer server: accepted a client (${socket.inetAddress?.hostAddress})")
                     handleConnection(socket)
                 }
             } catch (e: Exception) {
                 onLog("Server error: ${e.message}")
+            } finally {
+                activeServerSocket = null
+                onLog("Transfer server stopped")
             }
         }.start()
+    }
+
+    /** Closes the listening socket (if any) to unblock [runServer]'s accept() loop and end it. */
+    private fun stopServer() {
+        activeServerSocket?.let {
+            try {
+                it.close()
+            } catch (e: Exception) {
+                onLog("Error closing transfer server: ${e.message}")
+            }
+        }
     }
 
     private fun runClient(hostAddress: String) {
@@ -422,6 +598,15 @@ class WifiDirectSpike(
             ttlSeconds = SPIKE_TTL_SECONDS,
             reachTier = ReachTier.LOCALITY,
             dontRelay = false,
+            // Mechanical update for the version-2 wire format's new required fields
+            // (see /protocol/WIRE_FORMAT.md). This spike still sends `payload`
+            // unencrypted, same as before the v2 bump -- it does not adopt
+            // EncryptedFrameCodec, since wiring real content encryption into this
+            // throwaway harness is UI/feature work out of scope here (it "gets
+            // replaced, not incrementally reskinned"). `keyIncluded = false` with a
+            // zeroed key accurately reflects that: this frame carries no real CEK.
+            keyIncluded = false,
+            contentEncryptionKey = ByteArray(Frame.CONTENT_ENCRYPTION_KEY_SIZE),
             payload = payload,
         )
         val encoded = frame.encode()

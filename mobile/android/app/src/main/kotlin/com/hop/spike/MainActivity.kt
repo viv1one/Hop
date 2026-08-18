@@ -9,6 +9,7 @@ import android.net.Uri
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pDeviceList
 import android.net.wifi.p2p.WifiP2pInfo
+import android.media.MediaMetadataRetriever
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +19,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import com.hop.app.R
 import com.hop.protocol.ContentType
 import java.io.File
 import java.security.MessageDigest
@@ -52,6 +54,11 @@ class MainActivity : AppCompatActivity() {
      */
     @Volatile
     private var autoConnectPending = false
+
+    /** Tracks button state only — [WifiDirectSpike] owns the actual on/off state. */
+    private var continuousDiscoveryOn = false
+    private lateinit var discoverWifiButton: Button
+    private lateinit var discoverWifiButtonDefaultLabel: CharSequence
 
     private val fileProviderAuthority: String
         get() = "$packageName.fileprovider"
@@ -109,6 +116,7 @@ class MainActivity : AppCompatActivity() {
                         val peer = lastDiscoveredPeer
                         if (autoConnectPending && peer != null) {
                             autoConnectPending = false
+                            setContinuousDiscovery(false)
                             log("Auto-connecting to ${peer.deviceName} now that a peer was found")
                             wifiDirectSpike.connectTo(peer)
                         }
@@ -150,15 +158,18 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnScan).setOnClickListener {
             bleSpike.startScan()
         }
-        findViewById<Button>(R.id.btnDiscoverWifi).setOnClickListener {
-            wifiDirectSpike.discoverPeers()
-        }
+        discoverWifiButton = findViewById(R.id.btnDiscoverWifi)
+        discoverWifiButtonDefaultLabel = discoverWifiButton.text
+        discoverWifiButton.setOnClickListener { setContinuousDiscovery(!continuousDiscoveryOn) }
         findViewById<Button>(R.id.btnConnectTransfer).setOnClickListener {
             val peer = lastDiscoveredPeer
             if (peer == null) {
-                log("No peer discovered yet — discovering now, will connect automatically once one's found")
+                log(
+                    "No peer discovered yet — starting continuous discovery, will connect " +
+                        "automatically once a peer's found (leave the other phone's app open too)"
+                )
                 autoConnectPending = true
-                wifiDirectSpike.discoverPeers()
+                setContinuousDiscovery(true)
             } else {
                 wifiDirectSpike.connectTo(peer)
             }
@@ -178,6 +189,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Single place that flips [continuousDiscoveryOn], the button label, and
+     * the actual [WifiDirectSpike] state together, so "Send to Nearby Phone"'s
+     * auto-connect path and the manual "WiFi Direct Discover" toggle button
+     * can't disagree about whether discovery is currently running.
+     */
+    private fun setContinuousDiscovery(on: Boolean) {
+        continuousDiscoveryOn = on
+        if (on) {
+            wifiDirectSpike.startContinuousDiscovery()
+            discoverWifiButton.text = "WiFi Direct Discover: ON (tap to stop)"
+        } else {
+            wifiDirectSpike.stopContinuousDiscovery()
+            discoverWifiButton.text = discoverWifiButtonDefaultLabel
+        }
+    }
+
+    /**
      * Reads the picked media's mime type to determine its [ContentType]
      * (an "image" mime type maps to PHOTO, "video" maps to VIDEO), reads its
      * bytes, hashes them, and queues it for the next WiFi Direct send. Aborts
@@ -192,6 +220,37 @@ class MainActivity : AppCompatActivity() {
             mimeType?.startsWith("video/") == true -> ContentType.VIDEO
             else -> {
                 log("Picked media has unrecognized mime type '$mimeType' — aborting")
+                return
+            }
+        }
+
+        // BUILD_PLAN.md open decision #3 (settled via real-device spike): real
+        // phone camera output runs ~20-22 Mbps native (H.264 or HEVC, varies by
+        // device — v1 has no in-app camera, so HOP never controls the source
+        // encode). At that bitrate, PRD §4.1's nominal 60s target would produce
+        // a ~150-165MB file, missing the §7 "low single-digit seconds" transfer
+        // NFR at this repo's own measured real WiFi Direct throughput. A ~15s
+        // clip stays inside the NFR, so v1 enforces that cap at pick time
+        // instead of transcoding (no encode step to bound at capture without an
+        // in-app camera, and re-encoding an already-compressed clip is real
+        // complexity worth deferring past v1).
+        if (contentType == ContentType.VIDEO) {
+            val retriever = MediaMetadataRetriever()
+            val durationMs = try {
+                retriever.setDataSource(this, uri)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+            } finally {
+                retriever.release()
+            }
+            if (durationMs == null) {
+                log("Could not read picked video's duration — aborting rather than guessing")
+                return
+            }
+            if (durationMs > MAX_VIDEO_DURATION_MS) {
+                log(
+                    "Picked video is ${durationMs / 1000}s, longer than the " +
+                        "${MAX_VIDEO_DURATION_MS / 1000}s cap (BUILD_PLAN.md decision #3) — pick a shorter clip"
+                )
                 return
             }
         }
@@ -257,5 +316,11 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             logView.append("$message\n")
         }
+    }
+
+    private companion object {
+        // Settled by real-device measurement — see the comment in onMediaPicked
+        // and BUILD_PLAN.md open decision #3.
+        const val MAX_VIDEO_DURATION_MS = 15_000L
     }
 }

@@ -48,16 +48,25 @@ enum class ContentType(val wireValue: Int) {
 }
 
 /**
- * Reference implementation of the HOP wire frame, version 1.
+ * Reference implementation of the HOP wire frame, version 2.
  *
  * See /protocol/WIRE_FORMAT.md for the authoritative spec: byte layout,
  * field semantics, and the BLE-is-discovery-only / this-frame-is-the-WiFi-
- * Direct-transfer-frame distinction. This class implements version 1 only —
+ * Direct-transfer-frame distinction. This class implements version 2 only —
  * a future version bump is a new format, not a silent field change here.
  *
- * Note: [clipHash], [senderDeviceId], and [payload] are [ByteArray]s, so
- * this class overrides [equals]/[hashCode] to compare array *contents*
- * rather than Kotlin's default reference-equality behavior for arrays.
+ * [Frame] is a pure wire envelope: it encodes/decodes raw bytes and has no
+ * dependency on `crypto/`. It does not itself encrypt or decrypt anything —
+ * [payload] is opaque ciphertext as far as this class is concerned, and
+ * [contentEncryptionKey] is opaque key bytes. The encrypt/decrypt
+ * orchestration that produces those bytes lives in `EncryptedFrameCodec`
+ * (which does depend on `crypto/`, per ADR 0001's one-way rule) — see
+ * /protocol/WIRE_FORMAT.md.
+ *
+ * Note: [clipHash], [senderDeviceId], [contentEncryptionKey], and [payload]
+ * are [ByteArray]s, so this class overrides [equals]/[hashCode] to compare
+ * array *contents* rather than Kotlin's default reference-equality behavior
+ * for arrays.
  */
 class Frame(
     val version: Int = CURRENT_VERSION,
@@ -69,6 +78,8 @@ class Frame(
     val ttlSeconds: Long,
     val reachTier: ReachTier,
     val dontRelay: Boolean,
+    val keyIncluded: Boolean,
+    val contentEncryptionKey: ByteArray,
     val payload: ByteArray,
 ) {
     init {
@@ -81,6 +92,9 @@ class Frame(
         require(hopCount in 0..0xFF) { "hopCount must fit in a uint8 (0..255), was $hopCount" }
         require(ttlSeconds in 0..0xFFFFFFFFL) {
             "ttlSeconds must fit in a uint32 (0..${0xFFFFFFFFL}), was $ttlSeconds"
+        }
+        require(contentEncryptionKey.size == CONTENT_ENCRYPTION_KEY_SIZE) {
+            "contentEncryptionKey must be $CONTENT_ENCRYPTION_KEY_SIZE bytes, was ${contentEncryptionKey.size}"
         }
         require(payload.size.toLong() <= 0xFFFFFFFFL) {
             "payload length must fit in a uint32, was ${payload.size}"
@@ -100,6 +114,13 @@ class Frame(
         buffer.putInt(ttlSeconds.toInt())
         buffer.put(reachTier.wireValue.toByte())
         buffer.put(if (dontRelay) 1.toByte() else 0.toByte())
+        buffer.put(if (keyIncluded) 1.toByte() else 0.toByte())
+        // contentEncryptionKey is only meaningful when keyIncluded — zero-fill on
+        // the wire otherwise rather than leaking whatever bytes the caller passed
+        // (fixed-size reservation is a deliberate simplicity tradeoff, see
+        // /protocol/WIRE_FORMAT.md; it's not an invitation to carry stale key
+        // material in an unused field).
+        buffer.put(if (keyIncluded) contentEncryptionKey else ByteArray(CONTENT_ENCRYPTION_KEY_SIZE))
         buffer.putInt(payload.size)
         buffer.put(payload)
         return buffer.array()
@@ -117,6 +138,8 @@ class Frame(
             ttlSeconds == other.ttlSeconds &&
             reachTier == other.reachTier &&
             dontRelay == other.dontRelay &&
+            keyIncluded == other.keyIncluded &&
+            contentEncryptionKey.contentEquals(other.contentEncryptionKey) &&
             payload.contentEquals(other.payload)
     }
 
@@ -130,6 +153,8 @@ class Frame(
         result = 31 * result + ttlSeconds.hashCode()
         result = 31 * result + reachTier.hashCode()
         result = 31 * result + dontRelay.hashCode()
+        result = 31 * result + keyIncluded.hashCode()
+        result = 31 * result + contentEncryptionKey.contentHashCode()
         result = 31 * result + payload.contentHashCode()
         return result
     }
@@ -137,29 +162,31 @@ class Frame(
     override fun toString(): String =
         "Frame(version=$version, clipHash=${clipHash.size}b, senderDeviceId=${senderDeviceId.size}b, " +
             "contentType=$contentType, hopCount=$hopCount, originatedAtMs=$originatedAtMs, ttlSeconds=$ttlSeconds, " +
-            "reachTier=$reachTier, dontRelay=$dontRelay, payload=${payload.size}b)"
+            "reachTier=$reachTier, dontRelay=$dontRelay, keyIncluded=$keyIncluded, " +
+            "contentEncryptionKey=${contentEncryptionKey.size}b, payload=${payload.size}b)"
 
     companion object {
         /** Current wire format version implemented by this reference implementation. */
-        const val CURRENT_VERSION: Int = 1
+        const val CURRENT_VERSION: Int = 2
 
         const val CLIP_HASH_SIZE: Int = 32
         const val SENDER_DEVICE_ID_SIZE: Int = 16
+        const val CONTENT_ENCRYPTION_KEY_SIZE: Int = 32
 
         /** Fixed header size in bytes: everything before the variable-length payload. */
         const val HEADER_SIZE: Int =
-            1 + CLIP_HASH_SIZE + SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1 + 4 // = 69
+            1 + CLIP_HASH_SIZE + SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1 + 1 + CONTENT_ENCRYPTION_KEY_SIZE + 4 // = 102
 
         /**
-         * Decodes [bytes] into a [Frame] per /protocol/WIRE_FORMAT.md version 1.
+         * Decodes [bytes] into a [Frame] per /protocol/WIRE_FORMAT.md version 2.
          *
          * Throws [FrameDecodeException] on:
          * - fewer than [HEADER_SIZE] bytes (truncated header),
          * - a `version` byte other than [CURRENT_VERSION] (unknown/future version —
          *   rejected rather than guessed at, since the byte layout for other
-         *   versions is not defined here; this includes version 0, which this
-         *   version-1 decoder no longer understands),
-         * - an invalid `contentType`, `reachTier`, or `dontRelay` value,
+         *   versions is not defined here; this includes versions 0 and 1, which
+         *   this version-2 decoder no longer understands),
+         * - an invalid `contentType`, `reachTier`, `dontRelay`, or `keyIncluded` value,
          * - a declared `payloadLength` longer than the bytes actually available
          *   (truncated payload).
          */
@@ -196,6 +223,17 @@ class Frame(
                 )
             }
 
+            val keyIncludedByte = buffer.get().toInt() and 0xFF
+            val keyIncluded = when (keyIncludedByte) {
+                0 -> false
+                1 -> true
+                else -> throw FrameDecodeException(
+                    "Invalid keyIncluded byte: $keyIncludedByte (expected 0 or 1)"
+                )
+            }
+
+            val contentEncryptionKey = ByteArray(CONTENT_ENCRYPTION_KEY_SIZE).also { buffer.get(it) }
+
             val payloadLength = buffer.int.toLong() and 0xFFFFFFFFL
             val remaining = buffer.remaining().toLong()
             if (payloadLength > remaining) {
@@ -216,6 +254,8 @@ class Frame(
                 ttlSeconds = ttlSeconds,
                 reachTier = reachTier,
                 dontRelay = dontRelay,
+                keyIncluded = keyIncluded,
+                contentEncryptionKey = contentEncryptionKey,
                 payload = payload,
             )
         }

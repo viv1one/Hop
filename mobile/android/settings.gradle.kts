@@ -18,3 +18,5 @@ rootProject.name = "hop-spike"
 include(":app")
 include(":protocol")
 project(":protocol").projectDir = File(rootDir, "../../protocol")
+include(":crypto")
+project(":crypto").projectDir = File(rootDir, "../../crypto")

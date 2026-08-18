@@ -1,20 +1,31 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
 }
 
 android {
-    namespace = "com.hop.spike"
+    // Renamed from com.hop.spike -> com.hop.app: this is the app-level manifest
+    // identity (namespace/applicationId), not the Phase 0 spike code's Kotlin
+    // source package -- com.hop.spike.* (WifiDirectSpike/BleDiscoverySpike/
+    // MainActivity) is untouched and stays under its existing package until it
+    // is ported (not edited) and deleted in a later slice. Confirmed decision,
+    // see docs/adr and the Stage 1 plan this task was scoped against: free to
+    // rename now, real migration cost once a pilot build ships.
+    namespace = "com.hop.app"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.hop.spike"
+        applicationId = "com.hop.app"
         // BLE requires 18+; WifiP2pManager requires 14+. Target modern devices only —
         // this spike isn't shipping, so no reason to carry old-API compat code.
         minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "0.0.1-spike"
+        // Was unset before this module had instrumented tests (com.hop.data's Room
+        // DAO tests) -- JVM-unit-test-only until now.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -30,6 +41,28 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // org.signal:libsignal-client:0.86.5 (consumed transitively via :crypto)
+        // ships classes compiled with Kotlin 2.1 metadata, which this repo's
+        // centrally-pinned Kotlin 1.9.24 compiler can't read without this flag.
+        // See crypto/build.gradle.kts for the full note — this is a real
+        // version-compatibility finding that needs an explicit owner decision
+        // (accept this flag long-term vs. bump the central Kotlin plugin
+        // version), not a silent workaround.
+        freeCompilerArgs += listOf("-Xskip-metadata-version-check")
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    composeOptions {
+        // Confirmed via web search as the correct Compose Compiler pairing for
+        // this repo's centrally-pinned Kotlin 1.9.24 (mobile/android/build.gradle.kts)
+        // -- the newer unified org.jetbrains.kotlin.plugin.compose Gradle plugin
+        // needs Kotlin 2.0+ and isn't used here, consistent with the project's
+        // prior explicit choice not to bump Kotlin repo-wide (see the
+        // -Xskip-metadata-version-check note above).
+        kotlinCompilerExtensionVersion = "1.5.14"
     }
 }
 
@@ -38,4 +71,47 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.activity:activity-ktx:1.9.1")
     implementation(project(":protocol"))
+    implementation(project(":crypto"))
+
+    // Room persistence layer (com.hop.data) -- pinned to 2.6.1, not the latest
+    // Room release: Room 2.8.x requires Kotlin 2.0+, which this repo's
+    // centrally-pinned Kotlin 1.9.24 (mobile/android/build.gradle.kts) doesn't
+    // satisfy. 2.6.1 is confirmed compatible with Kotlin 1.9.23/1.9.24 plus the
+    // KSP 1.9.24-1.0.20 build declared in the root build.gradle.kts -- do not
+    // bump either version independently of the other.
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
+
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.1")
+    // kotlin.test assertion helpers (assertEquals/assertContentEquals/etc.),
+    // matching the pattern already used in crypto/build.gradle.kts's test deps.
+    androidTestImplementation(kotlin("test"))
+
+    // Jetpack Compose -- app shell (HopNavHost, first-run, main placeholder).
+    // Media3 ExoPlayer (Feed screen video playback) is a later slice's concern,
+    // deliberately not added here -- keep this scoped to what this slice uses.
+    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
+
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.foundation:foundation")
+
+    implementation("androidx.activity:activity-compose:1.9.1")
+    implementation("androidx.navigation:navigation-compose:2.7.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.3")
+    implementation("androidx.lifecycle:lifecycle-process:2.8.3")
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    // Explicit (rather than relying on it arriving transitively via DataStore/
+    // lifecycle-*-compose) since app-layer code (SettingsRepository, view
+    // models) uses Flow/Mutex/coroutine builders directly. Matches the version
+    // already pinned in crypto/build.gradle.kts.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }

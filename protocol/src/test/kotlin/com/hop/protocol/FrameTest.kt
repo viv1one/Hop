@@ -18,6 +18,8 @@ class FrameTest {
         ttlSeconds: Long = 3600L,
         reachTier: ReachTier = ReachTier.LOCALITY,
         dontRelay: Boolean = false,
+        keyIncluded: Boolean = true,
+        contentEncryptionKey: ByteArray = randomBytes(Frame.CONTENT_ENCRYPTION_KEY_SIZE),
         payload: ByteArray = randomBytes(1024),
     ): Frame = Frame(
         clipHash = randomBytes(Frame.CLIP_HASH_SIZE),
@@ -28,6 +30,8 @@ class FrameTest {
         ttlSeconds = ttlSeconds,
         reachTier = reachTier,
         dontRelay = dontRelay,
+        keyIncluded = keyIncluded,
+        contentEncryptionKey = contentEncryptionKey,
         payload = payload,
     )
 
@@ -49,6 +53,8 @@ class FrameTest {
         assertEquals(original.ttlSeconds, decoded.ttlSeconds)
         assertEquals(original.reachTier, decoded.reachTier)
         assertEquals(original.dontRelay, decoded.dontRelay)
+        assertEquals(original.keyIncluded, decoded.keyIncluded)
+        assertTrue(original.contentEncryptionKey.contentEquals(decoded.contentEncryptionKey))
         assertTrue(original.payload.contentEquals(decoded.payload))
     }
 
@@ -77,6 +83,30 @@ class FrameTest {
             val decoded = Frame.decode(original.encode())
             assertEquals(flag, decoded.dontRelay)
         }
+    }
+
+    @Test
+    fun `round trip preserves keyIncluded true with the content encryption key`() {
+        val cek = randomBytes(Frame.CONTENT_ENCRYPTION_KEY_SIZE)
+        val original = sampleFrame(keyIncluded = true, contentEncryptionKey = cek)
+
+        val decoded = Frame.decode(original.encode())
+
+        assertEquals(true, decoded.keyIncluded)
+        assertTrue(cek.contentEquals(decoded.contentEncryptionKey))
+    }
+
+    @Test
+    fun `round trip preserves keyIncluded false and zero-fills the key on the wire`() {
+        // Per /protocol/WIRE_FORMAT.md, contentEncryptionKey is ignored/zero-filled
+        // on encode when keyIncluded is false, regardless of what the constructor
+        // was given -- this avoids leaking stale key material into an unused field.
+        val original = sampleFrame(keyIncluded = false, contentEncryptionKey = randomBytes(Frame.CONTENT_ENCRYPTION_KEY_SIZE))
+
+        val decoded = Frame.decode(original.encode())
+
+        assertEquals(false, decoded.keyIncluded)
+        assertTrue(ByteArray(Frame.CONTENT_ENCRYPTION_KEY_SIZE).contentEquals(decoded.contentEncryptionKey))
     }
 
     @Test
@@ -117,9 +147,10 @@ class FrameTest {
     fun `constructing a frame with a non-current version and decoding it round trips within this version`() {
         // Frame's constructor allows specifying `version` (e.g. for a future encoder
         // that speaks multiple versions), but this decoder only understands
-        // CURRENT_VERSION — anything else must be rejected on decode.
+        // CURRENT_VERSION — anything else must be rejected on decode. Uses version 3
+        // (a not-yet-defined future version) since 2 is CURRENT_VERSION now.
         val frame = Frame(
-            version = 2,
+            version = 3,
             clipHash = randomBytes(Frame.CLIP_HASH_SIZE),
             senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
             contentType = ContentType.VIDEO,
@@ -128,6 +159,8 @@ class FrameTest {
             ttlSeconds = 0L,
             reachTier = ReachTier.LOCALITY,
             dontRelay = false,
+            keyIncluded = false,
+            contentEncryptionKey = randomBytes(Frame.CONTENT_ENCRYPTION_KEY_SIZE),
             payload = ByteArray(0),
         )
 
@@ -191,6 +224,15 @@ class FrameTest {
         assertFailsWith<FrameDecodeException> { Frame.decode(bytes) }
     }
 
+    @Test
+    fun `decoding an invalid keyIncluded byte throws`() {
+        val bytes = sampleFrame().encode()
+        val keyIncludedOffset = 1 + Frame.CLIP_HASH_SIZE + Frame.SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1
+        bytes[keyIncludedOffset] = 7 // neither 0 nor 1
+
+        assertFailsWith<FrameDecodeException> { Frame.decode(bytes) }
+    }
+
     // --- Rejecting malformed field sizes at construction time ---
 
     @Test
@@ -206,6 +248,29 @@ class FrameTest {
                     ttlSeconds = it.ttlSeconds,
                     reachTier = it.reachTier,
                     dontRelay = it.dontRelay,
+                    keyIncluded = it.keyIncluded,
+                    contentEncryptionKey = it.contentEncryptionKey,
+                    payload = it.payload,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `constructing a frame with a wrong-sized contentEncryptionKey throws`() {
+        assertFailsWith<IllegalArgumentException> {
+            sampleFrame().let {
+                Frame(
+                    clipHash = it.clipHash,
+                    senderDeviceId = it.senderDeviceId,
+                    contentType = it.contentType,
+                    hopCount = it.hopCount,
+                    originatedAtMs = it.originatedAtMs,
+                    ttlSeconds = it.ttlSeconds,
+                    reachTier = it.reachTier,
+                    dontRelay = it.dontRelay,
+                    keyIncluded = it.keyIncluded,
+                    contentEncryptionKey = randomBytes(31),
                     payload = it.payload,
                 )
             }

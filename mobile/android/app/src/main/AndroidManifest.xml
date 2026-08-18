@@ -26,10 +26,18 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <application
+        android:name=".HopApplication"
         android:allowBackup="false"
-        android:label="HOP Spike"
-        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+        android:label="HOP"
+        android:theme="@style/Theme.Hop">
 
+        <!-- ".MainActivity" resolves against the namespace (com.hop.app, see
+             app/build.gradle.kts) to com.hop.app.MainActivity, the new
+             pure-Compose app shell (HopNavHost), not
+             com.hop.spike.MainActivity. The Phase 0 spike's MainActivity is
+             untouched but no longer wired as the launcher; it is ported (not
+             edited) into com.hop.transport in a later slice, per the plan
+             this task was scoped against. -->
         <activity
             android:name=".MainActivity"
             android:exported="true">

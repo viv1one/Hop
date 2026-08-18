@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Manifest/system theme for a pure-Compose app: no AppCompat, no
+         Compose-visible styling here (that's theme/Theme.kt's HopTheme). This
+         only covers the brief system-level window state before the first
+         Compose frame is drawn (splash/status-bar background). -->
+    <style name="Theme.Hop" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/hop_background</item>
+    </style>
+</resources>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Backing color for the system window theme (windowBackground, before
+         Compose content is set). The real color scheme used by Compose UI
+         lives in theme/Theme.kt, not here. Greenfield: no prior theme to
+         reconcile with, not final visual design. -->
+    <color name="hop_background">#FFFFFFFF</color>
+</resources>
