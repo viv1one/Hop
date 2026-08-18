@@ -114,4 +114,24 @@ dependencies {
     // models) uses Flow/Mutex/coroutine builders directly. Matches the version
     // already pinned in crypto/build.gradle.kts.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // Media3 ExoPlayer -- Feed screen video playback (com.hop.app.feed). No
+    // media3-ui-compose: not confirmed to exist/be compatible at this Compose
+    // Compiler/BOM pairing, so this uses the classic PlayerView wrapped in
+    // AndroidView { } instead -- the standard, guaranteed-available pattern.
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-ui:1.3.1")
+
+    // JVM (non-instrumented) unit tests -- this app module's first (FeedViewModel).
+    // JUnit4 + kotlin.test, matching the style already used in androidTest/ (not
+    // JUnit5, unlike protocol/crypto -- those are plain-Kotlin JVM modules with no
+    // androidx.test/AGP unit-test convention to match; this module's existing
+    // androidTest/ suite is already JUnit4-based, so JVM unit tests here follow
+    // the same convention rather than introducing a second test framework).
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("test"))
+    // Needed to bridge ViewModel's `viewModelScope` (Dispatchers.Main.immediate)
+    // onto a deterministic test dispatcher in a plain JVM unit test, where no
+    // real Android Main-thread Looper exists.
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

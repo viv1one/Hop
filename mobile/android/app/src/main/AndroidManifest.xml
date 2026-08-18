@@ -4,8 +4,16 @@
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.wifi.direct" android:required="true" />
 
-    <!-- BLE discovery -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <!-- BLE discovery. usesPermissionFlags="neverForLocation" (API 31+) declares that
+         this app's BLE scanning never derives physical location from scan results, so
+         it doesn't require an Android Location permission grant on its own (PRD §6) —
+         peer discovery needs presence, not location. Note this covers BLE scanning
+         only: WifiP2pManager.discoverPeers() below has its own separate,
+         platform-level Location-permission requirement on many Android versions
+         (see the WiFi Direct permission block's own comment) that this flag does not
+         remove — don't assume this alone makes the Location prompt disappear. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -21,7 +29,11 @@
 
     <!-- Pre-Android 13, BLE + WifiP2p peer discovery both require coarse/fine location.
          Both are declared together: Android 12+ lets the user grant only COARSE when
-         FINE is requested, so FINE must never be declared without COARSE alongside it. -->
+         FINE is requested, so FINE must never be declared without COARSE alongside it.
+         WifiP2pManager.discoverPeers() in particular has its own platform-level
+         Location requirement independent of BLE's neverForLocation flag above — this
+         is a real friction point for a privacy-positioned product, not fully solved by
+         this manifest alone. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 

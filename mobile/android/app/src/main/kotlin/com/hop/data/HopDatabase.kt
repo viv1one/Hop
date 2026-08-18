@@ -18,6 +18,14 @@ import androidx.room.RoomDatabase
  * fresh handshake after an app restart -- [MessageEntity] preserves message
  * *history* across a restart, but not the live ratchet session that produced
  * it. That's a substantial separate piece of work, deferred to a later slice.
+ *
+ * Version bumped 1 -> 2 for [BlockedSenderDeviceEntity]/[ReportedPostEntity]
+ * (Feed tab slice). No `Migration` is provided --
+ * `Room.databaseBuilder(...).fallbackToDestructiveMigration()` (see
+ * `AppContainer`) is the deliberate choice here, not an oversight: no real
+ * users/on-device data exist yet for this database (the singleton wiring
+ * that would ever have created a `hop.db` file didn't exist before this
+ * slice), so there's nothing a real migration would need to preserve.
  */
 @Database(
     entities = [
@@ -25,8 +33,10 @@ import androidx.room.RoomDatabase
         MessageEntity::class,
         BlockedIdentityEntity::class,
         DecayKeyEntity::class,
+        BlockedSenderDeviceEntity::class,
+        ReportedPostEntity::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {
@@ -34,4 +44,6 @@ abstract class HopDatabase : RoomDatabase() {
     abstract fun messageDao(): MessageDao
     abstract fun blockedIdentityDao(): BlockedIdentityDao
     abstract fun decayKeyDao(): DecayKeyDao
+    abstract fun blockedSenderDeviceDao(): BlockedSenderDeviceDao
+    abstract fun reportedPostDao(): ReportedPostDao
 }

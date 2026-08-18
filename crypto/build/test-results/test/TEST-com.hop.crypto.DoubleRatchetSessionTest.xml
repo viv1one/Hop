@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.hop.crypto.DoubleRatchetSessionTest" tests="9" skipped="0" failures="0" errors="0" timestamp="2026-08-18T15:21:28.165Z" hostname="Vivone.local" time="0.843">
+<testsuite name="com.hop.crypto.DoubleRatchetSessionTest" tests="9" skipped="0" failures="0" errors="0" timestamp="2026-08-18T17:59:05.588Z" hostname="Vivone.local" time="0.931">
   <properties/>
-  <testcase name="decrypting the same ciphertext twice fails the second time()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.663"/>
-  <testcase name="messages decrypt correctly when delivered out of order()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.003"/>
-  <testcase name="bob encrypts and alice decrypts after receiving bobs first message()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.003"/>
-  <testcase name="exceeding the skipped-message-key cap throws rather than silently losing the message()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.162"/>
+  <testcase name="decrypting the same ciphertext twice fails the second time()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.754"/>
+  <testcase name="messages decrypt correctly when delivered out of order()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.002"/>
+  <testcase name="bob encrypts and alice decrypts after receiving bobs first message()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.002"/>
+  <testcase name="exceeding the skipped-message-key cap throws rather than silently losing the message()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.161"/>
   <testcase name="alice encrypts and bob decrypts()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.001"/>
   <testcase name="a message key is erased after use, so a later state snapshot cannot decrypt it again()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.001"/>
   <testcase name="a dropped message does not prevent decrypting a later one()" classname="com.hop.crypto.DoubleRatchetSessionTest" time="0.001"/>
