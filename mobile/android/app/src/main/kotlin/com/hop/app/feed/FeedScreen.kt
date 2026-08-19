@@ -30,12 +30,18 @@ import com.hop.app.AppContainer
  * [onComposeClick] is a no-op placeholder wired from the empty-feed CTA, same
  * pattern as [com.hop.app.HopNavHost]'s existing `onNavigateToComposer`
  * placeholder -- the post composer doesn't exist until a later slice.
+ *
+ * [onMessageClick] backs each post's "Message" action (see
+ * [PostPagerItem]'s `BlockReportAffordance`) -- fired with the exact same
+ * `senderDeviceId` hex string already passed to [onBlock]/`onReport`, no
+ * separate identity concept for messaging.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun FeedScreen(
     container: AppContainer,
     onComposeClick: () -> Unit = {},
+    onMessageClick: (peerId: String) -> Unit = {},
 ) {
     val viewModel: FeedViewModel = viewModel(
         factory = viewModelFactory {
@@ -72,6 +78,7 @@ fun FeedScreen(
             decrypt = viewModel::decrypt,
             onBlock = { viewModel.blockSender(post.senderDeviceId) },
             onReport = { viewModel.reportPost(post.clipHash) },
+            onMessage = { onMessageClick(post.senderDeviceId) },
         )
     }
 }

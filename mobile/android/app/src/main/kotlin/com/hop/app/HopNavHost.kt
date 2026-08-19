@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -24,24 +23,33 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import com.hop.app.composer.PostComposerScreen
 import com.hop.app.feed.FeedScreen
 import com.hop.app.firstrun.FirstRunScreen
+import com.hop.app.inbox.ConversationDetailScreen
+import com.hop.app.inbox.ConversationListScreen
 
 private const val ROUTE_FIRST_RUN = "first_run"
 private const val ROUTE_MAIN = "main"
 private const val ROUTE_POST_COMPOSER = "post_composer"
+private const val ARG_PEER_ID = "peerId"
+private const val ROUTE_CONVERSATION_DETAIL = "conversation/{$ARG_PEER_ID}"
 
 /**
  * Outer navigation graph: `first_run` -> `main` -> `post_composer` (modal-style,
  * reachable from `main`'s Feed tab FAB/empty-state CTA, pops back to `main` on
- * successful post or cancel). Start destination is resolved by reading
- * [AppContainer.settingsRepository]'s `hasCompletedFirstRun` flag once, with a
- * brief loading state while that first read resolves (DataStore's first
- * emission isn't synchronous).
+ * successful post or cancel) / `conversation/{peerId}` (reachable from the
+ * Inbox tab's conversation list or a post's "Message" action, pops back to
+ * `main` on back press -- the same second-level-destination-off-`main`
+ * pattern as `post_composer`, not a separate nav mechanism). Start
+ * destination is resolved by reading [AppContainer.settingsRepository]'s
+ * `hasCompletedFirstRun` flag once, with a brief loading state while that
+ * first read resolves (DataStore's first emission isn't synchronous).
  */
 @Composable
 fun HopNavHost(
@@ -76,6 +84,7 @@ fun HopNavHost(
             MainScreen(
                 container = container,
                 onNavigateToComposer = { navController.navigate(ROUTE_POST_COMPOSER) },
+                onNavigateToConversation = { peerId -> navController.navigate("conversation/$peerId") },
             )
         }
         composable(ROUTE_POST_COMPOSER) {
@@ -83,6 +92,17 @@ fun HopNavHost(
                 container = container,
                 onPosted = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
+            )
+        }
+        composable(
+            route = ROUTE_CONVERSATION_DETAIL,
+            arguments = listOf(navArgument(ARG_PEER_ID) { type = NavType.StringType }),
+        ) { backStackEntry ->
+            val peerId = backStackEntry.arguments?.getString(ARG_PEER_ID).orEmpty()
+            ConversationDetailScreen(
+                container = container,
+                peerId = peerId,
+                onBack = { navController.popBackStack() },
             )
         }
     }
@@ -95,13 +115,20 @@ private fun NavHostController.navigateToMainClearingBackStack() {
 }
 
 /**
- * The real two-tab shell (PRD §5: full-screen feed + inbox). Feed now shows
- * real (decrypted-on-demand) content via [FeedScreen]; Inbox stays an inert
- * placeholder for the whole of Phase 1 (BUILD_PLAN.md -- Inbox/messaging
- * needs a persistent SignalProtocolStore that doesn't exist yet).
+ * The real two-tab shell (PRD §5: full-screen feed + inbox). Feed shows real
+ * (decrypted-on-demand) content via [FeedScreen]; Inbox now shows the real
+ * conversation list via [ConversationListScreen]. Conversation *detail* isn't
+ * a third tab-switch case here -- it's a top-level `NavHost` destination (see
+ * [HopNavHost]'s own doc), the same "second-level destination off `main`"
+ * shape [onNavigateToComposer] already uses, reused rather than nesting a
+ * second `NavHost` inside this tab switch.
  */
 @Composable
-private fun MainScreen(container: AppContainer, onNavigateToComposer: () -> Unit) {
+private fun MainScreen(
+    container: AppContainer,
+    onNavigateToComposer: () -> Unit,
+    onNavigateToConversation: (peerId: String) -> Unit,
+) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
     Scaffold(
@@ -140,8 +167,15 @@ private fun MainScreen(container: AppContainer, onNavigateToComposer: () -> Unit
             contentAlignment = Alignment.Center,
         ) {
             when (selectedTab) {
-                0 -> FeedScreen(container = container, onComposeClick = onNavigateToComposer)
-                else -> Text("Inbox — coming soon", style = MaterialTheme.typography.bodyLarge)
+                0 -> FeedScreen(
+                    container = container,
+                    onComposeClick = onNavigateToComposer,
+                    onMessageClick = onNavigateToConversation,
+                )
+                else -> ConversationListScreen(
+                    container = container,
+                    onConversationClick = onNavigateToConversation,
+                )
             }
         }
     }

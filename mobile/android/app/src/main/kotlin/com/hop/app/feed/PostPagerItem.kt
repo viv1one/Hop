@@ -46,9 +46,11 @@ import java.io.File
  * Renders a single [FeedScreen] page: on-demand decrypt of [post] (via
  * [decrypt], [FeedViewModel]'s cached wrapper around
  * `PostRepository.decrypt`), dispatched by [PostEntity.contentType] to a
- * photo/video/decayed renderer. The block/report affordance renders
+ * photo/video/decayed renderer. The block/report/message affordance renders
  * regardless of decrypt outcome -- sender metadata ([PostEntity.senderDeviceId])
- * is available even for a post that has decayed.
+ * is available even for a post that has decayed, and [onMessage] uses that
+ * same `senderDeviceId` as the Inbox conversation's `peerId` (see
+ * `com.hop.app.inbox`'s "one identity, reused everywhere" doc).
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -59,6 +61,7 @@ fun PostPagerItem(
     decrypt: suspend (PostEntity) -> PostRepository.DecryptResult,
     onBlock: () -> Unit,
     onReport: () -> Unit,
+    onMessage: () -> Unit = {},
 ) {
     var result by remember(post.clipHash) { mutableStateOf<PostRepository.DecryptResult?>(null) }
 
@@ -92,6 +95,7 @@ fun PostPagerItem(
             modifier = Modifier.align(Alignment.TopEnd).padding(16.dp),
             onBlock = onBlock,
             onReport = onReport,
+            onMessage = onMessage,
         )
     }
 }
@@ -168,7 +172,12 @@ private fun VideoPage(bytes: ByteArray, clipHash: String, pageIndex: Int, pagerS
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BlockReportAffordance(modifier: Modifier = Modifier, onBlock: () -> Unit, onReport: () -> Unit) {
+private fun BlockReportAffordance(
+    modifier: Modifier = Modifier,
+    onBlock: () -> Unit,
+    onReport: () -> Unit,
+    onMessage: () -> Unit,
+) {
     var sheetOpen by remember { mutableStateOf(false) }
 
     IconButton(onClick = { sheetOpen = true }, modifier = modifier) {
@@ -180,6 +189,15 @@ private fun BlockReportAffordance(modifier: Modifier = Modifier, onBlock: () -> 
             onDismissRequest = { sheetOpen = false },
             sheetState = rememberModalBottomSheetState(),
         ) {
+            TextButton(
+                onClick = {
+                    onMessage()
+                    sheetOpen = false
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Message")
+            }
             TextButton(
                 onClick = {
                     onBlock()
