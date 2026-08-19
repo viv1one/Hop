@@ -3,43 +3,49 @@ package com.hop.app.feed
 import android.net.Uri
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
+import com.hop.app.theme.HopSpacing
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import android.graphics.BitmapFactory
 import com.hop.data.PostEntity
 import com.hop.repository.PostRepository
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -78,13 +84,8 @@ fun PostPagerItem(
             null -> Unit
             is PostRepository.DecryptResult.Decayed -> DecayedPostPlaceholder()
             is PostRepository.DecryptResult.Decrypted -> when (post.contentType) {
-                "PHOTO" -> PhotoPage(bytes = current.bytes, pageIndex = pageIndex, pagerState = pagerState)
-                "VIDEO" -> VideoPage(
-                    bytes = current.bytes,
-                    clipHash = post.clipHash,
-                    pageIndex = pageIndex,
-                    pagerState = pagerState,
-                )
+                "PHOTO" -> PhotoPage(bytes = current.bytes)
+                "VIDEO" -> VideoPage(bytes = current.bytes, clipHash = post.clipHash)
                 // Defensive only -- PostEntity.contentType is always written from
                 // com.hop.protocol.ContentType.name, so this should never be hit.
                 else -> Unit
@@ -92,7 +93,7 @@ fun PostPagerItem(
         }
 
         BlockReportAffordance(
-            modifier = Modifier.align(Alignment.TopEnd).padding(16.dp),
+            modifier = Modifier.align(Alignment.TopEnd).padding(HopSpacing.md),
             onBlock = onBlock,
             onReport = onReport,
             onMessage = onMessage,
@@ -100,30 +101,26 @@ fun PostPagerItem(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoPage(bytes: ByteArray, pageIndex: Int, pagerState: PagerState) {
+private fun PhotoPage(bytes: ByteArray) {
     val bitmap = remember(bytes) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
 
+    // No auto-advance -- a photo stays on screen until the user swipes away,
+    // same as a video plays through and then simply holds on its last frame
+    // (see VideoPage below). Both used to force-advance to the next post on a
+    // timer/on playback end; removed as an unwanted-feeling interruption
+    // found via real device use, not a deliberate Reels-style design choice
+    // this app ever committed to.
     Image(
         bitmap = bitmap.asImageBitmap(),
         contentDescription = null,
         modifier = Modifier.fillMaxSize(),
     )
-
-    LaunchedEffect(pageIndex) {
-        delay(5_000)
-        if (pagerState.currentPage == pageIndex && pageIndex + 1 < pagerState.pageCount) {
-            pagerState.animateScrollToPage(pageIndex + 1)
-        }
-    }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun VideoPage(bytes: ByteArray, clipHash: String, pageIndex: Int, pagerState: PagerState) {
+private fun VideoPage(bytes: ByteArray, clipHash: String) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     // Deliberate, bounded exception to PostEntity's "ciphertext only on disk"
     // contract: ContentEncryption is whole-blob AES-GCM, not a streaming
@@ -145,20 +142,7 @@ private fun VideoPage(bytes: ByteArray, clipHash: String, pageIndex: Int, pagerS
     }
 
     DisposableEffect(clipHash) {
-        val listener = object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_ENDED &&
-                    pagerState.currentPage == pageIndex &&
-                    pageIndex + 1 < pagerState.pageCount
-                ) {
-                    scope.launch { pagerState.animateScrollToPage(pageIndex + 1) }
-                }
-            }
-        }
-        exoPlayer.addListener(listener)
-
         onDispose {
-            exoPlayer.removeListener(listener)
             exoPlayer.release()
             tempFile.delete()
         }
@@ -180,8 +164,18 @@ private fun BlockReportAffordance(
 ) {
     var sheetOpen by remember { mutableStateOf(false) }
 
-    IconButton(onClick = { sheetOpen = true }, modifier = modifier) {
-        Icon(Icons.Filled.MoreVert, contentDescription = "More options")
+    // A dark scrim behind the icon, not the theme's own surface color -- this
+    // button sits directly on top of arbitrary user photo/video content, not
+    // app chrome, so it needs contrast against whatever's underneath rather
+    // than whatever's in light/dark mode.
+    IconButton(
+        onClick = { sheetOpen = true },
+        modifier = modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.35f)),
+    ) {
+        Icon(Icons.Filled.MoreVert, contentDescription = "More options", tint = Color.White)
     }
 
     if (sheetOpen) {
@@ -189,33 +183,48 @@ private fun BlockReportAffordance(
             onDismissRequest = { sheetOpen = false },
             sheetState = rememberModalBottomSheetState(),
         ) {
-            TextButton(
+            SheetAction(
+                icon = Icons.AutoMirrored.Filled.Send,
+                label = "Message",
                 onClick = {
                     onMessage()
                     sheetOpen = false
                 },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Message")
-            }
-            TextButton(
+            )
+            SheetAction(
+                icon = Icons.Filled.Close,
+                label = "Block this sender",
+                tint = MaterialTheme.colorScheme.error,
                 onClick = {
                     onBlock()
                     sheetOpen = false
                 },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Block this sender")
-            }
-            TextButton(
+            )
+            SheetAction(
+                icon = Icons.Filled.Warning,
+                label = "Report this post",
+                tint = MaterialTheme.colorScheme.error,
                 onClick = {
                     onReport()
                     sheetOpen = false
                 },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Report this post")
-            }
+            )
         }
+    }
+}
+
+@Composable
+private fun SheetAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    tint: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.primary,
+) {
+    TextButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.padding(end = HopSpacing.sm))
+        Text(label, color = MaterialTheme.colorScheme.onSurface)
     }
 }
