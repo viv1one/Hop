@@ -7,11 +7,15 @@ import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.StubAttestationProvider
 import com.hop.data.HopDatabase
 import com.hop.data.RoomDecayKeyStorage
+import com.hop.data.RoomSignalProtocolStore
 import com.hop.data.SettingsRepository
+import com.hop.data.toPeerIdHex
 import com.hop.repository.BlockRepository
+import com.hop.repository.MessageRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.ReportRepository
 import com.hop.transport.TransportManager
+import org.signal.libsignal.protocol.state.SignalProtocolStore
 
 /**
  * Hand-rolled dependency-injection holder -- no Hilt, the object graph is
@@ -63,5 +67,60 @@ class AppContainer(applicationContext: Context) {
     val blockRepository: BlockRepository = BlockRepository(hopDatabase.blockedSenderDeviceDao())
     val reportRepository: ReportRepository = ReportRepository(hopDatabase.reportedPostDao())
 
-    val transportManager: TransportManager = TransportManager(applicationContext, postRepository, decayKeyStore)
+    /**
+     * Persistent Double Ratchet session/key store (Stage 1). Typed as the
+     * plain libsignal-client [SignalProtocolStore] interface -- the
+     * pluggable seam `crypto/`'s `DoubleRatchetSession` already accepts --
+     * rather than the concrete [RoomSignalProtocolStore], so both
+     * [messageRepository] and [transportManager] (which needs it to publish
+     * this device's own prekey bundle ambiently on every new connection)
+     * depend only on that seam.
+     */
+    val signalProtocolStore: SignalProtocolStore = RoomSignalProtocolStore(
+        hopDatabase.signalIdentityDao(),
+        hopDatabase.signalPreKeyDao(),
+        hopDatabase.signalSignedPreKeyDao(),
+        hopDatabase.signalKyberPreKeyDao(),
+        hopDatabase.signalSessionDao(),
+    )
+
+    /**
+     * This device's own stable messaging identity: the same hex string
+     * [SettingsRepository.getOrCreateStableSenderDeviceId] persists (once
+     * hex-encoded), reused as both the address peers know this device by
+     * ([com.hop.data.peerSignalAddress]) and the `senderPeerId` this device
+     * announces in every prekey bundle / message envelope it sends. One
+     * identity, reused everywhere -- see `com.hop.data.PeerIdentity`'s doc.
+     */
+    private val getOwnPeerId: suspend () -> String = {
+        settingsRepository.getOrCreateStableSenderDeviceId().toPeerIdHex()
+    }
+
+    /**
+     * References [transportManager] inside its `sendToPeer` lambda via a
+     * forward property reference -- resolved lazily at call time (when a
+     * message is actually sent), not at construction time, by which point
+     * [transportManager] below is fully constructed. Breaks what would
+     * otherwise be a circular dependency: [transportManager] needs
+     * [messageRepository]'s callbacks to hand off received prekey
+     * bundles/ciphertext, and [messageRepository] needs [transportManager]
+     * to send outgoing ones.
+     */
+    val messageRepository: MessageRepository = MessageRepository(
+        messageDao = hopDatabase.messageDao(),
+        signalProtocolStore = signalProtocolStore,
+        blockRepository = blockRepository,
+        getOwnPeerId = getOwnPeerId,
+        sendToPeer = { peerId, type, payload -> transportManager.sendToPeer(peerId, type, payload) },
+    )
+
+    val transportManager: TransportManager = TransportManager(
+        context = applicationContext,
+        postRepository = postRepository,
+        decayKeyStore = decayKeyStore,
+        signalProtocolStore = signalProtocolStore,
+        getOwnPeerId = getOwnPeerId,
+        onPreKeyBundleReceived = messageRepository::cachePeerBundle,
+        onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
+    )
 }

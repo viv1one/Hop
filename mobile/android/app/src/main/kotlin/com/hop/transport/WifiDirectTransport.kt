@@ -7,10 +7,18 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import com.hop.crypto.DecayKeyStore
+import com.hop.crypto.DoubleRatchetSession
+import com.hop.crypto.PreKeyBundleCodec
+import com.hop.data.PEER_DEVICE_ID
 import com.hop.data.PostEntity
 import com.hop.protocol.Frame
+import com.hop.protocol.MessageCiphertextEnvelope
+import com.hop.protocol.PreKeyBundleEnvelope
+import com.hop.protocol.WireEnvelope
+import com.hop.protocol.WirePayloadType
 import com.hop.repository.PostRepository
 import kotlinx.coroutines.runBlocking
+import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
@@ -40,12 +48,59 @@ import java.util.concurrent.CopyOnWriteArrayList
  *   until the socket closes/EOF), and stores ciphertext + key separately
  *   (matching [PostRepository]'s on-demand-decrypt design) instead of
  *   force-decrypting and handing off to a system viewer.
+ *
+ * As of the Phase 1 messaging slice, every blob crossing the socket is a
+ * [WireEnvelope] (`[1-byte type][4-byte length][payload]`), not a bare
+ * `[4-byte length][Frame bytes]` -- see [WireEnvelope]'s own doc and
+ * `/protocol/WIRE_FORMAT.md` for why this is an intentional, non-backward-
+ * compatible break. Posts still fan out to every connected peer
+ * ([broadcastPost]); prekey bundle announcements and message ciphertext are
+ * peer-specific ([sendToPeer]), never broadcast.
  */
 class WifiDirectTransport(
     context: Context,
     private val channel: WifiP2pManager.Channel,
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
+    /**
+     * This device's persistent Double Ratchet session/key store -- needed
+     * here (not just in `com.hop.repository.MessageRepository`) so this
+     * class can publish and announce this device's own [PreKeyBundle]
+     * ambiently on every new connection (see [announceOwnPreKeyBundle]).
+     * Typed as the plain libsignal-client [SignalProtocolStore] interface
+     * (the pluggable seam `crypto/`'s [DoubleRatchetSession] already
+     * accepts), not the concrete `RoomSignalProtocolStore`, so a test can
+     * substitute `InMemorySignalProtocolStore`.
+     */
+    private val signalProtocolStore: SignalProtocolStore,
+    /**
+     * This device's own stable messaging identity (hex-encoded
+     * `senderDeviceId`, see `com.hop.data.PeerIdentity`'s doc) -- a suspend
+     * function rather than a plain value since it's ultimately backed by
+     * `SettingsRepository.getOrCreateStableSenderDeviceId()` (DataStore,
+     * suspend). Read lazily, off the main thread, only when actually needed
+     * (announcing a bundle or sending a message), not at construction time.
+     */
+    private val getOwnPeerId: suspend () -> String,
+    /**
+     * Called (never on the main thread -- see [receivePosts]) whenever a
+     * peer's [WirePayloadType.PREKEY_BUNDLE] announcement arrives, with the
+     * announcing peer's id and their still-opaque bundle bytes. Deliberately
+     * *not* deserialized into a libsignal [org.signal.libsignal.protocol.state.PreKeyBundle]
+     * here -- that's libsignal-aware work this class avoids per the Phase 1
+     * messaging plan (`PreKeyBundleCodec`/[com.hop.repository.MessageRepository]
+     * own that instead); this class's only libsignal-aware code path is
+     * *publishing* its own bundle (see [announceOwnPreKeyBundle]).
+     */
+    private val onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
+    /**
+     * Called (off the main thread, see [receivePosts]) whenever a
+     * [WirePayloadType.MESSAGE_CIPHERTEXT] envelope arrives, with the
+     * sender's peer id and the opaque Double Ratchet ciphertext. Suspend
+     * since the real implementation (`MessageRepository.onEnvelopeReceived`)
+     * does real Room/libsignal work.
+     */
+    private val onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
     private val onLog: (String) -> Unit = {},
 ) {
     companion object {
@@ -75,6 +130,13 @@ class WifiDirectTransport(
         postsDir = File(appContext.filesDir, "posts"),
     )
 
+    /** Routes a decoded [WireEnvelope] to the right handler -- see [EnvelopeDispatcher]'s own doc. */
+    private val envelopeDispatcher = EnvelopeDispatcher(
+        receivedFrameStore = receivedFrameStore,
+        onPreKeyBundleReceived = onPreKeyBundleReceived,
+        onMessageCiphertextReceived = onMessageCiphertextReceived,
+    )
+
     /**
      * Session-scoped, in-memory-only send outbox. [broadcastPost] appends and
      * immediately pushes the new frame to every currently-open connection (see
@@ -87,6 +149,10 @@ class WifiDirectTransport(
      * hardware, the receiving phone never got a second post sent over an
      * already-open group. [outboxLock] closes that gap without double-sending:
      * see its doc.
+     *
+     * Holds already-[WireEnvelope]-wrapped bytes (`POST_FRAME`-tagged), not
+     * bare `Frame` bytes -- wrapped once in [broadcastPost], so backlog
+     * flushes ([sendBacklog]) never need to re-wrap.
      *
      * Deliberately no ack/retry, and nothing here re-sends a post queued in a
      * *previous* app process/session -- this matches Phase 1's explicit scope
@@ -134,6 +200,10 @@ class WifiDirectTransport(
      * connected right now. See [outbox]'s doc for what "for the rest of this
      * session" does and doesn't mean.
      *
+     * Wraps [encoded] in a [WirePayloadType.POST_FRAME]-tagged [WireEnvelope]
+     * exactly once here -- everything downstream ([outbox], [sendBacklog],
+     * live push below) deals in already-wrapped bytes.
+     *
      * Note for future maintainers: this class does not build frames on send,
      * so the Phase 0 spike's `senderDeviceId`-regenerated-per-send bug
      * ([com.hop.spike.WifiDirectSpike.sendPayload]) has no structural
@@ -144,20 +214,41 @@ class WifiDirectTransport(
      * this class later.
      */
     fun broadcastPost(encoded: ByteArray) {
+        val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, encoded)
         val connectionsSnapshot: List<PeerConnection>
         val outboxSize: Int
         synchronized(outboxLock) {
-            outbox.add(encoded)
+            outbox.add(envelope)
             outboxSize = outbox.size
             connectionsSnapshot = activeConnections.toList()
         }
         onLog("Queued post for broadcast (${encoded.size} bytes); outbox size=$outboxSize")
         for (connection in connectionsSnapshot) {
-            if (!connection.trySend(encoded)) {
+            if (!connection.trySend(envelope)) {
                 onLog("Live send failed to a connected peer; dropping that connection")
                 activeConnections.remove(connection)
             }
         }
+    }
+
+    /**
+     * Sends [payload] wrapped in a [type]-tagged [WireEnvelope] to exactly
+     * the one currently-connected peer whose most recent PREKEY_BUNDLE or
+     * MESSAGE_CIPHERTEXT announcement identified them as [peerId] -- unlike
+     * [broadcastPost], this never fans out to every open connection (prekey
+     * bundles and message ciphertext are peer-specific; posts are not).
+     *
+     * Returns `false` (never throws) if no currently-open connection is
+     * tagged with [peerId] -- either this peer isn't connected right now, or
+     * this device has never received a PREKEY_BUNDLE/MESSAGE_CIPHERTEXT
+     * envelope identifying which open connection is theirs. Phase 1 has no
+     * store-and-forward, so this is a real, expected "can't deliver right
+     * now" outcome, not a bug -- callers (`MessageRepository.send`) still
+     * persist the outgoing message locally regardless.
+     */
+    fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean {
+        val connection = activeConnections.firstOrNull { it.remotePeerId == peerId } ?: return false
+        return connection.trySend(WireEnvelope.encode(type, payload))
     }
 
     /**
@@ -171,16 +262,30 @@ class WifiDirectTransport(
             outbox.toList()
         }
 
-    /** Thread-safe wrapper around one peer socket's output stream -- see [activeConnections]'s doc. */
+    /**
+     * Thread-safe wrapper around one peer socket's output stream -- see
+     * [activeConnections]'s doc. [remotePeerId] starts `null` and is set the
+     * first time this connection carries a PREKEY_BUNDLE or
+     * MESSAGE_CIPHERTEXT envelope identifying who's on the other end (see
+     * [receivePosts]) -- a post-only connection may never learn this, which
+     * is fine, since posts are never peer-targeted.
+     */
     private class PeerConnection(socket: Socket) {
         private val out = DataOutputStream(socket.getOutputStream())
         private val writeLock = Any()
 
-        /** Writes one length-prefixed frame. Returns `false` (never throws) on any I/O failure. */
-        fun trySend(encoded: ByteArray): Boolean = synchronized(writeLock) {
+        @Volatile
+        var remotePeerId: String? = null
+
+        /**
+         * Writes one already-[WireEnvelope]-encoded blob (self-framing: it
+         * carries its own type + length header, so no additional outer
+         * length prefix is written here). Returns `false` (never throws) on
+         * any I/O failure.
+         */
+        fun trySend(envelope: ByteArray): Boolean = synchronized(writeLock) {
             try {
-                out.writeInt(encoded.size)
-                out.write(encoded)
+                out.write(envelope)
                 out.flush()
                 true
             } catch (e: Exception) {
@@ -211,6 +316,56 @@ class WifiDirectTransport(
      */
     @Volatile
     private var activeServerSocket: ServerSocket? = null
+
+    /**
+     * This device's own current Double Ratchet prekey bundle, published into
+     * [signalProtocolStore] and encoded ([PreKeyBundleCodec]) at most once
+     * per process, then memoized -- every subsequent connection announces
+     * the exact same bundle rather than republishing (and thereby
+     * invalidating) fresh prekeys on every reconnect. No rotation exists yet
+     * (fixed ids preKeyId=1/signedPreKeyId=1/kyberPreKeyId=1) -- named MVP
+     * simplification, see the Phase 1 messaging plan.
+     */
+    @Volatile
+    private var ownPreKeyBundleBytesMemo: ByteArray? = null
+    private val ownPreKeyBundleLock = Any()
+
+    private fun ownPreKeyBundleBytes(): ByteArray =
+        ownPreKeyBundleBytesMemo ?: synchronized(ownPreKeyBundleLock) {
+            ownPreKeyBundleBytesMemo ?: PreKeyBundleCodec.encode(
+                DoubleRatchetSession.publishPreKeyBundle(store = signalProtocolStore, deviceId = PEER_DEVICE_ID),
+            ).also { ownPreKeyBundleBytesMemo = it }
+        }
+
+    /**
+     * Publishes (lazily, once -- see [ownPreKeyBundleBytes]) and sends this
+     * device's own current prekey bundle to [connection] as a
+     * [WirePayloadType.PREKEY_BUNDLE]-tagged [WireEnvelope], immediately on
+     * every new connection -- see this class's doc / the Phase 1 messaging
+     * plan's "ambient bundle exchange" decision for why this happens
+     * unconditionally rather than only on-demand at message-send time: Phase
+     * 1 has no store-and-forward, so a peer who has since walked away could
+     * otherwise never be messaged at all.
+     *
+     * [handleConnection] is the one place both the group-owner accept-loop
+     * ([runServer]) and the client-connect path ([connectWithRetry]) already
+     * converge, so calling this from there (rather than duplicating the call
+     * in both) covers both sides of a WiFi Direct connection with one call
+     * site.
+     */
+    private fun announceOwnPreKeyBundle(connection: PeerConnection) {
+        try {
+            val ownPeerId = runBlocking { getOwnPeerId() }
+            val envelope = PreKeyBundleEnvelope(peerId = ownPeerId, bundleBytes = ownPreKeyBundleBytes())
+            if (connection.trySend(WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, envelope.encode()))) {
+                onLog("Announced own prekey bundle to a newly connected peer")
+            } else {
+                onLog("Failed to announce own prekey bundle to a newly connected peer")
+            }
+        } catch (e: Exception) {
+            onLog("Error announcing own prekey bundle: ${e.message}")
+        }
+    }
 
     @SuppressLint("MissingPermission")
     fun discoverPeers() {
@@ -399,19 +554,24 @@ class WifiDirectTransport(
      * queued on whichever side loses that coin flip). Both directions run on
      * background threads -- never the main thread -- since both do blocking
      * socket I/O plus (on receive) file/Room I/O.
+     *
+     * Also kicks off [announceOwnPreKeyBundle] on its own background thread
+     * -- see that method's doc for why this is the single call site covering
+     * both the group-owner accept-loop and the client-connect path.
      */
     private fun handleConnection(socket: Socket) {
         val connection = PeerConnection(socket)
         val backlog = registerConnectionAndGetBacklog(connection)
         Thread({ sendBacklog(connection, backlog) }, "hop-send").start()
+        Thread({ announceOwnPreKeyBundle(connection) }, "hop-bundle-announce").start()
         Thread({ receivePosts(socket, connection) }, "hop-receive").start()
     }
 
     /** Flushes every post queued before this connection registered -- new posts arrive via [broadcastPost]'s live push instead. */
     private fun sendBacklog(connection: PeerConnection, backlog: List<ByteArray>) {
         onLog("Sending ${backlog.size} queued post(s) to connected peer")
-        for (encoded in backlog) {
-            if (!connection.trySend(encoded)) {
+        for (envelope in backlog) {
+            if (!connection.trySend(envelope)) {
                 onLog("Send error while flushing backlog to a connected peer")
                 break
             }
@@ -419,39 +579,55 @@ class WifiDirectTransport(
     }
 
     /**
-     * Reads length-prefixed frames from [socket] until it closes/EOF -- a
-     * peer may have several queued posts to send in one connection, not just
-     * one. Each frame is handed to [ReceivedFrameStore.handle].
+     * Reads [WireEnvelope]s from [socket] until it closes/EOF -- a peer may
+     * have several queued envelopes to send in one connection, not just one.
+     * Each envelope's header (`[1-byte type][4-byte length]`) is read
+     * manually via [DataInputStream] rather than buffering the whole
+     * envelope and calling [WireEnvelope.decode] (which needs the complete
+     * bytes up front, header included) -- functionally equivalent (same
+     * [WirePayloadType.fromWireValue] validation, same [WireEnvelope]
+     * construction), just without an extra header+payload copy.
      *
      * [connection] is removed from [activeConnections] once this loop ends
      * (peer disconnect, EOF, or error) -- this is the only place a
-     * [PeerConnection] is deregistered, so [broadcastPost]'s live push never
-     * targets a socket that's already gone.
+     * [PeerConnection] is deregistered, so [broadcastPost]/[sendToPeer] never
+     * target a socket that's already gone.
      */
     private fun receivePosts(socket: Socket, connection: PeerConnection) {
         try {
             val input = DataInputStream(socket.getInputStream())
             while (true) {
-                val size = try {
-                    input.readInt()
+                val typeByte = try {
+                    input.readUnsignedByte()
                 } catch (e: EOFException) {
                     break // peer closed the connection / sent everything it had
                 }
-                if (size < 0) {
-                    onLog("Receive: invalid frame length $size -- ending this connection's receive loop")
+                val length = try {
+                    input.readInt()
+                } catch (e: EOFException) {
+                    onLog("Receive: connection closed mid-envelope-header -- ending this connection's receive loop")
                     break
                 }
-                val buffer = ByteArray(size)
-                input.readFully(buffer)
+                if (length < 0) {
+                    onLog("Receive: invalid envelope payload length $length -- ending this connection's receive loop")
+                    break
+                }
+                val payload = ByteArray(length)
+                input.readFully(payload)
                 try {
-                    val stored = receivedFrameStore.handle(buffer)
-                    onLog(if (stored) "Received and stored a new post" else "Received a frame, not stored (dedupe or decode failure)")
+                    val envelope = WireEnvelope(WirePayloadType.fromWireValue(typeByte), payload)
+                    val identifiedPeerId = runBlocking { envelopeDispatcher.dispatch(envelope) }
+                    if (identifiedPeerId != null) {
+                        connection.remotePeerId = identifiedPeerId
+                    }
+                    onLog("Received and handled a ${envelope.type} envelope")
                 } catch (e: Exception) {
-                    // Don't let one bad frame kill the loop -- framing is already
-                    // correctly consumed above (we read exactly `size` bytes), so
-                    // the socket's byte stream is still in a valid state to keep
-                    // reading the next frame.
-                    onLog("Error handling received frame: ${e.message}")
+                    // Don't let one bad/unexpected envelope kill the loop --
+                    // framing is already correctly consumed above (we read
+                    // exactly the declared header + payload byte count), so
+                    // the socket's byte stream is still in a valid state to
+                    // keep reading the next envelope.
+                    onLog("Error handling received envelope: ${e.message}")
                 }
             }
         } catch (e: SocketException) {
@@ -544,4 +720,55 @@ internal class ReceivedFrameStore(
     }
 
     private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
+}
+
+/**
+ * Pure receive-path dispatch logic: given one already-decoded [WireEnvelope],
+ * routes to [ReceivedFrameStore.handle] (posts) or the
+ * [onPreKeyBundleReceived]/[onMessageCiphertextReceived] callbacks
+ * (messaging) -- the exact three-way split [WifiDirectTransport.receivePosts]
+ * uses on the real socket receive loop.
+ *
+ * Factored out for the same reason [ReceivedFrameStore] is: fully testable
+ * without a real Android `Context`/`WifiP2pManager`/live WiFi Direct group --
+ * an instrumented test can drive it directly against real
+ * [PreKeyBundleEnvelope]/[MessageCiphertextEnvelope] bytes and real
+ * `MessageRepository` callbacks over a plain loopback socket, without a
+ * `WifiP2pManager.Channel` in the loop at all. `internal` (not `private`) for
+ * the same direct-construction reason as [ReceivedFrameStore].
+ *
+ * Deliberately contains zero libsignal-aware deserialization itself --
+ * [onPreKeyBundleReceived] receives the bundle's bytes as-is, unparsed; only
+ * this envelope's own protocol-level fields ([PreKeyBundleEnvelope.peerId] /
+ * [MessageCiphertextEnvelope.senderPeerId]) are read here.
+ */
+internal class EnvelopeDispatcher(
+    private val receivedFrameStore: ReceivedFrameStore,
+    private val onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit,
+    private val onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit,
+) {
+    /**
+     * Handles [envelope] and returns the peer id it identified its sender as,
+     * if any -- `null` for a [WirePayloadType.POST_FRAME] envelope, which
+     * carries no peer-messaging identity. Callers use a non-null result to
+     * tag the connection this envelope arrived on (see
+     * [WifiDirectTransport.PeerConnection.remotePeerId]) so a later
+     * peer-targeted send ([WifiDirectTransport.sendToPeer]) can find it.
+     */
+    suspend fun dispatch(envelope: WireEnvelope): String? = when (envelope.type) {
+        WirePayloadType.POST_FRAME -> {
+            receivedFrameStore.handle(envelope.payload)
+            null
+        }
+        WirePayloadType.PREKEY_BUNDLE -> {
+            val bundleEnvelope = PreKeyBundleEnvelope.decode(envelope.payload)
+            onPreKeyBundleReceived(bundleEnvelope.peerId, bundleEnvelope.bundleBytes)
+            bundleEnvelope.peerId
+        }
+        WirePayloadType.MESSAGE_CIPHERTEXT -> {
+            val messageEnvelope = MessageCiphertextEnvelope.decode(envelope.payload)
+            onMessageCiphertextReceived(messageEnvelope.senderPeerId, messageEnvelope.ciphertext)
+            messageEnvelope.senderPeerId
+        }
+    }
 }

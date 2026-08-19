@@ -18,7 +18,9 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.hop.crypto.DecayKeyStore
+import com.hop.protocol.WirePayloadType
 import com.hop.repository.PostRepository
+import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -57,6 +59,10 @@ class TransportManager(
     private val context: Context,
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
+    signalProtocolStore: SignalProtocolStore,
+    getOwnPeerId: suspend () -> String,
+    onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
+    onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
 ) : DefaultLifecycleObserver {
 
     private val manager = context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
@@ -67,6 +73,10 @@ class TransportManager(
         channel = channel,
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
+        signalProtocolStore = signalProtocolStore,
+        getOwnPeerId = getOwnPeerId,
+        onPreKeyBundleReceived = onPreKeyBundleReceived,
+        onMessageCiphertextReceived = onMessageCiphertextReceived,
         onLog = { message -> Log.d(TAG, message) },
     )
 
@@ -185,6 +195,10 @@ class TransportManager(
 
     /** Delegates to [WifiDirectTransport.broadcastPost] -- see its doc for the outbox's session-scoped, no-ack/retry semantics. */
     fun broadcastPost(encoded: ByteArray) = wifiDirectTransport.broadcastPost(encoded)
+
+    /** Delegates to [WifiDirectTransport.sendToPeer] -- see its doc for the peer-specific (non-broadcast) send semantics. */
+    fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean =
+        wifiDirectTransport.sendToPeer(peerId, type, payload)
 
     @SuppressLint("MissingPermission")
     private fun maybeConnect(device: WifiP2pDevice) {
