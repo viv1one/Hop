@@ -4,12 +4,12 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.hop.crypto.DecayKeyStore
-import com.hop.crypto.DoubleRatchetSession
 import com.hop.crypto.PreKeyBundleCodec
 import com.hop.data.HopDatabase
 import com.hop.data.IdentityKeyPairKeystoreCipher
 import com.hop.data.MessageEntity
 import com.hop.data.PEER_DEVICE_ID
+import com.hop.data.PreKeyRotationManager
 import com.hop.data.RoomSignalProtocolStore
 import com.hop.protocol.PreKeyBundleEnvelope
 import com.hop.protocol.WireEnvelope
@@ -26,7 +26,6 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
-import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetAddress
@@ -73,7 +72,7 @@ class WifiDirectTransportMessagingTest {
 
     /** One conversation participant's full local stack, mirroring one physical device. */
     private inner class Party(db: HopDatabase, val peerId: String) {
-        val store: SignalProtocolStore = RoomSignalProtocolStore(
+        val store: RoomSignalProtocolStore = RoomSignalProtocolStore(
             db.signalIdentityDao(),
             db.signalPreKeyDao(),
             db.signalSignedPreKeyDao(),
@@ -81,6 +80,21 @@ class WifiDirectTransportMessagingTest {
             db.signalSessionDao(),
             IdentityKeyPairKeystoreCipher(),
         )
+
+        /**
+         * Mirrors [WifiDirectTransport]'s own [PreKeyRotationManager] wiring
+         * (see [com.hop.app.AppContainer]) -- production no longer announces
+         * bundles via a single memoized `DoubleRatchetSession.publishPreKeyBundle`
+         * call (see [WifiDirectTransport.announceOwnPreKeyBundle]'s doc for
+         * why that was a correctness bug), so this test harness shouldn't
+         * either.
+         */
+        private val preKeyRotationManager = PreKeyRotationManager(
+            store = store,
+            counterDao = db.signalPreKeyCounterDao(),
+            deviceId = PEER_DEVICE_ID,
+        )
+
         val blockRepository = BlockRepository(db.blockedSenderDeviceDao())
         private val postRepository = PostRepository(db.postDao(), DecayKeyStore())
         private val receivedFrameStore = ReceivedFrameStore(postRepository, DecayKeyStore(), tempFolder.newFolder())
@@ -104,7 +118,7 @@ class WifiDirectTransportMessagingTest {
 
         /** Publishes and sends this party's own current prekey bundle over [viaLink] -- test's stand-in for [WifiDirectTransport.announceOwnPreKeyBundle]. */
         fun announceBundleTo(viaLink: LoopbackLink) {
-            val bundle = DoubleRatchetSession.publishPreKeyBundle(store, PEER_DEVICE_ID)
+            val bundle = preKeyRotationManager.currentBundle()
             val envelope = PreKeyBundleEnvelope(peerId = peerId, bundleBytes = PreKeyBundleCodec.encode(bundle))
             viaLink.send(WirePayloadType.PREKEY_BUNDLE, envelope.encode())
         }

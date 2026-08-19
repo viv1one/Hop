@@ -9,12 +9,17 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.signal.libsignal.protocol.DuplicateMessageException
+import org.signal.libsignal.protocol.InvalidKeyIdException
 import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.state.SessionRecord
 import org.signal.libsignal.protocol.state.SignalProtocolStore
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 /**
  * Wires up a [RoomSignalProtocolStore] over every DAO [HopDatabase] exposes
@@ -400,6 +405,205 @@ class RoomSignalProtocolStoreTest {
                 "raw Room-persisted identityKeyPairBytes must be Keystore-wrapped ciphertext, " +
                     "not the plain serialized key pair -- encryption is not actually happening"
             }
+        } finally {
+            db.close()
+        }
+    }
+
+    // --- PreKeyRotationManager: the correctness bug this class exists to fix ---
+    //
+    // Before PreKeyRotationManager existed, WifiDirectTransport memoized a
+    // *single* published prekey bundle (always fixed ids preKeyId=1/
+    // signedPreKeyId=1/kyberPreKeyId=1) and handed that exact same bundle to
+    // every peer that connected for the rest of the app process's lifetime.
+    // libsignal-client deletes a one-time EC prekey (RoomSignalProtocolStore
+    // .removePreKey) the moment ANY peer completes a handshake that consumes
+    // it -- so the moment a first peer (Bob) did that, a second peer's
+    // (Carol's) subsequent handshake attempt against the *same* memoized
+    // bundle referenced an id Alice's store had already deleted:
+    // RoomSignalProtocolStore.loadPreKey would throw InvalidKeyIdException,
+    // decrypt would fail, and MessageRepository.onEnvelopeReceived's
+    // catch-all would silently drop Carol's first message with zero visible
+    // cause. This is not a hypothetical -- it reliably reproduced against
+    // the pre-fix code (Alice's bundle announcement calling
+    // `DoubleRatchetSession.publishPreKeyBundle(store, deviceId)` fresh on
+    // every connection, but always at the same fixed ids, so the *second*
+    // call would overwrite -- not add to -- whatever the first call handed
+    // out before it was necessarily consumed). The test below is the actual
+    // proof the fix holds: Carol's handshake, after Bob's has already
+    // consumed a one-time prekey, must still succeed.
+    @Test
+    fun aSecondPeersFirstMessageDecryptsSuccessfullyAfterAFirstPeerAlreadyConsumedAOneTimePrekey() {
+        // Alice is the responder throughout -- Bob and Carol both initiate a
+        // fresh session against whatever bundle Alice most recently
+        // announced, mirroring com.hop.transport.WifiDirectTransport's
+        // ambient "announce own current bundle to every new connection"
+        // behavior (announceOwnPreKeyBundle, now backed by
+        // PreKeyRotationManager.currentBundle), just without the socket/
+        // transport layer in the way.
+        val aliceStore = aliceDb.asSignalProtocolStore()
+        val aliceAddress = SignalProtocolAddress("alice", 1)
+        val alicePreKeyRotationManager = PreKeyRotationManager(
+            store = aliceStore,
+            counterDao = aliceDb.signalPreKeyCounterDao(),
+            deviceId = aliceAddress.deviceId,
+        )
+
+        val bob = Party(bobDb, "bob")
+        val carolDb = newDb()
+        try {
+            val carol = Party(carolDb, "carol")
+
+            // Alice announces her current bundle to Bob -- the first-ever
+            // announcement for this device, so this hands out one-time
+            // prekey id 1.
+            val bundleForBob = alicePreKeyRotationManager.currentBundle()
+
+            // Bob completes a handshake against that bundle and sends Alice
+            // a first (PreKey-type) message. Per libsignal-client's own
+            // PreKeyStore contract, this consumes (deletes) the one-time
+            // prekey bundleForBob referenced -- see
+            // RoomSignalProtocolStore.removePreKey's doc.
+            val bobSession = DoubleRatchetSession.initiate(bob.store, aliceAddress, bundleForBob)
+            val bobsFirstMessage = bobSession.encrypt("hello alice, this is bob".toByteArray())
+            val aliceSessionWithBob = DoubleRatchetSession.forIncoming(aliceStore, bob.address)
+            assertContentEquals(
+                "hello alice, this is bob".toByteArray(),
+                aliceSessionWithBob.decrypt(bobsFirstMessage),
+            )
+
+            // Alice's one-time prekey from bundleForBob is now consumed and
+            // gone from her store.
+            assertFalse(
+                aliceStore.containsPreKey(bundleForBob.preKeyId),
+                "Bob's completed handshake should have consumed (deleted) Alice's one-time prekey",
+            )
+
+            // Alice now announces her *current* bundle to Carol -- a brand
+            // new connection, exactly like a second peer connecting to
+            // WifiDirectTransport within the same app-process lifetime.
+            val bundleForCarol = alicePreKeyRotationManager.currentBundle()
+            assertNotEquals(
+                bundleForBob.preKeyId,
+                bundleForCarol.preKeyId,
+                "Carol must be handed a different, not-yet-consumed one-time prekey than Bob's -- " +
+                    "handing out the same (already-consumed) id is exactly the bug this class fixes",
+            )
+
+            // Carol completes her own handshake against her bundle and sends
+            // Alice a first message. Before the fix, this would reference
+            // the same already-deleted one-time prekey id Bob's did --
+            // decrypt would fail and the message would be silently dropped.
+            // With the fix, Carol's bundle references a distinct,
+            // still-unconsumed one-time prekey, so this must succeed.
+            val carolSession = DoubleRatchetSession.initiate(carol.store, aliceAddress, bundleForCarol)
+            val carolsFirstMessage = carolSession.encrypt("hello alice, this is carol".toByteArray())
+            val aliceSessionWithCarol = DoubleRatchetSession.forIncoming(aliceStore, carol.address)
+            assertContentEquals(
+                "hello alice, this is carol".toByteArray(),
+                aliceSessionWithCarol.decrypt(carolsFirstMessage),
+            )
+        } finally {
+            carolDb.close()
+        }
+    }
+
+    // --- PreKeyRotationManager: one-time prekey batch replenishment ---
+
+    @Test
+    fun replenishmentGeneratesNewNonCollidingOneTimePreKeyIdsOnceThePoolRunsLow() {
+        val db = newDb()
+        try {
+            val store = db.asSignalProtocolStore()
+            val manager = PreKeyRotationManager(store, db.signalPreKeyCounterDao(), deviceId = 1)
+
+            // Hand out enough one-time prekeys to run well past a single
+            // batch -- proves replenishment actually happens (not just that
+            // the first ONE_TIME_PRE_KEY_BATCH_SIZE calls work) and that
+            // every newly generated id is genuinely new, never a repeat of
+            // one already handed out.
+            val callCount = PreKeyRotationManager.ONE_TIME_PRE_KEY_BATCH_SIZE * 2 + 3
+            val handedOutIds = (1..callCount).map { manager.currentBundle().preKeyId }
+
+            assertEquals(
+                handedOutIds.size,
+                handedOutIds.toSet().size,
+                "every handed-out one-time prekey id must be distinct -- a repeat means two peers " +
+                    "could be handed (and race to consume) the same one-time prekey",
+            )
+            assertTrue(
+                handedOutIds.max() > PreKeyRotationManager.ONE_TIME_PRE_KEY_BATCH_SIZE,
+                "replenishment should have generated ids beyond the very first batch",
+            )
+
+            // Every handed-out id must actually resolve real, still-present
+            // key material in the store -- not just an id number with
+            // nothing backing it.
+            handedOutIds.forEach { id ->
+                assertTrue(store.containsPreKey(id), "handed-out prekey id $id should exist in the store")
+            }
+        } finally {
+            db.close()
+        }
+    }
+
+    // --- PreKeyRotationManager: signed/Kyber prekey rotation + grace period + pruning ---
+
+    @Test
+    fun signedAndKyberPreKeysRotateAfterIntervalWhilePreviousStaysValidWithinGracePeriodThenGetsPrunedAfter() {
+        val db = newDb()
+        try {
+            val store = db.asSignalProtocolStore()
+            var clockMs = 0L
+            val manager = PreKeyRotationManager(store, db.signalPreKeyCounterDao(), deviceId = 1) { clockMs }
+
+            val bundle1 = manager.currentBundle()
+            val signedId1 = bundle1.signedPreKeyId
+            val kyberId1 = bundle1.kyberPreKeyId
+
+            // Advance just past the rotation interval -- both the signed and
+            // Kyber prekeys are now due for rotation.
+            clockMs = PreKeyRotationManager.SIGNED_PRE_KEY_ROTATION_INTERVAL.toMillis() + 1
+            val bundle2 = manager.currentBundle()
+            val signedId2 = bundle2.signedPreKeyId
+            val kyberId2 = bundle2.kyberPreKeyId
+
+            assertNotEquals(signedId1, signedId2, "signed prekey should have rotated to a new id")
+            assertNotEquals(kyberId1, kyberId2, "Kyber prekey should have rotated to a new id")
+
+            // The just-superseded ids remain loadable -- a peer who cached a
+            // bundle shortly before rotation can still complete a handshake
+            // against it.
+            assertTrue(
+                store.containsSignedPreKey(signedId1),
+                "previous signed prekey should remain valid within its grace period",
+            )
+            assertTrue(
+                store.containsKyberPreKey(kyberId1),
+                "previous Kyber prekey should remain valid within its grace period",
+            )
+            assertEquals(signedId1, store.loadSignedPreKey(signedId1).id)
+            assertEquals(kyberId1, store.loadKyberPreKey(kyberId1).id)
+
+            // Advance past rotation interval + grace period from the
+            // original (id1) prekeys' creation time -- id1's generation is
+            // now safely outside every peer's grace period and should be
+            // pruned.
+            clockMs = (
+                PreKeyRotationManager.SIGNED_PRE_KEY_ROTATION_INTERVAL + PreKeyRotationManager.SIGNED_PRE_KEY_GRACE_PERIOD
+                ).toMillis() + 1
+            manager.currentBundle()
+
+            assertFalse(
+                store.containsSignedPreKey(signedId1),
+                "long-superseded signed prekey should be pruned once outside its grace period",
+            )
+            assertFalse(
+                store.containsKyberPreKey(kyberId1),
+                "long-superseded Kyber prekey should be pruned once outside its grace period",
+            )
+            assertFailsWith<InvalidKeyIdException> { store.loadSignedPreKey(signedId1) }
+            assertFailsWith<InvalidKeyIdException> { store.loadKyberPreKey(kyberId1) }
         } finally {
             db.close()
         }

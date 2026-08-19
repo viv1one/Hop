@@ -252,6 +252,24 @@ class RoomSignalProtocolStore(
         kyberPreKeyDao.markUsed(kyberPreKeyId)
     }
 
+    /**
+     * Deletes a Kyber prekey row outright -- **not** part of
+     * libsignal-client's `KyberPreKeyStore` contract at all (that interface,
+     * unlike `SignedPreKeyStore`/`PreKeyStore`, has no remove method
+     * whatsoever -- confirmed via `javap` against the compiled 0.86.5 jar).
+     * Exists solely for [PreKeyRotationManager]'s age-based pruning of a
+     * long-superseded Kyber prekey once it's outside every peer's rotation
+     * grace period -- a different lifecycle event from "consumed by a
+     * handshake" ([markKyberPreKeyUsed], which never deletes; see its own
+     * doc). Not reachable through the `SignalProtocolStore` interface --
+     * callers must hold a concrete [RoomSignalProtocolStore] reference, which
+     * is exactly why [PreKeyRotationManager] is constructed against this
+     * concrete type rather than the interface.
+     */
+    fun pruneKyberPreKey(kyberPreKeyId: Int) {
+        kyberPreKeyDao.deleteById(kyberPreKeyId)
+    }
+
     // --- SessionStore ---
 
     override fun loadSession(address: SignalProtocolAddress): SessionRecord? =

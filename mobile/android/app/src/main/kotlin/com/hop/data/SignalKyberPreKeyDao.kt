@@ -27,4 +27,16 @@ interface SignalKyberPreKeyDao {
     /** See [KyberPreKeyEntity.used]'s doc -- marks, never deletes. */
     @Query("UPDATE signal_kyber_prekeys SET used = 1 WHERE kyberPreKeyId = :kyberPreKeyId")
     fun markUsed(kyberPreKeyId: Int)
+
+    /**
+     * Deletes a Kyber prekey row outright -- **not** the same lifecycle event
+     * as [markUsed] (see [KyberPreKeyEntity.used]'s doc for why consumption
+     * itself must never delete). This exists solely for
+     * [com.hop.data.PreKeyRotationManager]'s age-based pruning of a
+     * long-superseded Kyber prekey once it's outside every peer's rotation
+     * grace period -- called rarely (roughly once per rotation interval), never
+     * at the moment a prekey is consumed by a handshake.
+     */
+    @Query("DELETE FROM signal_kyber_prekeys WHERE kyberPreKeyId = :kyberPreKeyId")
+    fun deleteById(kyberPreKeyId: Int)
 }

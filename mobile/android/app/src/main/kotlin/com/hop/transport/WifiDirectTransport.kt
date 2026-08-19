@@ -7,10 +7,9 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import com.hop.crypto.DecayKeyStore
-import com.hop.crypto.DoubleRatchetSession
 import com.hop.crypto.PreKeyBundleCodec
-import com.hop.data.PEER_DEVICE_ID
 import com.hop.data.PostEntity
+import com.hop.data.PreKeyRotationManager
 import com.hop.protocol.Frame
 import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.PreKeyBundleEnvelope
@@ -18,7 +17,6 @@ import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.PostRepository
 import kotlinx.coroutines.runBlocking
-import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
@@ -63,16 +61,19 @@ class WifiDirectTransport(
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
     /**
-     * This device's persistent Double Ratchet session/key store -- needed
-     * here (not just in `com.hop.repository.MessageRepository`) so this
-     * class can publish and announce this device's own [PreKeyBundle]
-     * ambiently on every new connection (see [announceOwnPreKeyBundle]).
-     * Typed as the plain libsignal-client [SignalProtocolStore] interface
-     * (the pluggable seam `crypto/`'s [DoubleRatchetSession] already
-     * accepts), not the concrete `RoomSignalProtocolStore`, so a test can
-     * substitute `InMemorySignalProtocolStore`.
+     * Owns this device's one-time/signed/Kyber prekey pool and rotation
+     * policy -- needed here (not just in `com.hop.repository.MessageRepository`)
+     * so this class can publish and announce this device's own current
+     * [PreKeyBundle] ambiently on every new connection (see
+     * [announceOwnPreKeyBundle]). See [PreKeyRotationManager]'s own doc for
+     * why every connection gets a freshly-assembled bundle (a distinct,
+     * never-before-handed-out one-time prekey each time) rather than the
+     * single memoized bundle this class used before -- that memoization was
+     * a real correctness bug: once one peer consumed the memoized bundle's
+     * one-time prekey, every later peer's first message silently failed to
+     * decrypt.
      */
-    private val signalProtocolStore: SignalProtocolStore,
+    private val preKeyRotationManager: PreKeyRotationManager,
     /**
      * This device's own stable messaging identity (hex-encoded
      * `senderDeviceId`, see `com.hop.data.PeerIdentity`'s doc) -- a suspend
@@ -318,34 +319,20 @@ class WifiDirectTransport(
     private var activeServerSocket: ServerSocket? = null
 
     /**
-     * This device's own current Double Ratchet prekey bundle, published into
-     * [signalProtocolStore] and encoded ([PreKeyBundleCodec]) at most once
-     * per process, then memoized -- every subsequent connection announces
-     * the exact same bundle rather than republishing (and thereby
-     * invalidating) fresh prekeys on every reconnect. No rotation exists yet
-     * (fixed ids preKeyId=1/signedPreKeyId=1/kyberPreKeyId=1) -- named MVP
-     * simplification, see the Phase 1 messaging plan.
-     */
-    @Volatile
-    private var ownPreKeyBundleBytesMemo: ByteArray? = null
-    private val ownPreKeyBundleLock = Any()
-
-    private fun ownPreKeyBundleBytes(): ByteArray =
-        ownPreKeyBundleBytesMemo ?: synchronized(ownPreKeyBundleLock) {
-            ownPreKeyBundleBytesMemo ?: PreKeyBundleCodec.encode(
-                DoubleRatchetSession.publishPreKeyBundle(store = signalProtocolStore, deviceId = PEER_DEVICE_ID),
-            ).also { ownPreKeyBundleBytesMemo = it }
-        }
-
-    /**
-     * Publishes (lazily, once -- see [ownPreKeyBundleBytes]) and sends this
-     * device's own current prekey bundle to [connection] as a
-     * [WirePayloadType.PREKEY_BUNDLE]-tagged [WireEnvelope], immediately on
-     * every new connection -- see this class's doc / the Phase 1 messaging
-     * plan's "ambient bundle exchange" decision for why this happens
-     * unconditionally rather than only on-demand at message-send time: Phase
-     * 1 has no store-and-forward, so a peer who has since walked away could
-     * otherwise never be messaged at all.
+     * Publishes and sends this device's own *current* prekey bundle to
+     * [connection] as a [WirePayloadType.PREKEY_BUNDLE]-tagged [WireEnvelope],
+     * immediately on every new connection -- see this class's doc / the
+     * Phase 1 messaging plan's "ambient bundle exchange" decision for why
+     * this happens unconditionally rather than only on-demand at
+     * message-send time: Phase 1 has no store-and-forward, so a peer who has
+     * since walked away could otherwise never be messaged at all.
+     *
+     * Calls [PreKeyRotationManager.currentBundle] fresh on every connection
+     * -- no memoization here (see [preKeyRotationManager]'s own doc for why
+     * memoizing a single bundle across every peer was a correctness bug, not
+     * just an efficiency shortcut). This stays cheap: [PreKeyRotationManager]
+     * only does DB reads (plus, rarely, a batch-replenish/rotation write) on
+     * the common path, never new EC/Kyber keypair generation per connection.
      *
      * [handleConnection] is the one place both the group-owner accept-loop
      * ([runServer]) and the client-connect path ([connectWithRetry]) already
@@ -356,7 +343,8 @@ class WifiDirectTransport(
     private fun announceOwnPreKeyBundle(connection: PeerConnection) {
         try {
             val ownPeerId = runBlocking { getOwnPeerId() }
-            val envelope = PreKeyBundleEnvelope(peerId = ownPeerId, bundleBytes = ownPreKeyBundleBytes())
+            val bundleBytes = PreKeyBundleCodec.encode(preKeyRotationManager.currentBundle())
+            val envelope = PreKeyBundleEnvelope(peerId = ownPeerId, bundleBytes = bundleBytes)
             if (connection.trySend(WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, envelope.encode()))) {
                 onLog("Announced own prekey bundle to a newly connected peer")
             } else {

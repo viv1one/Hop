@@ -26,7 +26,13 @@ import androidx.room.RoomDatabase
  * [RemoteIdentityEntity.pendingIdentityKeyBytes]/[RemoteIdentityEntity.identityChangeDetectedAtMs]
  * (the "safety-number-changed" warning gap named in that entity's own doc,
  * closed by surfacing an identity-key mismatch to the Inbox UI instead of
- * it silently blocking send/decrypt with no visible cause). No `Migration`
+ * it silently blocking send/decrypt with no visible cause). Version bumped
+ * 4 -> 5 to add [SignalPreKeyCounterEntity] (the persisted id-allocation
+ * state backing [PreKeyRotationManager]: one-time EC prekey batch
+ * replenishment plus signed/Kyber prekey rotation, closing the "no
+ * rotation, fixed ids" gap named in [PreKeyEntity]/[SignedPreKeyEntity]/
+ * [KyberPreKeyEntity]'s docs and the correctness bug that gap caused -- see
+ * [PreKeyRotationManager]'s own doc for both). No `Migration`
  * is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
  * (see `AppContainer`) is the deliberate choice here, not an oversight: no
  * real users/on-device data exist yet for this database, so there's nothing
@@ -46,8 +52,9 @@ import androidx.room.RoomDatabase
         SignedPreKeyEntity::class,
         KyberPreKeyEntity::class,
         SessionEntity::class,
+        SignalPreKeyCounterEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {
@@ -62,4 +69,5 @@ abstract class HopDatabase : RoomDatabase() {
     abstract fun signalSignedPreKeyDao(): SignalSignedPreKeyDao
     abstract fun signalKyberPreKeyDao(): SignalKyberPreKeyDao
     abstract fun signalSessionDao(): SignalSessionDao
+    abstract fun signalPreKeyCounterDao(): SignalPreKeyCounterDao
 }

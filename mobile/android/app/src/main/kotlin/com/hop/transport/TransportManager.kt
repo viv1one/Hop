@@ -18,9 +18,9 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.hop.crypto.DecayKeyStore
+import com.hop.data.PreKeyRotationManager
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.PostRepository
-import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -59,7 +59,7 @@ class TransportManager(
     private val context: Context,
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
-    signalProtocolStore: SignalProtocolStore,
+    preKeyRotationManager: PreKeyRotationManager,
     getOwnPeerId: suspend () -> String,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
@@ -73,7 +73,7 @@ class TransportManager(
         channel = channel,
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
-        signalProtocolStore = signalProtocolStore,
+        preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,

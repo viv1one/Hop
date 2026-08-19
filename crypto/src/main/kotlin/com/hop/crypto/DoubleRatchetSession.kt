@@ -121,12 +121,30 @@ class DoubleRatchetSession private constructor(
 
         /**
          * Generates a fresh one-time prekey, signed prekey, and Kyber (PQXDH)
-         * prekey, stores them into [store], and assembles them into a
-         * [PreKeyBundle] for out-of-band publication to a prospective
-         * initiator. Not part of the ratchet itself, but the minimum
-         * bundle-publishing step every responder needs before anyone can call
-         * [initiate] against them — kept here rather than a separate file since
-         * it's purely a session-establishment concern local to this wrapper.
+         * prekey (each at fixed id 1 by default), stores them into [store],
+         * and assembles them into a [PreKeyBundle] for out-of-band
+         * publication to a prospective initiator. Not part of the ratchet
+         * itself, but the minimum bundle-publishing step every responder
+         * needs before anyone can call [initiate] against them — kept here
+         * rather than a separate file since it's purely a
+         * session-establishment concern local to this wrapper.
+         *
+         * **No rotation/replenishment of its own** — every call re-publishes
+         * fresh key material at the *same* fixed ids by default, which is
+         * exactly the "always id 1" bug pattern described in
+         * `com.hop.data.RoomSignalProtocolStore`'s doc: a second call
+         * silently invalidates whatever the first call handed out, if the
+         * first bundle's one-time prekey hasn't been consumed yet. This
+         * convenience wrapper remains useful for tests and any one-shot
+         * single-handshake scenario (it's what
+         * `DoubleRatchetSessionTest`/`RoomSignalProtocolStoreTest` use to
+         * stand up a single Alice/Bob pair), but production code that
+         * announces a bundle to more than one peer over a device's lifetime
+         * must use [generateOneTimePreKeys]/[generateSignedPreKey]/
+         * [generateKyberPreKey]/[assembleBundle] directly through a
+         * replenishment/rotation policy instead —
+         * `com.hop.data.PreKeyRotationManager` is that policy for this app's
+         * Room-backed store.
          */
         fun publishPreKeyBundle(
             store: SignalProtocolStore,
@@ -135,38 +153,125 @@ class DoubleRatchetSession private constructor(
             signedPreKeyId: Int = 1,
             kyberPreKeyId: Int = 1,
         ): PreKeyBundle {
+            generateSignedPreKey(store, signedPreKeyId)
+            generateOneTimePreKeys(store, startId = preKeyId, count = 1)
+            generateKyberPreKey(store, kyberPreKeyId)
+            return assembleBundle(store, deviceId, preKeyId, signedPreKeyId, kyberPreKeyId)
+        }
+
+        /**
+         * Generates [count] fresh one-time EC prekeys with sequential ids
+         * starting at [startId] (`startId`, `startId+1`, ..., `startId+count-1`)
+         * and stores each into [store], returning the ids generated. Pure
+         * generation + storage — doesn't touch or know about any id-allocation
+         * policy (that's the caller's job, e.g. `com.hop.data.PreKeyRotationManager`,
+         * which is what actually decides *which* ids are safe to hand out
+         * next so two different peers are never handed the same one-time
+         * prekey before either has consumed it).
+         */
+        fun generateOneTimePreKeys(store: SignalProtocolStore, startId: Int, count: Int): List<Int> {
+            require(count > 0) { "count must be positive, was $count" }
+            return (0 until count).map { offset ->
+                val id = startId + offset
+                store.storePreKey(id, PreKeyRecord(id, ECKeyPair.generate()))
+                id
+            }
+        }
+
+        /**
+         * Generates one fresh EC signed prekey at [signedPreKeyId], signs it
+         * with [store]'s own long-term identity key, and stores it into
+         * [store]. Callers doing rotation (`com.hop.data.PreKeyRotationManager`)
+         * are responsible for picking a not-yet-used [signedPreKeyId] and for
+         * eventually pruning a superseded one via `store.removeSignedPreKey`
+         * once it's outside its grace period — this function only generates
+         * and stores, it never removes anything.
+         *
+         * [timestampMs] defaults to the real wall clock but is overridable so
+         * a rotation-policy caller (`com.hop.data.PreKeyRotationManager`, and
+         * its tests) can drive the embedded `SignedPreKeyRecord.timestamp` —
+         * the value rotation-age decisions are actually based on — off the
+         * same injectable clock the caller itself uses, rather than mixing a
+         * real timestamp into an otherwise fully-deterministic test.
+         */
+        fun generateSignedPreKey(
+            store: SignalProtocolStore,
+            signedPreKeyId: Int,
+            timestampMs: Long = System.currentTimeMillis(),
+        ): SignedPreKeyRecord {
             val identity = store.identityKeyPair
+            val keyPair = ECKeyPair.generate()
+            val signature = identity.privateKey.calculateSignature(keyPair.publicKey.serialize())
+            val record = SignedPreKeyRecord(signedPreKeyId, timestampMs, keyPair, signature)
+            store.storeSignedPreKey(signedPreKeyId, record)
+            return record
+        }
 
-            val signedPreKeyPair = ECKeyPair.generate()
-            val signedPreKeySignature =
-                identity.privateKey.calculateSignature(signedPreKeyPair.publicKey.serialize())
-            store.storeSignedPreKey(
-                signedPreKeyId,
-                SignedPreKeyRecord(signedPreKeyId, System.currentTimeMillis(), signedPreKeyPair, signedPreKeySignature),
-            )
+        /**
+         * Generates one fresh Kyber (PQXDH) prekey at [kyberPreKeyId], signs
+         * it with [store]'s own long-term identity key, and stores it into
+         * [store]. Like [generateSignedPreKey], this is the "signed" (not
+         * one-time-batch) side of prekey material in this app's bundle shape
+         * — libsignal-client's `PreKeyBundle` carries exactly one Kyber
+         * prekey, signed the same way the EC signed prekey is, so this app
+         * rotates it on the same policy/timer as the EC signed prekey rather
+         * than batch-issuing many of them the way [generateOneTimePreKeys]
+         * does for the EC one-time prekey. `markKyberPreKeyUsed`'s "mark,
+         * never delete" contract (see `RoomSignalProtocolStore.markKyberPreKeyUsed`'s
+         * doc) is unrelated to and unaffected by rotation — rotation-driven
+         * pruning of a long-superseded Kyber prekey is a separate, later
+         * lifecycle event a caller triggers explicitly, never implied by
+         * generating a new one here.
+         *
+         * [timestampMs]: see [generateSignedPreKey]'s doc -- same rationale,
+         * applied to `KyberPreKeyRecord.timestamp`.
+         */
+        fun generateKyberPreKey(
+            store: SignalProtocolStore,
+            kyberPreKeyId: Int,
+            timestampMs: Long = System.currentTimeMillis(),
+        ): KyberPreKeyRecord {
+            val identity = store.identityKeyPair
+            val keyPair = KEMKeyPair.generate(KEMKeyType.KYBER_1024)
+            val signature = identity.privateKey.calculateSignature(keyPair.publicKey.serialize())
+            val record = KyberPreKeyRecord(kyberPreKeyId, timestampMs, keyPair, signature)
+            store.storeKyberPreKey(kyberPreKeyId, record)
+            return record
+        }
 
-            val oneTimePreKeyPair = ECKeyPair.generate()
-            store.storePreKey(preKeyId, PreKeyRecord(preKeyId, oneTimePreKeyPair))
-
-            val kyberKeyPair = KEMKeyPair.generate(KEMKeyType.KYBER_1024)
-            val kyberSignature = identity.privateKey.calculateSignature(kyberKeyPair.publicKey.serialize())
-            store.storeKyberPreKey(
-                kyberPreKeyId,
-                KyberPreKeyRecord(kyberPreKeyId, System.currentTimeMillis(), kyberKeyPair, kyberSignature),
-            )
-
+        /**
+         * Assembles a [PreKeyBundle] from key material *already stored* in
+         * [store] at [preKeyId]/[signedPreKeyId]/[kyberPreKeyId] — unlike
+         * [publishPreKeyBundle], this never generates anything itself, so
+         * it's cheap (DB reads only) to call on every new connection once a
+         * one-time prekey pool and current signed/Kyber prekeys already
+         * exist (see `com.hop.data.PreKeyRotationManager.currentBundle`, the
+         * production caller of this function). Throws
+         * `org.signal.libsignal.protocol.InvalidKeyIdException` if any of the
+         * three ids doesn't currently resolve in [store].
+         */
+        fun assembleBundle(
+            store: SignalProtocolStore,
+            deviceId: Int,
+            preKeyId: Int,
+            signedPreKeyId: Int,
+            kyberPreKeyId: Int,
+        ): PreKeyBundle {
+            val preKey = store.loadPreKey(preKeyId)
+            val signedPreKey = store.loadSignedPreKey(signedPreKeyId)
+            val kyberPreKey = store.loadKyberPreKey(kyberPreKeyId)
             return PreKeyBundle(
                 store.localRegistrationId,
                 deviceId,
                 preKeyId,
-                oneTimePreKeyPair.publicKey,
+                preKey.keyPair.publicKey,
                 signedPreKeyId,
-                signedPreKeyPair.publicKey,
-                signedPreKeySignature,
-                identity.publicKey,
+                signedPreKey.keyPair.publicKey,
+                signedPreKey.signature,
+                store.identityKeyPair.publicKey,
                 kyberPreKeyId,
-                kyberKeyPair.publicKey,
-                kyberSignature,
+                kyberPreKey.keyPair.publicKey,
+                kyberPreKey.signature,
             )
         }
     }

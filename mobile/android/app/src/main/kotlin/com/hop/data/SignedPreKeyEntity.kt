@@ -14,8 +14,14 @@ import androidx.room.PrimaryKey
  * [IdentityKeyPairEntity]'s doc for why this pattern is used consistently
  * across every entity in this store.
  *
- * No rotation in this slice, same named MVP simplification as [PreKeyEntity]
- * -- `DoubleRatchetSession.publishPreKeyBundle` always publishes fixed id 1.
+ * Rotated periodically by [PreKeyRotationManager] (see its own doc for the
+ * interval/grace-period policy) -- this table can hold more than one row at
+ * once (the current signed prekey plus, briefly, a just-superseded one still
+ * within its grace period), not always exactly one.
+ * `com.hop.crypto.DoubleRatchetSession.publishPreKeyBundle`'s own fixed-id-1
+ * default remains a simple single-shot convenience for tests/one-off
+ * handshakes; production bundle announcement goes through
+ * [PreKeyRotationManager] instead.
  */
 @Entity(tableName = "signal_signed_prekeys")
 data class SignedPreKeyEntity(

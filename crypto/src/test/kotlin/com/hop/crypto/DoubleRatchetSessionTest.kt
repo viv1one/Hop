@@ -9,6 +9,7 @@ import org.signal.libsignal.protocol.state.SignalProtocolStore
 import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
 import org.signal.libsignal.protocol.util.KeyHelper
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 
@@ -211,5 +212,90 @@ class DoubleRatchetSessionTest {
         // is the case a caller must treat as "start a fresh handshake with this
         // peer," not as a message to silently drop.
         assertFailsWith<DuplicateMessageException> { bobSession.decrypt(skippedEarly) }
+    }
+
+    // --- generateOneTimePreKeys / generateSignedPreKey / generateKyberPreKey / assembleBundle ---
+    //
+    // These are the lower-level primitives `com.hop.data.PreKeyRotationManager`
+    // builds its replenishment/rotation policy on top of (Room-specific id
+    // bookkeeping lives there, not here -- these are plain generation/storage/
+    // assembly functions against the SignalProtocolStore interface, so they're
+    // testable with libsignal-client's own InMemorySignalProtocolStore, no
+    // Room/instrumentation needed).
+
+    @Test
+    fun `generateOneTimePreKeys stores exactly count keys at sequential ids starting at startId`() {
+        val bob = Party("bob")
+
+        val ids = DoubleRatchetSession.generateOneTimePreKeys(bob.store, startId = 5, count = 4)
+
+        assertEquals(listOf(5, 6, 7, 8), ids)
+        ids.forEach { id -> assert(bob.store.containsPreKey(id)) { "prekey $id should exist after generation" } }
+    }
+
+    @Test
+    fun `a bundle assembled from separately generated prekeys is usable to establish a real session`() {
+        // Exercises the exact call sequence PreKeyRotationManager.currentBundle
+        // uses in production: generate once, assemble (a cheap read) possibly
+        // many times/later -- as opposed to publishPreKeyBundle's
+        // generate-and-assemble-in-one-call convenience path.
+        val bob = Party("bob")
+        DoubleRatchetSession.generateSignedPreKey(bob.store, signedPreKeyId = 7)
+        DoubleRatchetSession.generateOneTimePreKeys(bob.store, startId = 1, count = 3)
+        DoubleRatchetSession.generateKyberPreKey(bob.store, kyberPreKeyId = 2)
+
+        // Hand out one-time prekey id 2 specifically (not necessarily the
+        // first generated) -- proves assembleBundle doesn't implicitly
+        // assume "id 1" anywhere.
+        val bundle = DoubleRatchetSession.assembleBundle(
+            bob.store,
+            deviceId = bob.address.deviceId,
+            preKeyId = 2,
+            signedPreKeyId = 7,
+            kyberPreKeyId = 2,
+        )
+
+        val alice = Party("alice")
+        val aliceSession = DoubleRatchetSession.initiate(alice.store, bob.address, bundle)
+        val bobSession = DoubleRatchetSession.forIncoming(bob.store, alice.address)
+
+        val plaintext = "hop hop hop".toByteArray()
+        assertContentEquals(plaintext, bobSession.decrypt(aliceSession.encrypt(plaintext)))
+    }
+
+    @Test
+    fun `two different one-time prekeys from the same batch can each independently establish a session`() {
+        // The crux of the correctness bug PreKeyRotationManager fixes, at
+        // the lowest level: two peers (Bob's two sessions here, standing in
+        // for two different real peers) each initiating against a bundle
+        // built from a *different* one-time prekey id must both succeed --
+        // neither consumes or invalidates the other's.
+        val responder = Party("responder")
+        DoubleRatchetSession.generateSignedPreKey(responder.store, signedPreKeyId = 1)
+        DoubleRatchetSession.generateKyberPreKey(responder.store, kyberPreKeyId = 1)
+        DoubleRatchetSession.generateOneTimePreKeys(responder.store, startId = 1, count = 2)
+
+        val bundleForFirstPeer = DoubleRatchetSession.assembleBundle(
+            responder.store, deviceId = 1, preKeyId = 1, signedPreKeyId = 1, kyberPreKeyId = 1,
+        )
+        val bundleForSecondPeer = DoubleRatchetSession.assembleBundle(
+            responder.store, deviceId = 1, preKeyId = 2, signedPreKeyId = 1, kyberPreKeyId = 1,
+        )
+
+        val firstPeer = Party("first-peer")
+        val secondPeer = Party("second-peer")
+
+        val firstPeerSession = DoubleRatchetSession.initiate(firstPeer.store, responder.address, bundleForFirstPeer)
+        val firstMessage = firstPeerSession.encrypt("hello from first peer".toByteArray())
+        val responderSessionWithFirst = DoubleRatchetSession.forIncoming(responder.store, firstPeer.address)
+        assertContentEquals("hello from first peer".toByteArray(), responderSessionWithFirst.decrypt(firstMessage))
+
+        // First peer's handshake has now consumed one-time prekey id 1 --
+        // the second peer's independent handshake (against id 2) must still
+        // succeed.
+        val secondPeerSession = DoubleRatchetSession.initiate(secondPeer.store, responder.address, bundleForSecondPeer)
+        val secondMessage = secondPeerSession.encrypt("hello from second peer".toByteArray())
+        val responderSessionWithSecond = DoubleRatchetSession.forIncoming(responder.store, secondPeer.address)
+        assertContentEquals("hello from second peer".toByteArray(), responderSessionWithSecond.decrypt(secondMessage))
     }
 }

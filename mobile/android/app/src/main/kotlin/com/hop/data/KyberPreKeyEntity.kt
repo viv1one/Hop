@@ -24,8 +24,17 @@ import androidx.room.PrimaryKey
  * [RoomSignalProtocolStore.markKyberPreKeyUsed]'s doc for the consequence of
  * that scope cut.
  *
- * No rotation in this slice, same named MVP simplification as [PreKeyEntity]
- * -- `DoubleRatchetSession.publishPreKeyBundle` always publishes fixed id 1.
+ * Rotated periodically by [PreKeyRotationManager] on the same interval/
+ * grace-period policy as the EC signed prekey (see its own doc, and
+ * [com.hop.crypto.DoubleRatchetSession.generateKyberPreKey]'s doc for why
+ * this app treats the Kyber prekey as "signed-prekey-shaped" rather than a
+ * one-time batch pool). Rotation-driven pruning of a long-superseded row
+ * uses [RoomSignalProtocolStore.pruneKyberPreKey] -- a distinct lifecycle
+ * event from [used] above, which never triggers deletion.
+ * `com.hop.crypto.DoubleRatchetSession.publishPreKeyBundle`'s own fixed-id-1
+ * default remains a simple single-shot convenience for tests/one-off
+ * handshakes; production bundle announcement goes through
+ * [PreKeyRotationManager] instead.
  */
 @Entity(tableName = "signal_kyber_prekeys")
 data class KyberPreKeyEntity(

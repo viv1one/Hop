@@ -7,6 +7,8 @@ import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.StubAttestationProvider
 import com.hop.data.HopDatabase
 import com.hop.data.IdentityKeyPairKeystoreCipher
+import com.hop.data.PEER_DEVICE_ID
+import com.hop.data.PreKeyRotationManager
 import com.hop.data.RoomDecayKeyStorage
 import com.hop.data.RoomSignalProtocolStore
 import com.hop.data.SettingsRepository
@@ -16,7 +18,6 @@ import com.hop.repository.MessageRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.ReportRepository
 import com.hop.transport.TransportManager
-import org.signal.libsignal.protocol.state.SignalProtocolStore
 
 /**
  * Hand-rolled dependency-injection holder -- no Hilt, the object graph is
@@ -70,25 +71,39 @@ class AppContainer(applicationContext: Context) {
 
     /**
      * Persistent Double Ratchet session/key store (Stage 1). Typed as the
-     * plain libsignal-client [SignalProtocolStore] interface -- the
-     * pluggable seam `crypto/`'s `DoubleRatchetSession` already accepts --
-     * rather than the concrete [RoomSignalProtocolStore], so both
-     * [messageRepository] and [transportManager] (which needs it to publish
-     * this device's own prekey bundle ambiently on every new connection)
-     * depend only on that seam.
+     * concrete [RoomSignalProtocolStore] (not the plain libsignal-client
+     * `SignalProtocolStore` interface) since [preKeyRotationManager] below
+     * needs [RoomSignalProtocolStore.pruneKyberPreKey], which isn't part of
+     * that interface (see that method's own doc for why) -- assignable
+     * anywhere a `SignalProtocolStore` is expected regardless
+     * ([messageRepository]'s constructor parameter stays interface-typed).
      *
      * [IdentityKeyPairKeystoreCipher] Android-Keystore-wraps only the own
      * long-term identity key pair before it hits Room -- see its own doc
      * and [com.hop.data.IdentityKeyPairEntity]'s doc for why that field
      * specifically, and no other Signal-store field, gets this treatment.
      */
-    val signalProtocolStore: SignalProtocolStore = RoomSignalProtocolStore(
+    val signalProtocolStore: RoomSignalProtocolStore = RoomSignalProtocolStore(
         hopDatabase.signalIdentityDao(),
         hopDatabase.signalPreKeyDao(),
         hopDatabase.signalSignedPreKeyDao(),
         hopDatabase.signalKyberPreKeyDao(),
         hopDatabase.signalSessionDao(),
         IdentityKeyPairKeystoreCipher(),
+    )
+
+    /**
+     * One-time/signed/Kyber prekey batch replenishment + rotation policy
+     * (see its own doc) -- [transportManager] uses this (instead of
+     * [signalProtocolStore] directly) to assemble and announce this device's
+     * own current prekey bundle on every new connection, replacing the old
+     * "publish once, memoize forever" pattern that used to silently break
+     * messaging with a second peer in the same app-process lifetime.
+     */
+    val preKeyRotationManager = PreKeyRotationManager(
+        store = signalProtocolStore,
+        counterDao = hopDatabase.signalPreKeyCounterDao(),
+        deviceId = PEER_DEVICE_ID,
     )
 
     /**
@@ -126,7 +141,7 @@ class AppContainer(applicationContext: Context) {
         context = applicationContext,
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
-        signalProtocolStore = signalProtocolStore,
+        preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
