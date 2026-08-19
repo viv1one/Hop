@@ -37,17 +37,34 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Required by org.signal:libsignal-android:0.86.5's own AAR metadata
+        // -- AGP's checkDebugAarMetadata task fails the build outright if
+        // this isn't enabled for a consumer of that artifact (confirmed by
+        // the actual build failure, not assumed/preemptive). :app's minSdk
+        // is already 26, well above where desugaring usually matters, but
+        // this is a hard requirement declared by the dependency itself, not
+        // an optional opt-in here.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
         jvmTarget = "17"
-        // org.signal:libsignal-client:0.86.5 (consumed transitively via :crypto)
-        // ships classes compiled with Kotlin 2.1 metadata, which this repo's
-        // centrally-pinned Kotlin 1.9.24 compiler can't read without this flag.
-        // See crypto/build.gradle.kts for the full note — this is a real
-        // version-compatibility finding that needs an explicit owner decision
-        // (accept this flag long-term vs. bump the central Kotlin plugin
-        // version), not a silent workaround.
+        // org.signal:libsignal-android:0.86.5 is declared directly below as
+        // an `implementation` dependency of :app (NOT consumed transitively
+        // via :crypto — crypto/build.gradle.kts declares
+        // org.signal:libsignal-client, not -android, as `implementation`,
+        // not `api`, so neither artifact lands on :app's compile classpath
+        // on its own; confirmed by direct read, not assumed). :app needs its
+        // own copy because RoomSignalProtocolStore (com.hop.data) implements
+        // libsignal-client's SignalProtocolStore interface directly (see the
+        // dependency block below for why -android specifically, not
+        // -client). Its Java API classes are compiled with Kotlin 2.1
+        // metadata, which this repo's centrally-pinned Kotlin 1.9.24
+        // compiler can't read without this flag. See crypto/build.gradle.kts
+        // for the full note — this is a real version-compatibility finding
+        // that needs an explicit owner decision (accept this flag long-term
+        // vs. bump the central Kotlin plugin version), not a silent
+        // workaround.
         freeCompilerArgs += listOf("-Xskip-metadata-version-check")
     }
 
@@ -72,6 +89,44 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.1")
     implementation(project(":protocol"))
     implementation(project(":crypto"))
+    // org.signal:libsignal-android:0.86.5 -- deliberately NOT
+    // org.signal:libsignal-client (the artifact crypto/build.gradle.kts
+    // pins), even though :app needs the exact same Java API surface that
+    // artifact provides. A real, load-bearing finding discovered while
+    // getting RoomSignalProtocolStoreTest to actually pass on-device (not
+    // just compile): org.signal:libsignal-client is the desktop/server JVM
+    // artifact -- its jar embeds exactly one native binary,
+    // libsignal_jni_amd64.so, loaded via a temp-extract-and-System.load
+    // bootstrap that only works on a JVM, not inside an Android app process.
+    // It has ZERO Android-ABI native libraries, so any Android runtime code
+    // path that touches libsignal (e.g. constructing a
+    // SignalProtocolAddress) fails with UnsatisfiedLinkError /
+    // NoClassDefFoundError on a real device or emulator, regardless of ABI --
+    // confirmed by decompiling the resolved jar (javap/unzip -l), not
+    // assumed. org.signal:libsignal-android:0.86.5 is Signal's own published
+    // Android-targeting counterpart at the identical version: its AAR bundles
+    // the correct jni/<abi>/libsignal_jni.so for arm64-v8a/armeabi-v7a/x86/
+    // x86_64 (AGP-recognized native-lib packaging), and its POM declares a
+    // `compile`-scope dependency on the exact same
+    // org.signal:libsignal-client:0.86.5 for the shared Java API classes
+    // (SignalProtocolStore, SignalProtocolAddress, etc.) -- so this one line
+    // transitively supplies both the classes RoomSignalProtocolStore
+    // (com.hop.data) compiles against AND a native binary that actually
+    // loads on Android, with no duplicate-class risk (libsignal-android's own
+    // classes.jar contributes only a couple of Android-specific logging
+    // classes, no overlap with libsignal-client's package). :crypto's own
+    // build.gradle.kts is untouched and still correctly depends on plain
+    // libsignal-client -- its tests run as plain JVM/JUnit processes (never
+    // inside an Android runtime), so the desktop-native artifact is exactly
+    // right there. See the -Xskip-metadata-version-check note in the
+    // kotlinOptions block above for why the matching compiler flag is
+    // required alongside this.
+    implementation("org.signal:libsignal-android:0.86.5")
+    // Satisfies the isCoreLibraryDesugaringEnabled requirement above --
+    // AGP-recommended, widely-used desugar_jdk_libs version compatible with
+    // AGP 8.5.2 (this repo's pinned Android Gradle Plugin version, see the
+    // root mobile/android/build.gradle.kts).
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     // Room persistence layer (com.hop.data) -- pinned to 2.6.1, not the latest
     // Room release: Room 2.8.x requires Kotlin 2.0+, which this repo's

@@ -1,10 +1,18 @@
 # HOP Wire Format
 
-Status: **version 2, current.** This is BUILD_PLAN.md's "open decision #4"
-output for Phase 0, extended by Phase 1's encrypted-content-carrying work — a
-versioned frame format every device on the mesh (and every independent
-relay-node implementation, once those exist in Phase 2+) must agree on to
-interoperate.
+Status: **`Frame` version 2, current; socket wire envelope version 1,
+current.** This is BUILD_PLAN.md's "open decision #4" output for Phase 0,
+extended by Phase 1's encrypted-content-carrying work and, later in Phase 1,
+by the 1:1 encrypted-messaging slice's socket envelope — a versioned frame
+format every device on the mesh (and every independent relay-node
+implementation, once those exist in Phase 2+) must agree on to interoperate.
+
+These are two independently versioned things, on purpose (see "Socket-level
+wire envelope" below for why): `Frame` is the WiFi Direct **transfer frame**
+(the thing that goes *inside* the envelope for a post); the **wire envelope**
+is the outermost socket-level framing that wraps every blob sent over a WiFi
+Direct transfer socket, `Frame`-carrying or not. A `Frame` version bump does
+not imply an envelope version bump, and vice versa.
 
 Fields, byte layout, and encoding may still change before Phase 2+ relay and
 decay logic locks this down for real. That is expected. What is **not**
@@ -202,12 +210,97 @@ scope (do not implement these against this frame yet):
 - Multi-frame chunking for large clips (today's implementation sends one
   frame with the whole clip as `payload`).
 - Messaging (1:1/group Double Ratchet) — that's a separate `crypto/`
-  concern from post/clip content encryption; this frame carries post
-  content, not chat messages.
+  concern from post/clip content encryption; `Frame` itself carries post
+  content only, never chat messages. (The socket-level wire envelope below
+  *does* now transport messaging ciphertext and prekey bundles alongside
+  `Frame`, but it does so as an opaque sibling payload type — it never wraps
+  messaging content inside a `Frame`, and `Frame`'s own byte layout above is
+  completely unaffected.)
+
+## Socket-level wire envelope (version 1)
+
+Everything above this section describes `Frame` — the payload for a *post*.
+This section describes a separate, outer layer: the framing actually written
+to and read from the WiFi Direct transfer socket by
+`mobile/android/.../transport/WifiDirectTransport.kt`.
+
+**Before this section existed** (i.e. everywhere in this document above),
+that socket framing was an unversioned implementation detail, not itself
+part of this spec: `[4-byte big-endian length][Frame bytes]`, nothing else.
+Every blob on the socket was assumed to be a `Frame`.
+
+**As of envelope version 1**, the socket framing is tagged:
+
+```
+[1-byte WirePayloadType][4-byte big-endian length][payload bytes]
+```
+
+This is a version bump under this document's own discipline ("any change to
+field layout, field set, or encoding rules MUST bump version") — applied
+here to the envelope layer specifically, not to `Frame`. **This is an
+intentional breaking change to the socket wire format.** Old bare
+`[length][Frame bytes]` bytes are no longer valid input to the envelope
+decoder: there is no other wire-format consumer or interoperating relay-node
+implementation yet at this stage of the project, so there is no compatibility
+shim and none is planned until one exists.
+
+Why a new layer instead of folding this into `Frame` itself, per ADR 0001:
+`Frame`'s 102-byte layout is completely unchanged by this — a
+`WirePayloadType.POST_FRAME`-typed envelope's payload is exactly what
+`Frame.encode()` already produced, byte-for-byte, just now prefixed with a
+type tag before it hits the socket. This is purely additive at the `Frame`
+level. The reason a post frame needs a sibling at the socket layer at all is
+the 1:1 encrypted-messaging slice (PRD §4.3-4.4): prekey bundle announcements
+and Double Ratchet ciphertext now also travel over the same WiFi Direct
+socket a device already has open to a peer, and a receiver needs to know
+which of the three it's looking at before it can decode it.
+
+### `WirePayloadType` enum values
+
+| Value | Type                 | Payload shape                                                              |
+|------:|----------------------|------------------------------------------------------------------------------|
+| 0     | `POST_FRAME`         | Exactly a `Frame.encode()` output, unchanged. See "Byte layout (version 2)" above. |
+| 1     | `PREKEY_BUNDLE`      | A `PreKeyBundleEnvelope.encode()` output — see below.                       |
+| 2     | `MESSAGE_CIPHERTEXT` | A `MessageCiphertextEnvelope.encode()` output — see below.                  |
+
+Any other value is invalid for envelope version 1 and decoders must reject it
+rather than guess, matching `Frame`'s own decode discipline.
+
+### `PreKeyBundleEnvelope` and `MessageCiphertextEnvelope` payload shapes
+
+Both are opaque-payload wrappers with their own simple length-prefixed
+encoding, independent of `Frame`'s fixed-header design (these payloads are
+inherently variable-shaped, so there's no equivalent fixed-header win here):
+
+- `PreKeyBundleEnvelope`: `[4-byte peerId UTF-8 byte length][peerId UTF-8
+  bytes][remaining bytes = opaque serialized PreKeyBundle bytes]`.
+- `MessageCiphertextEnvelope`: `[4-byte senderPeerId UTF-8 byte
+  length][senderPeerId UTF-8 bytes][4-byte recipientPeerId UTF-8 byte
+  length][recipientPeerId UTF-8 bytes][remaining bytes = opaque Double
+  Ratchet ciphertext]`.
+
+`peerId`/`senderPeerId`/`recipientPeerId` are opaque identifying strings as
+far as `protocol/` is concerned (in practice, the hex-encoded
+`senderDeviceId` string already used elsewhere on the wire — see that
+field's own doc above — but this module doesn't need to know that semantic).
+The bundle bytes and ciphertext bytes are **never deserialized or decrypted
+by `protocol/`** — per ADR 0001, `protocol/` may depend on `crypto/` (an
+existing, already-established dependency via `EncryptedFrameCodec`, not a
+new one added here), never the reverse, and this envelope layer specifically
+adds **no new dependency on libsignal-client types**. A serialized
+`PreKeyBundle` or Double Ratchet ciphertext blob is exactly as opaque to
+`protocol/` as `Frame.payload` already is to `Frame` itself.
+
+Reminder of the actual guarantee here, echoing the "Encryption" section
+above: none of this envelope layer implies any access-control or
+confidentiality property on its own. `PREKEY_BUNDLE`/`MESSAGE_CIPHERTEXT`
+payloads are already encrypted (or, for a prekey bundle, meant to be public
+key material) by the time they reach this layer — this envelope only tags
+*what kind* of bytes follow, it does not itself protect them.
 
 ## Reference implementation
 
-The reference implementation now spans two files, split per ADR 0001's
+The reference implementation now spans five files, split per ADR 0001's
 module boundary:
 
 - `protocol/src/main/kotlin/com/hop/protocol/Frame.kt` — the pure wire
@@ -224,3 +317,12 @@ module boundary:
   (`ContentEncryption`, `DecayKeyStore`), per ADR 0001's explicit direction:
   "`protocol/` depends on `crypto/` to encrypt/decrypt message payloads
   before they hit the wire," never the reverse.
+- `protocol/src/main/kotlin/com/hop/protocol/WireEnvelope.kt` — the
+  socket-level `[type][length][payload]` framing described above
+  (`WirePayloadType`, `WireEnvelope.encode()`/`WireEnvelope.decode()`). Like
+  `Frame.kt`, it has no dependency on `crypto/` — `payload` is opaque bytes
+  regardless of `type`.
+- `protocol/src/main/kotlin/com/hop/protocol/PreKeyBundleEnvelope.kt` and
+  `protocol/src/main/kotlin/com/hop/protocol/MessageCiphertextEnvelope.kt` —
+  the two opaque-payload wrapper shapes described above. Neither imports any
+  `org.signal.libsignal.*` type.
