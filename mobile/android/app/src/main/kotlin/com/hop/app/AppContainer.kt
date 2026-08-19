@@ -6,6 +6,7 @@ import com.hop.crypto.AttestationProvider
 import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.StubAttestationProvider
 import com.hop.data.HopDatabase
+import com.hop.data.IdentityKeyPairKeystoreCipher
 import com.hop.data.RoomDecayKeyStorage
 import com.hop.data.RoomSignalProtocolStore
 import com.hop.data.SettingsRepository
@@ -75,6 +76,11 @@ class AppContainer(applicationContext: Context) {
      * [messageRepository] and [transportManager] (which needs it to publish
      * this device's own prekey bundle ambiently on every new connection)
      * depend only on that seam.
+     *
+     * [IdentityKeyPairKeystoreCipher] Android-Keystore-wraps only the own
+     * long-term identity key pair before it hits Room -- see its own doc
+     * and [com.hop.data.IdentityKeyPairEntity]'s doc for why that field
+     * specifically, and no other Signal-store field, gets this treatment.
      */
     val signalProtocolStore: SignalProtocolStore = RoomSignalProtocolStore(
         hopDatabase.signalIdentityDao(),
@@ -82,6 +88,7 @@ class AppContainer(applicationContext: Context) {
         hopDatabase.signalSignedPreKeyDao(),
         hopDatabase.signalKyberPreKeyDao(),
         hopDatabase.signalSessionDao(),
+        IdentityKeyPairKeystoreCipher(),
     )
 
     /**
@@ -108,6 +115,7 @@ class AppContainer(applicationContext: Context) {
      */
     val messageRepository: MessageRepository = MessageRepository(
         messageDao = hopDatabase.messageDao(),
+        signalIdentityDao = hopDatabase.signalIdentityDao(),
         signalProtocolStore = signalProtocolStore,
         blockRepository = blockRepository,
         getOwnPeerId = getOwnPeerId,

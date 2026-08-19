@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -28,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -80,6 +82,7 @@ fun ConversationDetailScreen(
     )
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val hasIdentityChangeWarning by viewModel.hasIdentityChangeWarning.collectAsStateWithLifecycle()
 
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size) {
@@ -114,6 +117,10 @@ fun ConversationDetailScreen(
                 .fillMaxSize()
                 .padding(innerPadding),
         ) {
+            if (hasIdentityChangeWarning) {
+                IdentityChangeWarningBanner(onContinue = viewModel::trustChangedIdentity)
+            }
+
             if (messages.isEmpty()) {
                 // weight(1f), not fillMaxSize() -- this is a Column sibling of the
                 // sendFeedback Text and the input Row below; fillMaxSize() here claims
@@ -185,6 +192,55 @@ fun ConversationDetailScreen(
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Plain-language "this peer's messaging details changed" warning -- backs
+ * [ConversationDetailViewModel.hasIdentityChangeWarning]. Deliberately no
+ * "identity key"/"safety number"/"TOFU" language (PRD §5's
+ * mesh-invisibility mandate); this describes what happened in terms a
+ * non-technical user can act on, not the cryptographic mechanism behind it.
+ * [onContinue] wires to [ConversationDetailViewModel.trustChangedIdentity].
+ */
+@Composable
+private fun IdentityChangeWarningBanner(onContinue: () -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = HopSpacing.md, vertical = HopSpacing.sm),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(HopSpacing.md)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.size(20.dp),
+                )
+                Text(
+                    text = "This person's messaging details changed",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.padding(start = HopSpacing.sm),
+                )
+            }
+            Text(
+                text = "This could mean they're using a new device. Be cautious until you've confirmed it's really them.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                modifier = Modifier.padding(top = HopSpacing.xs),
+            )
+            TextButton(
+                onClick = onContinue,
+                modifier = Modifier.padding(top = HopSpacing.xs),
+            ) {
+                Text("Continue messaging", color = MaterialTheme.colorScheme.onErrorContainer)
             }
         }
     }

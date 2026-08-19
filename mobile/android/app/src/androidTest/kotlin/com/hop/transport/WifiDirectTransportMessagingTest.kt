@@ -7,6 +7,7 @@ import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.DoubleRatchetSession
 import com.hop.crypto.PreKeyBundleCodec
 import com.hop.data.HopDatabase
+import com.hop.data.IdentityKeyPairKeystoreCipher
 import com.hop.data.MessageEntity
 import com.hop.data.PEER_DEVICE_ID
 import com.hop.data.RoomSignalProtocolStore
@@ -78,6 +79,7 @@ class WifiDirectTransportMessagingTest {
             db.signalSignedPreKeyDao(),
             db.signalKyberPreKeyDao(),
             db.signalSessionDao(),
+            IdentityKeyPairKeystoreCipher(),
         )
         val blockRepository = BlockRepository(db.blockedSenderDeviceDao())
         private val postRepository = PostRepository(db.postDao(), DecayKeyStore())
@@ -87,6 +89,7 @@ class WifiDirectTransportMessagingTest {
 
         val messageRepository: MessageRepository = MessageRepository(
             messageDao = db.messageDao(),
+            signalIdentityDao = db.signalIdentityDao(),
             signalProtocolStore = store,
             blockRepository = blockRepository,
             getOwnPeerId = { peerId },

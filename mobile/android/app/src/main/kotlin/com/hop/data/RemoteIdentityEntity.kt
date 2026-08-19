@@ -15,17 +15,22 @@ import androidx.room.PrimaryKey
  * doc), not a Room foreign key to any other table.
  *
  * TOFU, not out-of-band verification: this app has no phone-number/account
- * directory and no Signal-style "safety number" comparison UI (named,
- * deliberate MVP simplification -- see the Phase 1 messaging plan's "no
- * re-verification UI if a peer's identity key changes" note). The first
- * identity key ever seen for a given [peerId] is trusted automatically; if a
- * later message claims to be from the same [peerId] but presents a
- * *different* identity key, [RoomSignalProtocolStore.isTrustedIdentity]
- * returns false and libsignal-client's `SessionBuilder`/`SessionCipher`
- * refuse to proceed (`UntrustedIdentityException`) rather than silently
- * re-trusting -- but nothing in this slice surfaces that refusal to the
- * user, unlike Signal's own safety-number-changed warning. That gap is
- * named, not forgotten.
+ * directory and no Signal-style "safety number" comparison UI. The first
+ * identity key ever seen for a given [peerId] is trusted automatically and
+ * stored in [identityKeyBytes]; if a later message claims to be from the
+ * same [peerId] but presents a *different* identity key,
+ * [RoomSignalProtocolStore.isTrustedIdentity] returns false (refusing to
+ * proceed, matching libsignal-client's own `UntrustedIdentityException`
+ * posture rather than silently re-trusting) **and** records that
+ * newly-seen, not-yet-trusted key in [pendingIdentityKeyBytes] /
+ * [identityChangeDetectedAtMs] as a side effect -- this is what lets the
+ * Inbox UI surface a plain-language warning instead of the peer's messages
+ * just silently failing to send/decrypt with no visible cause.
+ * [com.hop.repository.MessageRepository.trustChangedIdentity] is the
+ * corresponding "acknowledge and continue" action: it promotes
+ * [pendingIdentityKeyBytes] into [identityKeyBytes], clears the pending
+ * fields, and drops any now-stale session for this peer so the next
+ * handshake starts clean.
  */
 @Entity(tableName = "signal_remote_identities")
 data class RemoteIdentityEntity(
@@ -33,19 +38,28 @@ data class RemoteIdentityEntity(
     val peerId: String,
     val identityKeyBytes: ByteArray,
     val firstSeenAtMs: Long,
+    val pendingIdentityKeyBytes: ByteArray? = null,
+    val identityChangeDetectedAtMs: Long? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is RemoteIdentityEntity) return false
         return peerId == other.peerId &&
             identityKeyBytes.contentEquals(other.identityKeyBytes) &&
-            firstSeenAtMs == other.firstSeenAtMs
+            firstSeenAtMs == other.firstSeenAtMs &&
+            pendingIdentityKeyBytes.contentEqualsOrBothNull(other.pendingIdentityKeyBytes) &&
+            identityChangeDetectedAtMs == other.identityChangeDetectedAtMs
     }
 
     override fun hashCode(): Int {
         var result = peerId.hashCode()
         result = 31 * result + identityKeyBytes.contentHashCode()
         result = 31 * result + firstSeenAtMs.hashCode()
+        result = 31 * result + (pendingIdentityKeyBytes?.contentHashCode() ?: 0)
+        result = 31 * result + (identityChangeDetectedAtMs?.hashCode() ?: 0)
         return result
     }
 }
+
+private fun ByteArray?.contentEqualsOrBothNull(other: ByteArray?): Boolean =
+    if (this == null || other == null) this == null && other == null else contentEquals(other)

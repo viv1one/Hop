@@ -22,8 +22,12 @@ import androidx.room.RoomDatabase
  * persisted for the first time -- see its doc for what this fixes:
  * previously every 1:1 conversation needed a fresh handshake after an app
  * restart, since [MessageEntity] preserved message *history* but not the
- * live ratchet session that produced it). No `Migration` is provided for
- * either bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
+ * live ratchet session that produced it). Version bumped 3 -> 4 to add
+ * [RemoteIdentityEntity.pendingIdentityKeyBytes]/[RemoteIdentityEntity.identityChangeDetectedAtMs]
+ * (the "safety-number-changed" warning gap named in that entity's own doc,
+ * closed by surfacing an identity-key mismatch to the Inbox UI instead of
+ * it silently blocking send/decrypt with no visible cause). No `Migration`
+ * is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
  * (see `AppContainer`) is the deliberate choice here, not an oversight: no
  * real users/on-device data exist yet for this database, so there's nothing
  * a real migration would need to preserve.
@@ -43,7 +47,7 @@ import androidx.room.RoomDatabase
         KyberPreKeyEntity::class,
         SessionEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {

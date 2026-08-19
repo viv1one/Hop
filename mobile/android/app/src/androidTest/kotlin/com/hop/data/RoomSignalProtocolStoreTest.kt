@@ -14,12 +14,24 @@ import org.signal.libsignal.protocol.state.SessionRecord
 import org.signal.libsignal.protocol.state.SignalProtocolStore
 import kotlin.test.assertContentEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 
 /**
  * Wires up a [RoomSignalProtocolStore] over every DAO [HopDatabase] exposes
- * for it. File-scoped (not a member of [RoomSignalProtocolStoreTest]) so the
- * private nested `Party` helper class can use it too -- a plain (non-`inner`)
- * nested class has no implicit access to its outer class's members.
+ * for it, plus a fresh [IdentityKeyPairKeystoreCipher]. File-scoped (not a
+ * member of [RoomSignalProtocolStoreTest]) so the private nested `Party`
+ * helper class can use it too -- a plain (non-`inner`) nested class has no
+ * implicit access to its outer class's members.
+ *
+ * Every call to this function within one test-process instantiates its own
+ * [IdentityKeyPairKeystoreCipher], but all of them resolve to the *same*
+ * underlying `AndroidKeyStore` entry (a fixed alias, per-app-process, not
+ * per-instance) -- an accepted approximation of running two simulated
+ * "devices" (Alice/Bob, each with their own [HopDatabase]) inside one real
+ * test process/Keystore rather than two genuinely separate physical
+ * Keystores. This doesn't weaken anything under test here: each entity's
+ * ciphertext still carries its own random IV, so wrapping under a shared
+ * key does not let one party's stored bytes decrypt as another's.
  */
 private fun HopDatabase.asSignalProtocolStore(): RoomSignalProtocolStore = RoomSignalProtocolStore(
     signalIdentityDao(),
@@ -27,6 +39,7 @@ private fun HopDatabase.asSignalProtocolStore(): RoomSignalProtocolStore = RoomS
     signalSignedPreKeyDao(),
     signalKyberPreKeyDao(),
     signalSessionDao(),
+    IdentityKeyPairKeystoreCipher(),
 )
 
 /**
@@ -157,12 +170,25 @@ class RoomSignalProtocolStoreTest {
         // session bytes captured at this moment -- never Bob's earlier
         // session states, which were already erased by [DoubleRatchetSession]
         // as each message was consumed.
+        //
+        // The seeded identityKeyPairBytes is re-wrapped via a fresh
+        // IdentityKeyPairKeystoreCipher (not Bob's raw plain
+        // .serialize() bytes) so it round-trips through
+        // attackerStore.identityKeyPair the same way a real captured-and-
+        // reinserted Room row would. Per IdentityKeyPairKeystoreCipher's own
+        // doc, this only models an attacker who also has live Keystore
+        // access (e.g. a compromised running app process) -- a raw
+        // disk-only extraction of hop.db would instead leave the attacker
+        // holding undecryptable ciphertext, a *stronger* property than this
+        // particular test exercises; this test's actual subject is the
+        // session ratchet's forward secrecy, not identity-key
+        // confidentiality itself.
         val attackerDb = newDb()
         try {
             val attackerStore = attackerDb.asSignalProtocolStore()
             attackerDb.signalIdentityDao().insertOwnIdentity(
                 IdentityKeyPairEntity(
-                    identityKeyPairBytes = bob.store.identityKeyPair.serialize(),
+                    identityKeyPairBytes = IdentityKeyPairKeystoreCipher().encrypt(bob.store.identityKeyPair.serialize()),
                     registrationId = bob.store.localRegistrationId,
                     createdAtMs = 0L,
                 )
@@ -310,7 +336,12 @@ class RoomSignalProtocolStoreTest {
         // regenerate a new identity key pair on every instantiation --
         // otherwise every "restart" would silently break every existing
         // remote session (the far side's isTrustedIdentity check would start
-        // failing against a now-different identity).
+        // failing against a now-different identity). Since getIdentityKeyPair
+        // now unwraps IdentityKeyPairKeystoreCipher-wrapped bytes on every
+        // call, this also doubles as a round trip through the Keystore
+        // wrap/unwrap path itself, across two store instances simulating an
+        // app restart (Keystore-wrapping section below adds a same-instance
+        // variant and the actual ciphertext regression guard).
         val db = newDb()
         try {
             val first = db.asSignalProtocolStore()
@@ -321,6 +352,53 @@ class RoomSignalProtocolStoreTest {
             assertContentEquals(firstIdentity.serialize(), second.identityKeyPair.serialize())
             assert(firstRegistrationId == second.localRegistrationId) {
                 "registration id should be stable across reopened store instances"
+            }
+        } finally {
+            db.close()
+        }
+    }
+
+    // --- Android-Keystore wrapping of the own identity key pair ---
+
+    @Test
+    fun getIdentityKeyPairReturnsTheSameKeyPairAcrossRepeatedCallsOnOneStoreInstance() {
+        // Companion to ownIdentityKeyPairIsStableAcrossReopenedStoreInstances
+        // above (which covers *two* store instances / a simulated restart):
+        // this covers the simpler same-instance case, decrypting the
+        // Keystore-wrapped bytes twice must not somehow perturb them (e.g. no
+        // accidental re-encryption-on-read, no IV reuse bug that corrupts the
+        // stored ciphertext).
+        val db = newDb()
+        try {
+            val store = db.asSignalProtocolStore()
+            val first = store.identityKeyPair
+            val second = store.identityKeyPair
+            assertContentEquals(first.serialize(), second.serialize())
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun rawPersistedIdentityKeyPairBytesAreNotThePlainSerializedKeyPair() {
+        // The actual proof encryption is happening, not just that the round
+        // trip compiles and passes -- a bug that silently no-ops
+        // IdentityKeyPairKeystoreCipher (e.g. returns its input unchanged)
+        // would still pass every round-trip test above. Bypasses
+        // RoomSignalProtocolStore entirely and reads the raw Room row via
+        // the DAO directly, then asserts its identityKeyPairBytes is NOT
+        // byte-equal to the identity key pair's own plain .serialize()
+        // output.
+        val db = newDb()
+        try {
+            val store = db.asSignalProtocolStore()
+            val plainSerialized = store.identityKeyPair.serialize()
+
+            val rawEntity = db.signalIdentityDao().getOwnIdentity()
+            assertNotNull(rawEntity, "own identity row must exist after getIdentityKeyPair() forced its creation")
+            assert(!rawEntity.identityKeyPairBytes.contentEquals(plainSerialized)) {
+                "raw Room-persisted identityKeyPairBytes must be Keystore-wrapped ciphertext, " +
+                    "not the plain serialized key pair -- encryption is not actually happening"
             }
         } finally {
             db.close()

@@ -60,6 +60,16 @@ class ConversationDetailViewModel(
     val messages: StateFlow<List<MessageEntity>> = messageRepository.observeConversation(peerId)
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    /**
+     * True when this peer's identity key changed since it was first trusted
+     * (see [MessageRepository.observeIdentityChangeWarning]'s doc). Surfaced
+     * by [ConversationDetailScreen] as a plain-language banner with a
+     * [trustChangedIdentity] action, never as "identity key"/"safety
+     * number" language (PRD §5's mesh-invisibility mandate).
+     */
+    val hasIdentityChangeWarning: StateFlow<Boolean> = messageRepository.observeIdentityChangeWarning(peerId)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
     fun onDraftTextChanged(text: String) {
         _uiState.update { it.copy(draftText = text, sendFeedback = null) }
     }
@@ -75,6 +85,13 @@ class ConversationDetailViewModel(
                 SendResult.NoSessionAvailable ->
                     _uiState.update { it.copy(sendFeedback = SendFeedback.NoSessionAvailable) }
             }
+        }
+    }
+
+    /** Acknowledges [hasIdentityChangeWarning] and re-enables messaging this peer -- see [MessageRepository.trustChangedIdentity]'s doc for exactly what this does. */
+    fun trustChangedIdentity() {
+        viewModelScope.launch {
+            messageRepository.trustChangedIdentity(peerId)
         }
     }
 }

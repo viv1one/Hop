@@ -47,9 +47,14 @@ import org.signal.libsignal.protocol.util.KeyHelper
  * `IllegalStateException` on a main-thread query, the same real bug class
  * already found and fixed once this session in `PostComposerViewModel`.
  *
- * Identity keys (own and remote) are stored as raw bytes, not
- * Android-Keystore-wrapped -- named, deliberate MVP simplification, flagged
- * in [IdentityKeyPairEntity]'s doc.
+ * This device's own identity key pair (never remote identity keys, which
+ * are peers' *public* keys and stay unwrapped -- see
+ * [RemoteIdentityEntity]'s doc) is Android-Keystore-wrapped at rest: see
+ * [IdentityKeyPairKeystoreCipher] for the AES-256-GCM wrap/unwrap and why
+ * that class lives here rather than in `crypto/`. Prekeys, signed prekeys,
+ * Kyber prekeys, and session records are unaffected -- only the one field
+ * flagged in [IdentityKeyPairEntity]'s doc as materially higher blast-radius
+ * got this treatment.
  */
 class RoomSignalProtocolStore(
     private val identityDao: SignalIdentityDao,
@@ -57,6 +62,7 @@ class RoomSignalProtocolStore(
     private val signedPreKeyDao: SignalSignedPreKeyDao,
     private val kyberPreKeyDao: SignalKyberPreKeyDao,
     private val sessionDao: SignalSessionDao,
+    private val identityKeyPairCipher: IdentityKeyPairKeystoreCipher,
 ) : SignalProtocolStore {
 
     // --- IdentityKeyStore ---
@@ -70,13 +76,21 @@ class RoomSignalProtocolStore(
      * conflict strategy would let the second caller's insert silently win,
      * leaving the first caller holding an [IdentityKeyPair] object that no
      * longer matches what's persisted.
+     *
+     * The persisted [IdentityKeyPairEntity.identityKeyPairBytes] is
+     * [identityKeyPairCipher]-wrapped ciphertext, never the plain
+     * `.serialize()` bytes -- see [IdentityKeyPairKeystoreCipher]'s doc.
+     * Callers of this method that need the entity's registration id (e.g.
+     * [getLocalRegistrationId]) can use the returned entity as-is; callers
+     * that need the actual key pair must go through [getIdentityKeyPair],
+     * which unwraps it.
      */
     @Synchronized
     private fun ensureOwnIdentity(): IdentityKeyPairEntity {
         identityDao.getOwnIdentity()?.let { return it }
         val generated = IdentityKeyPair.generate()
         val entity = IdentityKeyPairEntity(
-            identityKeyPairBytes = generated.serialize(),
+            identityKeyPairBytes = identityKeyPairCipher.encrypt(generated.serialize()),
             registrationId = KeyHelper.generateRegistrationId(false),
             createdAtMs = System.currentTimeMillis(),
         )
@@ -84,7 +98,8 @@ class RoomSignalProtocolStore(
         return entity
     }
 
-    override fun getIdentityKeyPair(): IdentityKeyPair = IdentityKeyPair(ensureOwnIdentity().identityKeyPairBytes)
+    override fun getIdentityKeyPair(): IdentityKeyPair =
+        IdentityKeyPair(identityKeyPairCipher.decrypt(ensureOwnIdentity().identityKeyPairBytes))
 
     override fun getLocalRegistrationId(): Int = ensureOwnIdentity().registrationId
 
@@ -93,7 +108,12 @@ class RoomSignalProtocolStore(
      * key for [address]'s name is stored unconditionally (an upsert,
      * mirroring libsignal-client's own `InMemoryIdentityKeyStore` behavior
      * verified via decompile), and the return value reports whether this
-     * replaced a *different* previously-trusted key.
+     * replaced a *different* previously-trusted key. As a side effect of the
+     * upsert constructing a fresh [RemoteIdentityEntity], this also clears
+     * any pending-identity-change fields the address previously had (see
+     * [isTrustedIdentity]'s doc) -- correct for every real libsignal-client
+     * caller, since [saveIdentity] is only ever invoked *after*
+     * [isTrustedIdentity] has already returned `true` for the same key.
      */
     override fun saveIdentity(address: SignalProtocolAddress, identityKey: IdentityKey): IdentityKeyStore.IdentityChange {
         val existing = identityDao.getRemoteIdentity(address.name)
@@ -117,8 +137,20 @@ class RoomSignalProtocolStore(
      * stored key that *differs* from [identityKey] -> untrusted, which
      * causes libsignal-client's `SessionBuilder`/`SessionCipher` to refuse
      * to proceed (`UntrustedIdentityException`) rather than silently
-     * re-trusting -- see [RemoteIdentityEntity]'s doc for what this app does
-     * (nothing, yet) to surface that refusal to the user.
+     * re-trusting.
+     *
+     * On a mismatch, also records [identityKey] as [address]'s pending,
+     * not-yet-trusted identity via [SignalIdentityDao.markIdentityChangePending]
+     * -- this is the single choke point every mismatch passes through
+     * regardless of whether it originated from [com.hop.repository.MessageRepository.send]
+     * (via `SessionBuilder.process`) or [com.hop.repository.MessageRepository.onEnvelopeReceived]
+     * (via `SessionCipher.decrypt`), so recording it here, rather than at
+     * either call site, is what lets the Inbox UI surface a plain-language
+     * "this person's messaging details changed" warning
+     * ([com.hop.repository.MessageRepository.observeIdentityChangeWarning])
+     * instead of the peer's messages just silently failing with no visible
+     * cause -- the gap [RemoteIdentityEntity]'s doc used to name as "nothing
+     * done to surface that refusal to the user."
      */
     override fun isTrustedIdentity(
         address: SignalProtocolAddress,
@@ -126,7 +158,11 @@ class RoomSignalProtocolStore(
         direction: IdentityKeyStore.Direction,
     ): Boolean {
         val existing = identityDao.getRemoteIdentity(address.name) ?: return true
-        return IdentityKey(existing.identityKeyBytes) == identityKey
+        val trusted = IdentityKey(existing.identityKeyBytes) == identityKey
+        if (!trusted) {
+            identityDao.markIdentityChangePending(address.name, identityKey.serialize(), System.currentTimeMillis())
+        }
+        return trusted
     }
 
     override fun getIdentity(address: SignalProtocolAddress): IdentityKey? =

@@ -2,6 +2,8 @@ package com.hop.app.inbox
 
 import com.hop.data.MessageDao
 import com.hop.data.MessageEntity
+import com.hop.data.RemoteIdentityEntity
+import com.hop.data.SignalIdentityDao
 import com.hop.repository.BlockRepository
 import com.hop.repository.ConversationSummary
 import com.hop.repository.MessageRepository
@@ -41,6 +43,16 @@ internal object NoOpMessageDao : MessageDao {
     override suspend fun insert(message: MessageEntity): Long = error("unused by this fake")
     override fun getMessagesForPeer(peerId: String): Flow<List<MessageEntity>> = error("unused by this fake")
     override fun getLatestMessagePerPeer(): Flow<List<MessageEntity>> = error("unused by this fake")
+}
+
+internal object NoOpSignalIdentityDao : SignalIdentityDao {
+    override fun getOwnIdentity(): com.hop.data.IdentityKeyPairEntity? = error("unused by this fake")
+    override fun insertOwnIdentity(entity: com.hop.data.IdentityKeyPairEntity) = error("unused by this fake")
+    override fun getRemoteIdentity(peerId: String): RemoteIdentityEntity? = error("unused by this fake")
+    override fun observeRemoteIdentity(peerId: String): Flow<RemoteIdentityEntity?> = MutableStateFlow(null)
+    override fun upsertRemoteIdentity(entity: RemoteIdentityEntity) = error("unused by this fake")
+    override fun markIdentityChangePending(peerId: String, newKeyBytes: ByteArray, atMs: Long) = error("unused by this fake")
+    override fun clearIdentityChangePending(peerId: String) = error("unused by this fake")
 }
 
 internal object NoOpSignalProtocolStore : SignalProtocolStore {
@@ -100,6 +112,7 @@ internal class FakeMessageRepository(
     var lastSendCall: Pair<String, String>? = null,
 ) : MessageRepository(
     messageDao = NoOpMessageDao,
+    signalIdentityDao = NoOpSignalIdentityDao,
     signalProtocolStore = NoOpSignalProtocolStore,
     blockRepository = BlockRepository(NoOpBlockedSenderDeviceDao),
     getOwnPeerId = { "unused" },

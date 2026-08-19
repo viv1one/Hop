@@ -5,6 +5,7 @@ import com.hop.crypto.DoubleRatchetSession
 import com.hop.crypto.PreKeyBundleCodec
 import com.hop.data.MessageDao
 import com.hop.data.MessageEntity
+import com.hop.data.SignalIdentityDao
 import com.hop.data.peerSignalAddress
 import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.WirePayloadType
@@ -14,6 +15,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import org.signal.libsignal.protocol.IdentityKey
 import org.signal.libsignal.protocol.state.PreKeyBundle
 import org.signal.libsignal.protocol.state.SignalProtocolStore
 import java.util.concurrent.ConcurrentHashMap
@@ -89,6 +91,7 @@ sealed interface SendResult {
  */
 open class MessageRepository(
     private val messageDao: MessageDao,
+    private val signalIdentityDao: SignalIdentityDao,
     private val signalProtocolStore: SignalProtocolStore,
     private val blockRepository: BlockRepository,
     private val getOwnPeerId: suspend () -> String,
@@ -98,6 +101,62 @@ open class MessageRepository(
     private val cachedPeerBundles = ConcurrentHashMap<String, PreKeyBundle>()
 
     open fun observeConversation(peerId: String): Flow<List<MessageEntity>> = messageDao.getMessagesForPeer(peerId)
+
+    /**
+     * True whenever [peerId] has a pending, not-yet-trusted identity key
+     * change ([RemoteIdentityEntity.pendingIdentityKeyBytes] is non-null) --
+     * the UI-facing signal for the plain-language "this person's messaging
+     * details changed" warning (PRD §5's mesh-invisibility mandate rules out
+     * any "identity key"/"safety number" language in what's actually shown).
+     * Sourced from [SignalIdentityDao.observeRemoteIdentity], not
+     * [signalProtocolStore] -- `SignalProtocolStore` has no query surface of
+     * its own for this, by design (it's a UI concern layered on top of the
+     * trust-on-first-use mechanism, not part of libsignal-client's
+     * contract). See [trustChangedIdentity] for the corresponding "dismiss
+     * and continue" action.
+     */
+    open fun observeIdentityChangeWarning(peerId: String): Flow<Boolean> =
+        signalIdentityDao.observeRemoteIdentity(peerId).map { it?.pendingIdentityKeyBytes != null }
+
+    /**
+     * Promotes [peerId]'s pending, not-yet-trusted identity key (recorded by
+     * [com.hop.data.RoomSignalProtocolStore.isTrustedIdentity] the moment it
+     * detected a mismatch) into the actually-trusted key, then drops any
+     * session built against the old identity so the next [send]/
+     * [onEnvelopeReceived] starts a clean handshake against the new one --
+     * an old session's ratchet state has no valid continuation once the far
+     * side's identity has changed underneath it. A no-op if [peerId] has no
+     * pending change (nothing to promote).
+     *
+     * Deliberately does **not** touch [cachedPeerBundles]: the pending key
+     * this promotes is the identity key already carried by whatever bundle
+     * is currently cached for [peerId] (that's *why* the mismatch was
+     * detected in the first place -- see [com.hop.data.RoomSignalProtocolStore.isTrustedIdentity]'s
+     * doc), so the same cached bundle becomes usable immediately once
+     * trusted, no fresh bundle announcement required.
+     *
+     * [pendingIdentityKeyBytes] is only ever written by [com.hop.data.RoomSignalProtocolStore.isTrustedIdentity]
+     * from an already-validated `IdentityKey`'s own `.serialize()` output, so
+     * `IdentityKey(pendingKeyBytes)` below should never actually throw in
+     * real operation -- but this is called directly from a UI button tap
+     * ([com.hop.app.inbox.ConversationDetailViewModel.trustChangedIdentity]),
+     * so it's wrapped rather than left to crash the whole app on any future
+     * change that breaks that invariant, matching [send]/[onEnvelopeReceived]'s
+     * own "log and drop, never throw" posture for libsignal-touching calls.
+     */
+    open suspend fun trustChangedIdentity(peerId: String) = withContext(ioDispatcher) {
+        val entity = signalIdentityDao.getRemoteIdentity(peerId) ?: return@withContext
+        val pendingKeyBytes = entity.pendingIdentityKeyBytes ?: return@withContext
+
+        try {
+            signalProtocolStore.saveIdentity(peerSignalAddress(peerId), IdentityKey(pendingKeyBytes))
+            signalProtocolStore.deleteAllSessions(peerId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to trust peer $peerId's changed identity key", e)
+            return@withContext
+        }
+        signalIdentityDao.clearIdentityChangePending(peerId)
+    }
 
     open fun observeConversationSummaries(): Flow<List<ConversationSummary>> =
         messageDao.getLatestMessagePerPeer().map { latestPerPeer ->

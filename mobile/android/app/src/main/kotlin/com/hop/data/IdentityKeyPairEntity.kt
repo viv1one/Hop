@@ -23,13 +23,18 @@ import androidx.room.PrimaryKey
  * pattern of round-tripping libsignal-client records through their native
  * serialize/deserialize rather than a hand-rolled encoding.
  *
- * Stored as raw bytes, not Android-Keystore-wrapped -- a named, deliberate
- * MVP simplification carried over from [DecayKeyEntity]'s precedent, flagged
- * separately here because identity-key compromise has a materially worse
- * blast radius than a decay-key compromise (an attacker with this key pair
- * can forge this device's identity in every *future* session, not just
- * decrypt one already-expired post). Needs a Keystore-wrapping pass before
- * any real pilot -- not done in this slice.
+ * [identityKeyPairBytes] is Android-Keystore-wrapped ciphertext, not raw
+ * key-pair bytes -- flagged separately from [DecayKeyEntity]'s (still
+ * unwrapped) precedent because identity-key compromise has a materially
+ * worse blast radius than a decay-key compromise (an attacker with this key
+ * pair can forge this device's identity in every *future* session, not just
+ * decrypt one already-expired post). Wrapped/unwrapped by
+ * [RoomSignalProtocolStore] via [IdentityKeyPairKeystoreCipher]
+ * (AES-256-GCM, hardware-backed where the device supports it) immediately
+ * before/after this column is written/read -- see that cipher class's doc
+ * for the exact scheme and its limits (it protects a raw on-disk `hop.db`
+ * extraction, not a fully compromised running app process). [registrationId]
+ * and [createdAtMs] are unaffected, stored as plain values same as before.
  */
 @Entity(tableName = "signal_identity_key_pair")
 data class IdentityKeyPairEntity(
