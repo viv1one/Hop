@@ -98,7 +98,13 @@ fun ConversationDetailScreen(
                 .padding(innerPadding),
         ) {
             if (messages.isEmpty()) {
-                Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                // weight(1f), not fillMaxSize() -- this is a Column sibling of the
+                // sendFeedback Text and the input Row below; fillMaxSize() here claims
+                // the Column's entire remaining height for this unweighted child alone,
+                // pushing those later siblings off the bottom of the visible screen
+                // (found via real on-device testing, not caught by ViewModel unit tests,
+                // which don't exercise actual Compose layout).
+                Box(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                     Text(
                         text = "No messages yet -- say hello.",
                         style = MaterialTheme.typography.bodyMedium,

@@ -81,6 +81,35 @@ android {
         // -Xskip-metadata-version-check note above).
         kotlinCompilerExtensionVersion = "1.5.14"
     }
+
+    packaging {
+        // Real packaging bug found while exporting a build for the first time:
+        // :app depends on :crypto (implementation(project(":crypto"))), and
+        // :crypto depends on org.signal:libsignal-client (the desktop/server
+        // JVM artifact, correct for :crypto's own plain-JVM unit tests -- see
+        // its build.gradle.kts). `implementation` hides a dependency from a
+        // downstream module's *compile* classpath, but NOT from the final
+        // APK's packaging graph -- :app still bundles everything on its own
+        // runtime classpath, including :crypto's transitive dependencies. The
+        // result: alongside the correct org.signal:libsignal-android .so
+        // files this app actually needs (see the dependencies block below),
+        // the APK was also bundling libsignal-client's desktop-only
+        // .dylib/.dll native libraries -- completely inert on Android, no
+        // device can ever load them -- plus a duplicate "_testing" variant of
+        // every native lib (Signal's internal test-suite build, not used by
+        // this app either). Confirmed by unzipping a built APK: this exclusion
+        // took it from ~660MB to its real size. Excluding these here, in
+        // :app's own packaging block, rather than trying to stop :crypto from
+        // depending on libsignal-client at all -- :crypto's own tests
+        // genuinely need that desktop artifact, this is purely about what
+        // :app ships to a device.
+        jniLibs {
+            excludes += "**/libsignal_jni_testing.so"
+        }
+        resources {
+            excludes += setOf("**/*.dylib", "**/*.dll")
+        }
+    }
 }
 
 dependencies {
