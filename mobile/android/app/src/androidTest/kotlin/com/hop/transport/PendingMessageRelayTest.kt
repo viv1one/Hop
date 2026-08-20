@@ -18,6 +18,7 @@ import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BlockRepository
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.MessageRepository
 import com.hop.repository.PendingMessageRepository
@@ -130,11 +131,13 @@ class PendingMessageRelayTest {
         private val dontRelayRepository = DontRelayRepository(db.dontRelayFlagDao(), db.relayQueueDao(), relayPolicy)
         private val postRepository = PostRepository(db.postDao(), DecayKeyStore())
         private val receivedFrameStore = ReceivedFrameStore(postRepository, DecayKeyStore(), tempFolder.newFolder())
+        val bundleRepository = BundleRepository(db.bundleQueueDao(), relayPolicy)
 
         val dispatcher = EnvelopeDispatcher(
             receivedFrameStore = receivedFrameStore,
             dontRelayRepository = dontRelayRepository,
             pendingMessageRepository = pendingMessageRepository,
+            bundleRepository = bundleRepository,
             getOwnPeerId = { peerId },
             onPreKeyBundleReceived = messageRepository::cachePeerBundle,
             onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
@@ -204,7 +207,12 @@ class PendingMessageRelayTest {
         /** Mirrors [WifiDirectTransport.announceOwnPreKeyBundle]. */
         fun announceOwnBundle() {
             val bundle = party.preKeyRotationManager.currentBundle()
-            val envelope = PreKeyBundleEnvelope(peerId = party.peerId, bundleBytes = PreKeyBundleCodec.encode(bundle))
+            val envelope = PreKeyBundleEnvelope(
+                peerId = party.peerId,
+                hopCount = 0,
+                originatedAtMs = System.currentTimeMillis(),
+                bundleBytes = PreKeyBundleCodec.encode(bundle),
+            )
             send(WirePayloadType.PREKEY_BUNDLE, envelope.encode())
         }
 

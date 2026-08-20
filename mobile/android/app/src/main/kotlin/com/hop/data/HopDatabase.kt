@@ -56,7 +56,17 @@ import androidx.room.RoomDatabase
  * [GroupMemberEntity], and [GroupMessageEntity] (Phase 2 Slice 4's group
  * messaging -- per-member pairwise Double Ratchet fan-out, PRD §4.3, ADR 0001;
  * see [GroupEntity]'s own doc for why groups get their own tables rather than
- * reusing [MessageEntity]/[MessageDao]). No
+ * reusing [MessageEntity]/[MessageDao]). Version bumped 9 -> 10 to add
+ * [BundleQueueEntity] (the prekey-bundle relay/discovery follow-up's
+ * persisted mesh flood-relay queue for prekey bundles -- see its own doc and
+ * `com.hop.repository.BundleRepository`'s doc for why this table is
+ * peer-id-keyed with conditional replace rather than content-hash-keyed with
+ * first-custody-wins like every other relay table above): without this, a
+ * prekey bundle could only ever be learned via direct radio contact, which
+ * is also what silently capped Phase 2 Slice 4's group messaging to
+ * creator<->member reachability only (two members who'd each only met the
+ * creator, never each other, could never actually message directly -- see
+ * [GroupEntity]'s own doc for that named gap). No
  * `Migration` is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
  * (see `AppContainer`) is the deliberate choice here, not an oversight: no
  * real users/on-device data exist yet for this database, so there's nothing
@@ -84,8 +94,9 @@ import androidx.room.RoomDatabase
         GroupEntity::class,
         GroupMemberEntity::class,
         GroupMessageEntity::class,
+        BundleQueueEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {
@@ -107,4 +118,5 @@ abstract class HopDatabase : RoomDatabase() {
     abstract fun pendingMessageDao(): PendingMessageDao
     abstract fun groupDao(): GroupDao
     abstract fun groupMessageDao(): GroupMessageDao
+    abstract fun bundleQueueDao(): BundleQueueDao
 }

@@ -21,6 +21,7 @@ import com.hop.crypto.DecayKeyStore
 import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PreKeyRotationManager
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PointsRepository
@@ -68,6 +69,7 @@ class TransportManager(
     dontRelayRepository: DontRelayRepository,
     pointsRepository: PointsRepository,
     pendingMessageRepository: PendingMessageRepository,
+    bundleRepository: BundleRepository,
     preKeyRotationManager: PreKeyRotationManager,
     getOwnPeerId: suspend () -> String,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
@@ -86,6 +88,7 @@ class TransportManager(
         dontRelayRepository = dontRelayRepository,
         pointsRepository = pointsRepository,
         pendingMessageRepository = pendingMessageRepository,
+        bundleRepository = bundleRepository,
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = onPreKeyBundleReceived,

@@ -16,6 +16,7 @@ import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
@@ -113,6 +114,7 @@ class RelayTest {
         lateinit var dontRelayRepository: DontRelayRepository
         lateinit var relayRepository: RelayRepository
         lateinit var pendingMessageRepository: PendingMessageRepository
+        lateinit var bundleRepository: BundleRepository
         lateinit var receivedFrameStore: ReceivedFrameStore
         lateinit var dispatcher: EnvelopeDispatcher
 
@@ -131,11 +133,13 @@ class RelayTest {
                 isFlaggedForSuppression = dontRelayRepository::isSuppressed,
             )
             pendingMessageRepository = PendingMessageRepository(db.pendingMessageDao(), relayPolicy)
+            bundleRepository = BundleRepository(db.bundleQueueDao(), relayPolicy)
             receivedFrameStore = ReceivedFrameStore(postRepository, decayKeyStore, postsDir, relayPolicy)
             dispatcher = EnvelopeDispatcher(
                 receivedFrameStore = receivedFrameStore,
                 dontRelayRepository = dontRelayRepository,
                 pendingMessageRepository = pendingMessageRepository,
+                bundleRepository = bundleRepository,
                 getOwnPeerId = { name },
                 onPreKeyBundleReceived = { _, _ -> },
                 onMessageCiphertextReceived = { _, _ -> },

@@ -15,6 +15,7 @@ import com.hop.data.SettingsRepository
 import com.hop.data.toPeerIdHex
 import com.hop.protocol.RelayPolicy
 import com.hop.repository.BlockRepository
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.MessageRepository
 import com.hop.repository.PendingMessageRepository
@@ -119,6 +120,18 @@ class AppContainer(applicationContext: Context) {
     )
 
     /**
+     * The prekey-bundle relay/discovery follow-up's persisted mesh
+     * flood-relay queue for prekey bundles (see [BundleRepository]'s own
+     * doc). Shares the same default [RelayPolicy] shape [relayRepository]/
+     * [pendingMessageRepository] use -- no separate tuning input exists for
+     * bundles either.
+     */
+    val bundleRepository: BundleRepository = BundleRepository(
+        hopDatabase.bundleQueueDao(),
+        RelayPolicy(),
+    )
+
+    /**
      * Persistent Double Ratchet session/key store (Stage 1). Typed as the
      * concrete [RoomSignalProtocolStore] (not the plain libsignal-client
      * `SignalProtocolStore` interface) since [preKeyRotationManager] below
@@ -196,6 +209,7 @@ class AppContainer(applicationContext: Context) {
         dontRelayRepository = dontRelayRepository,
         pointsRepository = pointsRepository,
         pendingMessageRepository = pendingMessageRepository,
+        bundleRepository = bundleRepository,
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,

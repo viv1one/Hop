@@ -274,7 +274,35 @@ encoding, independent of `Frame`'s fixed-header design (these payloads are
 inherently variable-shaped, so there's no equivalent fixed-header win here):
 
 - `PreKeyBundleEnvelope`: `[4-byte peerId UTF-8 byte length][peerId UTF-8
-  bytes][remaining bytes = opaque serialized PreKeyBundle bytes]`.
+  bytes][1-byte hopCount][8-byte originatedAtMs][remaining bytes = opaque
+  serialized PreKeyBundle bytes]`. `hopCount`/`originatedAtMs` were added for
+  prekey-bundle mesh flood relay (the "prekey-bundle relay/discovery"
+  follow-up to Phase 2's four original slices: post relay, "don't relay"
+  flags, 1:1 store-and-forward, group messaging) — a breaking change to this
+  envelope's previous shape, accepted under the same "no real users yet"
+  justification that covered `MessageCiphertextEnvelope`'s own
+  `hopCount`/`originatedAtMs` addition below and `WireEnvelope`'s
+  introduction as a breaking change to the socket framing (see below). They
+  mirror `MessageCiphertextEnvelope.hopCount`/`MessageCiphertextEnvelope.originatedAtMs`
+  exactly (same uint8/int64 encoding, same semantics: `hopCount` is `0` at a
+  genuine direct announce and increments by one per relay hop; `originatedAtMs`
+  is epoch millis at first announce) so a bundle relay-custody row can be
+  evaluated against the same `RelayPolicy.isEligibleForRelay`/
+  `RelayPolicy.isExpired` already used for posts and messages, unmodified.
+  The TTL these are checked against is `PreKeyBundleEnvelope.DEFAULT_TTL_SECONDS`
+  (6 hours) — a propagation-hygiene knob, not a safety control: a stale
+  bundle already fails safely on its own (see
+  `com.hop.repository.BundleRepository`'s own "Limits" doc for the traced
+  libsignal-client call chain establishing that). **`hopCount == 0` is
+  load-bearing on the receiving end**, not just a relay-eligibility input: it
+  is what `com.hop.transport.EnvelopeDispatcher.dispatch`'s `PREKEY_BUNDLE`
+  branch uses to decide whether the connection an envelope arrived on
+  genuinely belongs to `peerId` (direct announce, safe to tag as this
+  device's line to that peer) or merely carried `peerId`'s bundle on their
+  behalf (a relayed copy, `hopCount >= 1`) — conflating the two would let a
+  later message send believe it reached the bundle's owner directly when it
+  only reached a carrier, skipping durable relay custody with nothing to
+  fall back on.
 - `MessageCiphertextEnvelope`: `[4-byte senderPeerId UTF-8 byte
   length][senderPeerId UTF-8 bytes][4-byte recipientPeerId UTF-8 byte
   length][recipientPeerId UTF-8 bytes][1-byte hopCount][8-byte

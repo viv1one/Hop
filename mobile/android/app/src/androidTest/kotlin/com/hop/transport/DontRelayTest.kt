@@ -15,6 +15,7 @@ import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
@@ -91,10 +92,12 @@ class DontRelayTest {
         )
         private val receivedFrameStore = ReceivedFrameStore(postRepository, decayKeyStore, postsDir, relayPolicy)
         private val pendingMessageRepository = PendingMessageRepository(db.pendingMessageDao(), relayPolicy)
+        private val bundleRepository = BundleRepository(db.bundleQueueDao(), relayPolicy)
         val dispatcher = EnvelopeDispatcher(
             receivedFrameStore = receivedFrameStore,
             dontRelayRepository = dontRelayRepository,
             pendingMessageRepository = pendingMessageRepository,
+            bundleRepository = bundleRepository,
             getOwnPeerId = { name },
             onPreKeyBundleReceived = { _, _ -> },
             onMessageCiphertextReceived = { _, _ -> },

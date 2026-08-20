@@ -100,8 +100,9 @@ fun GroupCreateScreen(
             )
 
             Text(
-                text = "Group messages reach members best when everyone has met in person at least " +
-                    "once -- someone who's only met you, and not the others, might not get every message.",
+                text = "Two members who haven't met each other in person yet may not get each other's " +
+                    "group messages right away -- this usually sorts itself out once your phones have " +
+                    "both been near other group members a few times.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = HopSpacing.md, vertical = HopSpacing.xs),

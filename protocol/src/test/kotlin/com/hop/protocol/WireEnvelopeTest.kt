@@ -51,7 +51,7 @@ class WireEnvelopeTest {
 
     @Test
     fun `round trip preserves type and payload for PREKEY_BUNDLE`() {
-        val payload = PreKeyBundleEnvelope(peerId = "abcdef0123456789", bundleBytes = randomBytes(128)).encode()
+        val payload = PreKeyBundleEnvelope(peerId = "abcdef0123456789", hopCount = 0, originatedAtMs = 1_700_000_000_000L, bundleBytes = randomBytes(128)).encode()
         val encoded = WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, payload)
 
         val decoded = WireEnvelope.decode(encoded)

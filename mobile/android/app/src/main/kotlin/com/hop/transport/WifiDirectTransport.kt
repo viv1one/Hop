@@ -8,6 +8,7 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.PreKeyBundleCodec
+import com.hop.data.BundleQueueEntity
 import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PendingMessageEntity
 import com.hop.data.PostEntity
@@ -19,6 +20,7 @@ import com.hop.protocol.PreKeyBundleEnvelope
 import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PointsRepository
@@ -114,6 +116,16 @@ class WifiDirectTransport(
      */
     private val pendingMessageRepository: PendingMessageRepository,
     /**
+     * The prekey-bundle relay/discovery follow-up's persisted mesh
+     * flood-relay queue for prekey bundles (see its own doc). Backs
+     * [registerConnectionAndGetBacklog]'s bundle backlog and the
+     * [WirePayloadType.PREKEY_BUNDLE] branch of [EnvelopeDispatcher.dispatch]
+     * for a *relayed* (`hopCount >= 1`) bundle -- a genuine direct announce
+     * (`hopCount == 0`) never touches this repository, see that branch's own
+     * doc for why.
+     */
+    private val bundleRepository: BundleRepository,
+    /**
      * Owns this device's one-time/signed/Kyber prekey pool and rotation
      * policy -- needed here (not just in `com.hop.repository.MessageRepository`)
      * so this class can publish and announce this device's own current
@@ -189,6 +201,7 @@ class WifiDirectTransport(
         receivedFrameStore = receivedFrameStore,
         dontRelayRepository = dontRelayRepository,
         pendingMessageRepository = pendingMessageRepository,
+        bundleRepository = bundleRepository,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
@@ -409,7 +422,9 @@ class WifiDirectTransport(
      * [WireEnvelope]-wrapped, followed by every non-expired "don't relay"
      * flag from [dontRelayRepository]'s persisted queue, followed by every
      * relay-eligible message from [pendingMessageRepository]'s persisted
-     * queue (Phase 2 Slice 3) -- see
+     * queue (Phase 2 Slice 3), followed by every relay-eligible bundle from
+     * [bundleRepository]'s persisted queue (the prekey-bundle relay/discovery
+     * follow-up) -- see
      * [outboxLock]'s doc for why this must share a lock with
      * [broadcastPost]/[broadcastDontRelayFlag]/[sendMessage] rather than
      * query any repository separately. [dontRelayRepository]'s flag backlog is offered
@@ -433,7 +448,8 @@ class WifiDirectTransport(
             val postBacklog = runBlocking { relayRepository.buildOutgoingBacklog() }
             val flagBacklog = runBlocking { dontRelayRepository.buildOutgoingFlagBacklog() }
             val messageBacklog = runBlocking { pendingMessageRepository.buildOutgoingBacklog() }
-            postBacklog + flagBacklog + messageBacklog
+            val bundleBacklog = runBlocking { bundleRepository.buildOutgoingBacklog() }
+            postBacklog + flagBacklog + messageBacklog + bundleBacklog
         }
 
     /**
@@ -512,12 +528,23 @@ class WifiDirectTransport(
      * converge, so calling this from there (rather than duplicating the call
      * in both) covers both sides of a WiFi Direct connection with one call
      * site.
+     *
+     * Always constructs the envelope with `hopCount = 0` -- this is, by
+     * definition, a genuine direct announce (this device really is on the
+     * other end of [connection]), never a relayed copy. See
+     * [EnvelopeDispatcher.dispatch]'s `PREKEY_BUNDLE` branch for why that
+     * distinction is load-bearing on the *receiving* end.
      */
     private fun announceOwnPreKeyBundle(connection: PeerConnection) {
         try {
             val ownPeerId = runBlocking { getOwnPeerId() }
             val bundleBytes = PreKeyBundleCodec.encode(preKeyRotationManager.currentBundle())
-            val envelope = PreKeyBundleEnvelope(peerId = ownPeerId, bundleBytes = bundleBytes)
+            val envelope = PreKeyBundleEnvelope(
+                peerId = ownPeerId,
+                hopCount = 0,
+                originatedAtMs = System.currentTimeMillis(),
+                bundleBytes = bundleBytes,
+            )
             if (connection.trySend(WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, envelope.encode()))) {
                 onLog("Announced own prekey bundle to a newly connected peer")
             } else {
@@ -838,6 +865,12 @@ class WifiDirectTransport(
                             handleNewlyReceivedMessage(result.row, arrivedOn = connection)
                             deliverAnyPendingMessagesTo(result.senderPeerId, connection)
                         }
+                        is DispatchResult.NewRelayableBundle -> handleNewlyReceivedBundle(result.row, arrivedOn = connection)
+                        is DispatchResult.DirectBundleAnnounce -> {
+                            connection.remotePeerId = result.peerId
+                            if (result.row != null) handleNewlyReceivedBundle(result.row, arrivedOn = connection)
+                            deliverAnyPendingMessagesTo(result.peerId, connection)
+                        }
                         DispatchResult.NoOp -> Unit
                     }
                     onLog("Received and handled a ${envelope.type} envelope")
@@ -934,6 +967,36 @@ class WifiDirectTransport(
             if (connection === arrivedOn) continue
             if (!connection.trySend(envelope)) {
                 onLog("Live message relay push failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
+     * Called once per genuinely-new [BundleQueueEntity] this device takes
+     * relay custody of on behalf of a bundle it did not itself announce (see
+     * [DispatchResult.NewRelayableBundle]) -- live-pushes a `hopCount + 1`
+     * re-encoded copy to every *other* currently-connected peer, never back
+     * to [arrivedOn], mirroring [handleNewlyReceivedMessage]'s own shape
+     * exactly. [bundleRepository.considerForRelay] has already been called by
+     * [EnvelopeDispatcher.dispatch] by the time this runs.
+     *
+     * Deliberately never touches `connection.remotePeerId` for *any*
+     * connection here, including [arrivedOn] -- this method only exists for
+     * a bundle this device is carrying, never one whose owner is genuinely on
+     * the other end of a live connection (that case is
+     * [DispatchResult.PeerIdentified], handled entirely separately). See
+     * [EnvelopeDispatcher.dispatch]'s `PREKEY_BUNDLE` branch for the
+     * message-misdirection bug this split closes.
+     */
+    private fun handleNewlyReceivedBundle(row: BundleQueueEntity, arrivedOn: PeerConnection) {
+        val storedEnvelope = PreKeyBundleEnvelope.decode(row.encodedEnvelope)
+        val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, outgoingEnvelope.encode())
+        for (connection in activeConnections) {
+            if (connection === arrivedOn) continue
+            if (!connection.trySend(envelope)) {
+                onLog("Live bundle relay push failed to a connected peer; dropping that connection")
                 activeConnections.remove(connection)
             }
         }
@@ -1125,6 +1188,23 @@ internal class EnvelopeDispatcher(
      */
     private val pendingMessageRepository: PendingMessageRepository,
     /**
+     * The prekey-bundle relay/discovery follow-up's persisted mesh
+     * flood-relay queue for prekey bundles -- [dispatch]'s
+     * [WirePayloadType.PREKEY_BUNDLE] branch calls
+     * [BundleRepository.considerForRelay] unconditionally, at every hop
+     * including a genuine direct announce (`hopCount == 0`): this device
+     * must take custody of a bundle it only ever learned directly too, or
+     * the mesh never gets a first hop to relay from at all. What *does*
+     * depend on [PreKeyBundleEnvelope.hopCount] is only whether the
+     * connection's `remotePeerId` gets tagged with the bundle owner's id
+     * ([DispatchResult.DirectBundleAnnounce] at hop 0 vs.
+     * [DispatchResult.NewRelayableBundle] at `hopCount >= 1`, which must
+     * never tag) -- see those cases' own docs for why conflating
+     * "take custody" with "safe to tag" was the bug an earlier version of
+     * this feature had.
+     */
+    private val bundleRepository: BundleRepository,
+    /**
      * This device's own stable messaging identity -- a suspend function
      * (mirroring the same `getOwnPeerId: suspend () -> String` pattern
      * already used by [WifiDirectTransport]/`MessageRepository`) rather than
@@ -1140,7 +1220,7 @@ internal class EnvelopeDispatcher(
 ) {
     /**
      * Handles [envelope] and returns what the caller needs to act on next --
-     * see [DispatchResult]'s own doc for the five cases.
+     * see [DispatchResult]'s own doc for the seven cases.
      */
     suspend fun dispatch(envelope: WireEnvelope): DispatchResult = when (envelope.type) {
         WirePayloadType.POST_FRAME -> {
@@ -1149,8 +1229,35 @@ internal class EnvelopeDispatcher(
         }
         WirePayloadType.PREKEY_BUNDLE -> {
             val bundleEnvelope = PreKeyBundleEnvelope.decode(envelope.payload)
+            // Cache unconditionally -- valid, cacheable bundle content
+            // regardless of whether this connection's owner is the bundle's
+            // owner or just a carrier. This is what makes group
+            // member-introduction free (see BundleRepository's own doc).
             onPreKeyBundleReceived(bundleEnvelope.peerId, bundleEnvelope.bundleBytes)
-            DispatchResult.PeerIdentified(bundleEnvelope.peerId)
+            // Take relay custody at EVERY hop, including hop 0 -- a device
+            // that only ever learns a bundle directly must still be able to
+            // re-offer it onward, or the mesh has no first hop to relay from
+            // at all (see DirectBundleAnnounce's own doc for the gap this
+            // closes; a first version of this feature only took custody on
+            // the hopCount >= 1 branch below, which meant nothing ever
+            // seeded the relay queue in the first place).
+            val row = bundleRepository.considerForRelay(bundleEnvelope)
+            if (bundleEnvelope.hopCount == 0) {
+                // Genuine direct announce -- the peer on the other end of
+                // THIS connection really is bundleEnvelope.peerId. Safe to
+                // tag, independent of whether custody-taking above succeeded.
+                DispatchResult.DirectBundleAnnounce(row, bundleEnvelope.peerId)
+            } else if (row != null) {
+                // Being carried by someone else -- take relay custody, but
+                // never tag this connection as bundleEnvelope.peerId (that
+                // would make a later sendMessage() unicast fast-path believe
+                // it reached the owner directly when it only reached a
+                // carrier, skipping durable PendingMessageRepository custody
+                // with nothing to fall back on).
+                DispatchResult.NewRelayableBundle(row, bundleEnvelope.peerId)
+            } else {
+                DispatchResult.NoOp
+            }
         }
         WirePayloadType.MESSAGE_CIPHERTEXT -> {
             val messageEnvelope = MessageCiphertextEnvelope.decode(envelope.payload)
@@ -1206,15 +1313,47 @@ internal class EnvelopeDispatcher(
  *   [PeerIdentified]), live-push it onward (see
  *   [WifiDirectTransport.handleNewlyReceivedMessage]), and check for a local
  *   delivery-confirmation opportunity (same as [PeerIdentified]).
+ * - [NewRelayableBundle] (the prekey-bundle relay/discovery follow-up): a
+ *   genuinely-new (fresher than any row already held, or the first ever seen
+ *   for this peer) [WirePayloadType.PREKEY_BUNDLE] envelope arrived at
+ *   `hopCount >= 1` -- i.e. this connection merely *carried* it, its owner is
+ *   not on the other end. Already taken into relay custody via
+ *   [BundleRepository.considerForRelay] by the time this is returned.
+ *   Callers live-push it onward (see
+ *   [WifiDirectTransport.handleNewlyReceivedBundle]) but **must never** tag
+ *   the connection's `remotePeerId` with [peerId] here -- unlike every other
+ *   case above, this one is specifically the "not a direct line to this
+ *   peer" case. See [EnvelopeDispatcher.dispatch]'s `PREKEY_BUNDLE` branch
+ *   for the message-misdirection bug this distinction exists to close.
+ * - [DirectBundleAnnounce]: a [WirePayloadType.PREKEY_BUNDLE] envelope
+ *   arrived at `hopCount == 0` -- a genuine direct announce, the peer on the
+ *   other end of *this* connection really is [peerId], so it's safe (and
+ *   required, same as [PeerIdentified]) to tag the connection with it.
+ *   Separately -- and this is the part a first version of this feature
+ *   missed, since it only took relay custody on the `hopCount >= 1` branch
+ *   below -- this device must *also* take relay custody of a bundle it only
+ *   ever learned directly, or the mesh never gets a first hop to relay from
+ *   at all (no device would ever re-offer a bundle it hadn't itself received
+ *   via relay, so nothing would ever seed the flood). [row] is non-null iff
+ *   [BundleRepository.considerForRelay] took genuinely-new custody, in which
+ *   case callers must live-push it
+ *   onward the same way [NewRelayableBundle] does (see
+ *   [WifiDirectTransport.handleNewlyReceivedBundle]), *in addition to*
+ *   tagging the connection -- these two actions are independent, not
+ *   mutually exclusive, unlike the hop-gating check that decides between
+ *   [DirectBundleAnnounce] and [NewRelayableBundle] in the first place.
  * - [NoOp]: nothing further for the caller to do -- either an envelope that
  *   turned out to be an already-seen clipHash/already-recorded flag/
- *   already-held message custody, or bytes that didn't decode.
+ *   already-held message custody/a stale-or-ineligible bundle, or bytes that
+ *   didn't decode.
  */
 internal sealed interface DispatchResult {
     data class PeerIdentified(val peerId: String) : DispatchResult
     data class NewPostFrame(val frame: Frame) : DispatchResult
     data class NewDontRelayFlag(val row: DontRelayFlagEntity) : DispatchResult
     data class NewRelayableMessage(val row: PendingMessageEntity, val senderPeerId: String) : DispatchResult
+    data class NewRelayableBundle(val row: BundleQueueEntity, val peerId: String) : DispatchResult
+    data class DirectBundleAnnounce(val row: BundleQueueEntity?, val peerId: String) : DispatchResult
     data object NoOp : DispatchResult
 }
 

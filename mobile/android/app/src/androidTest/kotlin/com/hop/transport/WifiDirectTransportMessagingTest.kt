@@ -16,6 +16,7 @@ import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BlockRepository
+import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.MessageRepository
 import com.hop.repository.PendingMessageRepository
@@ -127,10 +128,13 @@ class WifiDirectTransportMessagingTest {
             RelayPolicy(),
         )
 
+        val bundleRepository = BundleRepository(db.bundleQueueDao(), RelayPolicy())
+
         val dispatcher = EnvelopeDispatcher(
             receivedFrameStore = receivedFrameStore,
             dontRelayRepository = dontRelayRepository,
             pendingMessageRepository = pendingMessageRepository,
+            bundleRepository = bundleRepository,
             getOwnPeerId = { peerId },
             onPreKeyBundleReceived = messageRepository::cachePeerBundle,
             onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
@@ -139,7 +143,12 @@ class WifiDirectTransportMessagingTest {
         /** Publishes and sends this party's own current prekey bundle over [viaLink] -- test's stand-in for [WifiDirectTransport.announceOwnPreKeyBundle]. */
         fun announceBundleTo(viaLink: LoopbackLink) {
             val bundle = preKeyRotationManager.currentBundle()
-            val envelope = PreKeyBundleEnvelope(peerId = peerId, bundleBytes = PreKeyBundleCodec.encode(bundle))
+            val envelope = PreKeyBundleEnvelope(
+                peerId = peerId,
+                hopCount = 0,
+                originatedAtMs = System.currentTimeMillis(),
+                bundleBytes = PreKeyBundleCodec.encode(bundle),
+            )
             viaLink.send(WirePayloadType.PREKEY_BUNDLE, envelope.encode())
         }
     }
