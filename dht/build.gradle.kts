@@ -8,13 +8,18 @@ plugins {
 // (dependencyResolutionManagement, FAIL_ON_PROJECT_REPOS) since :dht is
 // included as a subproject of that build — do not add a repositories{} block here.
 
-// Phase 4 Slice 2: pure Kademlia routing-table bookkeeping, zero network I/O yet.
-// Deliberately zero dependency on :protocol or :crypto in either direction this
-// slice, and zero coroutines dependency (no async work exists yet) -- see
+// Phase 4 Slice 3: real network-facing DHT code (PING/PONG liveness RPC over
+// UDP), so this module now has its first real dependency, kotlinx-coroutines-
+// core (matching crypto/build.gradle.kts's exact coordinates -- the same
+// portability posture crypto/ already established: plain-JVM, works for a
+// future non-Android relay/bootstrap process too). Still deliberately zero
+// dependency on :protocol or :crypto in either direction -- see
 // dht/src/main/kotlin/com/hop/dht/NodeId.kt's doc comment for why NodeId's
 // 32-byte size is a hardcoded literal rather than a dependency on
 // protocol's Frame.CLIP_HASH_SIZE.
 dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     // kotlin.test assertion helpers (assertEquals/assertFailsWith/etc.), wired to
