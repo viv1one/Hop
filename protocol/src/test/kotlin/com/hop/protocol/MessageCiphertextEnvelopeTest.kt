@@ -8,10 +8,12 @@ import org.junit.jupiter.api.Test
 
 /**
  * Covers [MessageCiphertextEnvelope]'s own field encoding: `senderPeerId`/
- * `recipientPeerId` string length-prefixing plus the opaque `ciphertext`
- * payload. This module never touches Double Ratchet internals -- these
- * tests only exercise this envelope's own wire shape, matching [FrameTest]'s
- * round-trip/malformed-input rigor.
+ * `recipientPeerId` string length-prefixing, the `hopCount`/`originatedAtMs`
+ * fields added in Phase 2 Slice 3 (store-and-forward for offline 1:1
+ * recipients), and the opaque `ciphertext` payload. This module never
+ * touches Double Ratchet internals -- these tests only exercise this
+ * envelope's own wire shape, matching [FrameTest]'s round-trip/malformed-input
+ * rigor.
  */
 class MessageCiphertextEnvelopeTest {
 
@@ -20,10 +22,12 @@ class MessageCiphertextEnvelopeTest {
     private fun randomBytes(size: Int): ByteArray = ByteArray(size).also { random.nextBytes(it) }
 
     @Test
-    fun `round trip preserves senderPeerId, recipientPeerId, and ciphertext`() {
+    fun `round trip preserves senderPeerId, recipientPeerId, hopCount, originatedAtMs, and ciphertext`() {
         val original = MessageCiphertextEnvelope(
             senderPeerId = "0011223344556677",
             recipientPeerId = "8899aabbccddeeff",
+            hopCount = 3,
+            originatedAtMs = 1_700_000_000_000L,
             ciphertext = randomBytes(256),
         )
 
@@ -31,8 +35,47 @@ class MessageCiphertextEnvelopeTest {
 
         assertEquals(original.senderPeerId, decoded.senderPeerId)
         assertEquals(original.recipientPeerId, decoded.recipientPeerId)
+        assertEquals(original.hopCount, decoded.hopCount)
+        assertEquals(original.originatedAtMs, decoded.originatedAtMs)
         assertTrue(original.ciphertext.contentEquals(decoded.ciphertext))
         assertEquals(original, decoded)
+    }
+
+    @Test
+    fun `round trip preserves hopCount at its boundary values`() {
+        val min = MessageCiphertextEnvelope(
+            senderPeerId = "s",
+            recipientPeerId = "r",
+            hopCount = 0,
+            originatedAtMs = 0L,
+            ciphertext = randomBytes(8),
+        )
+        val max = min.copy(hopCount = 0xFF)
+
+        assertEquals(0, MessageCiphertextEnvelope.decode(min.encode()).hopCount)
+        assertEquals(0xFF, MessageCiphertextEnvelope.decode(max.encode()).hopCount)
+    }
+
+    @Test
+    fun `constructing with a hopCount outside uint8 range throws`() {
+        assertFailsWith<IllegalArgumentException> {
+            MessageCiphertextEnvelope(
+                senderPeerId = "s",
+                recipientPeerId = "r",
+                hopCount = 256,
+                originatedAtMs = 0L,
+                ciphertext = ByteArray(0),
+            )
+        }
+        assertFailsWith<IllegalArgumentException> {
+            MessageCiphertextEnvelope(
+                senderPeerId = "s",
+                recipientPeerId = "r",
+                hopCount = -1,
+                originatedAtMs = 0L,
+                ciphertext = ByteArray(0),
+            )
+        }
     }
 
     @Test
@@ -40,6 +83,8 @@ class MessageCiphertextEnvelopeTest {
         val original = MessageCiphertextEnvelope(
             senderPeerId = "sender",
             recipientPeerId = "recipient",
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
             ciphertext = ByteArray(0),
         )
 
@@ -50,7 +95,13 @@ class MessageCiphertextEnvelopeTest {
 
     @Test
     fun `round trip works with empty peer id strings`() {
-        val original = MessageCiphertextEnvelope(senderPeerId = "", recipientPeerId = "", ciphertext = randomBytes(32))
+        val original = MessageCiphertextEnvelope(
+            senderPeerId = "",
+            recipientPeerId = "",
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
+            ciphertext = randomBytes(32),
+        )
 
         val decoded = MessageCiphertextEnvelope.decode(original.encode())
 
@@ -64,6 +115,8 @@ class MessageCiphertextEnvelopeTest {
         val original = MessageCiphertextEnvelope(
             senderPeerId = "s",
             recipientPeerId = "r",
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
             ciphertext = randomBytes(65_536),
         )
 
@@ -73,14 +126,16 @@ class MessageCiphertextEnvelopeTest {
     }
 
     @Test
-    fun `encoded size accounts for both length-prefixed peer ids plus ciphertext`() {
+    fun `encoded size accounts for both length-prefixed peer ids, hopCount, originatedAtMs, plus ciphertext`() {
         val envelope = MessageCiphertextEnvelope(
             senderPeerId = "abcdef",
             recipientPeerId = "0123456789",
+            hopCount = 1,
+            originatedAtMs = 1_700_000_000_000L,
             ciphertext = randomBytes(40),
         )
         val expectedSize = 4 + "abcdef".toByteArray(Charsets.UTF_8).size +
-            4 + "0123456789".toByteArray(Charsets.UTF_8).size + 40
+            4 + "0123456789".toByteArray(Charsets.UTF_8).size + 1 + 8 + 40
         assertEquals(expectedSize, envelope.encode().size)
     }
 
@@ -96,7 +151,13 @@ class MessageCiphertextEnvelopeTest {
 
     @Test
     fun `decoding an envelope whose declared senderPeerId length exceeds available bytes throws`() {
-        val full = MessageCiphertextEnvelope(senderPeerId = "abc", recipientPeerId = "d", ciphertext = randomBytes(10)).encode()
+        val full = MessageCiphertextEnvelope(
+            senderPeerId = "abc",
+            recipientPeerId = "d",
+            hopCount = 0,
+            originatedAtMs = 0L,
+            ciphertext = randomBytes(10),
+        ).encode()
         val truncated = full.copyOf(4 + 1)
 
         assertFailsWith<MessageCiphertextEnvelopeDecodeException> { MessageCiphertextEnvelope.decode(truncated) }
@@ -104,7 +165,13 @@ class MessageCiphertextEnvelopeTest {
 
     @Test
     fun `decoding an envelope missing the recipientPeerId length prefix throws`() {
-        val full = MessageCiphertextEnvelope(senderPeerId = "abc", recipientPeerId = "def", ciphertext = randomBytes(10)).encode()
+        val full = MessageCiphertextEnvelope(
+            senderPeerId = "abc",
+            recipientPeerId = "def",
+            hopCount = 0,
+            originatedAtMs = 0L,
+            ciphertext = randomBytes(10),
+        ).encode()
         // Keep exactly through senderPeerId, drop everything else (no room for the
         // recipientPeerId length prefix at all).
         val senderIdBytes = "abc".toByteArray(Charsets.UTF_8)
@@ -115,10 +182,34 @@ class MessageCiphertextEnvelopeTest {
 
     @Test
     fun `decoding an envelope whose declared recipientPeerId length exceeds available bytes throws`() {
-        val full = MessageCiphertextEnvelope(senderPeerId = "abc", recipientPeerId = "defgh", ciphertext = randomBytes(10)).encode()
+        val full = MessageCiphertextEnvelope(
+            senderPeerId = "abc",
+            recipientPeerId = "defgh",
+            hopCount = 0,
+            originatedAtMs = 0L,
+            ciphertext = randomBytes(10),
+        ).encode()
         val senderIdBytes = "abc".toByteArray(Charsets.UTF_8)
         // Keep through the recipientPeerId length prefix, but cut off before its bytes.
         val truncated = full.copyOf(4 + senderIdBytes.size + 4 + 1)
+
+        assertFailsWith<MessageCiphertextEnvelopeDecodeException> { MessageCiphertextEnvelope.decode(truncated) }
+    }
+
+    @Test
+    fun `decoding an envelope truncated inside hopCount plus originatedAtMs throws`() {
+        val full = MessageCiphertextEnvelope(
+            senderPeerId = "abc",
+            recipientPeerId = "defgh",
+            hopCount = 7,
+            originatedAtMs = 1_700_000_000_000L,
+            ciphertext = randomBytes(10),
+        ).encode()
+        val senderIdBytes = "abc".toByteArray(Charsets.UTF_8)
+        val recipientIdBytes = "defgh".toByteArray(Charsets.UTF_8)
+        // Keep through recipientPeerId's bytes, plus a few bytes of the
+        // hopCount/originatedAtMs field, but not all 9.
+        val truncated = full.copyOf(4 + senderIdBytes.size + 4 + recipientIdBytes.size + 3)
 
         assertFailsWith<MessageCiphertextEnvelopeDecodeException> { MessageCiphertextEnvelope.decode(truncated) }
     }

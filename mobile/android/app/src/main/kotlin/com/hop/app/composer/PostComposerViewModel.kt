@@ -111,11 +111,13 @@ class PostComposerViewModel(
      * schedule (ADR 0003) so the sender can re-view their own post later,
      * writes the ciphertext under [postsDir], inserts a [PostEntity] row so
      * the post is immediately visible in this device's own feed, and hands
-     * the encoded frame to [broadcastPost] so it's offered to any WiFi Direct
-     * peer this device connects to for the rest of this session (see
-     * `WifiDirectTransport`'s outbox doc for exactly what that does and
-     * doesn't guarantee -- no ack/retry, no store-and-forward to a peer this
-     * device only meets after the post was made).
+     * the encoded frame to [broadcastPost], which both live-pushes it to any
+     * currently-connected WiFi Direct peer and (as of Phase 2 Slice 1) takes
+     * persisted relay custody of it via `RelayRepository`, so it's still
+     * offered to a peer this device only meets *after* the post was made --
+     * see `WifiDirectTransport.broadcastPost`'s own doc for exactly what
+     * that does and doesn't guarantee (still no ack/retry, and still bounded
+     * by `RelayPolicy`'s hop-count/decay limits).
      */
     fun post(bytes: ByteArray, contentType: ContentType) {
         if (_uiState.value.isPosting) return

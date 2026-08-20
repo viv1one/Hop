@@ -18,9 +18,14 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.hop.crypto.DecayKeyStore
+import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PreKeyRotationManager
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.DontRelayRepository
+import com.hop.repository.PendingMessageRepository
+import com.hop.repository.PointsRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -59,6 +64,10 @@ class TransportManager(
     private val context: Context,
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
+    relayRepository: RelayRepository,
+    dontRelayRepository: DontRelayRepository,
+    pointsRepository: PointsRepository,
+    pendingMessageRepository: PendingMessageRepository,
     preKeyRotationManager: PreKeyRotationManager,
     getOwnPeerId: suspend () -> String,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
@@ -73,6 +82,10 @@ class TransportManager(
         channel = channel,
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
+        dontRelayRepository = dontRelayRepository,
+        pointsRepository = pointsRepository,
+        pendingMessageRepository = pendingMessageRepository,
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
@@ -193,12 +206,19 @@ class TransportManager(
         bleDiscovery.stopScan()
     }
 
-    /** Delegates to [WifiDirectTransport.broadcastPost] -- see its doc for the outbox's session-scoped, no-ack/retry semantics. */
+    /** Delegates to [WifiDirectTransport.broadcastPost] -- see its doc for the persisted relay queue's no-ack/retry semantics. */
     fun broadcastPost(encoded: ByteArray) = wifiDirectTransport.broadcastPost(encoded)
+
+    /** Delegates to [WifiDirectTransport.broadcastDontRelayFlag] -- see its doc for the persisted flag queue's propagation semantics. */
+    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) = wifiDirectTransport.broadcastDontRelayFlag(row)
 
     /** Delegates to [WifiDirectTransport.sendToPeer] -- see its doc for the peer-specific (non-broadcast) send semantics. */
     fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean =
         wifiDirectTransport.sendToPeer(peerId, type, payload)
+
+    /** Delegates to [WifiDirectTransport.sendMessage] -- see its doc for the Phase 2 Slice 3 unicast-first, flood-on-failure semantics. */
+    fun sendMessage(peerId: String, payload: ByteArray): Boolean =
+        wifiDirectTransport.sendMessage(peerId, payload)
 
     @SuppressLint("MissingPermission")
     private fun maybeConnect(device: WifiP2pDevice) {

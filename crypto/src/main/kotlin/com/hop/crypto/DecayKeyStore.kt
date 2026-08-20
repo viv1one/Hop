@@ -46,11 +46,43 @@ class DecayKeyStore(
      * [decayWindow] elapses from now. Overwrites any existing entry for the same
      * [contentId] -- e.g. a re-share within the window should call this again
      * with a fresh expiry, per the "decay unless re-shared" model (ADR 0003).
+     *
+     * Convenience overload anchored to *now* -- delegates to the [Instant]
+     * overload below. Callers that know a post's true origination time (any
+     * multi-hop relay receive path, once queuing delay is possible) must use
+     * the [Instant] overload directly, computed from `Frame.originatedAtMs`,
+     * not this one: anchoring to "now" here means "now" for a directly-
+     * received frame, which is correct only because direct receipt has no
+     * queuing delay. See the [Instant] overload's own doc for the bug this
+     * distinction exists to prevent.
      */
     @Synchronized
     fun store(contentId: String, wrappedCek: ByteArray, decayWindow: Duration) {
         require(!decayWindow.isNegative) { "decayWindow must not be negative" }
-        storage.put(contentId, wrappedCek.copyOf(), clock.instant().plus(decayWindow))
+        store(contentId, wrappedCek, clock.instant().plus(decayWindow))
+    }
+
+    /**
+     * Stores [wrappedCek] for [contentId], recoverable via [retrieve] only
+     * until the absolute instant [expiresAt]. This is the primitive both
+     * [store] overloads ultimately funnel through.
+     *
+     * Callers must anchor [expiresAt] to a post's *original* decay schedule
+     * (`Frame.originatedAtMs + Frame.ttlSeconds`), not to local receipt/call
+     * time -- anchoring to receipt time is harmless at direct-hop distance
+     * (receipt happens moments after origination) but is a real correctness
+     * bug once multi-hop relay adds queuing delay: a relay holding a frame
+     * for a while before forwarding it would otherwise silently re-extend
+     * that post's decryption-key lifetime to "full TTL from whenever the
+     * relay finally forwards it," defeating ADR 0003's decay guarantee for
+     * every downstream recipient. Accepting no [expiresAt] that isn't
+     * already computed by the caller is deliberate: this class has no
+     * opinion about *which* origination time is correct, only that whatever
+     * is passed here is treated as the absolute expiry, full stop.
+     */
+    @Synchronized
+    fun store(contentId: String, wrappedCek: ByteArray, expiresAt: Instant) {
+        storage.put(contentId, wrappedCek.copyOf(), expiresAt)
     }
 
     /**

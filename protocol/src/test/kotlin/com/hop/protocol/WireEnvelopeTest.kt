@@ -65,6 +65,8 @@ class WireEnvelopeTest {
         val payload = MessageCiphertextEnvelope(
             senderPeerId = "sender-peer",
             recipientPeerId = "recipient-peer",
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
             ciphertext = randomBytes(64),
         ).encode()
         val encoded = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, payload)

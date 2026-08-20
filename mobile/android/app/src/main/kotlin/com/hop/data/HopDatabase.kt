@@ -32,8 +32,32 @@ import androidx.room.RoomDatabase
  * replenishment plus signed/Kyber prekey rotation, closing the "no
  * rotation, fixed ids" gap named in [PreKeyEntity]/[SignedPreKeyEntity]/
  * [KyberPreKeyEntity]'s docs and the correctness bug that gap caused -- see
- * [PreKeyRotationManager]'s own doc for both). No `Migration`
- * is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
+ * [PreKeyRotationManager]'s own doc for both). Version bumped 5 -> 6 to add
+ * [RelayQueueEntity] (Phase 2 Slice 1's persisted store-and-forward relay
+ * queue -- see its own doc and `com.hop.repository.RelayRepository`'s doc
+ * for why relay custody needs a table separate from [PostEntity]): without
+ * this, a post's relay backlog lived only in [WifiDirectTransport]'s
+ * in-memory `outbox`, so both a self-authored post and anything received
+ * for onward relay were silently lost the moment this device's own app
+ * process died, not just when a downstream peer's did. Version bumped 6 -> 7
+ * to add [DontRelayFlagEntity] (Phase 2 Slice 2's persisted "don't relay"
+ * distinct-attested-device flag counter -- see its own doc and
+ * `com.hop.repository.DontRelayRepository`'s doc for the order-independence
+ * design this backs) and [PointsLedgerEntity] (the clipHash-keyed,
+ * insert-IGNORE points-award table -- see its own doc for the
+ * backlog-resend double-counting bug this specific shape closes). Version
+ * bumped 7 -> 8 to add [PendingMessageEntity] (Phase 2 Slice 3's persisted
+ * relay-custody queue for offline 1:1 message recipients -- see its own doc
+ * and `com.hop.repository.PendingMessageRepository`'s doc for why a message
+ * relay-custody row needs a table separate from [RelayQueueEntity]): without
+ * this, a message that unicast delivery couldn't reach right now had no
+ * durable fallback at all -- see `MessageRepository.send`'s pre-Slice-3 doc
+ * for the exact gap this closes. Version bumped 8 -> 9 to add [GroupEntity],
+ * [GroupMemberEntity], and [GroupMessageEntity] (Phase 2 Slice 4's group
+ * messaging -- per-member pairwise Double Ratchet fan-out, PRD §4.3, ADR 0001;
+ * see [GroupEntity]'s own doc for why groups get their own tables rather than
+ * reusing [MessageEntity]/[MessageDao]). No
+ * `Migration` is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
  * (see `AppContainer`) is the deliberate choice here, not an oversight: no
  * real users/on-device data exist yet for this database, so there's nothing
  * a real migration would need to preserve.
@@ -53,8 +77,15 @@ import androidx.room.RoomDatabase
         KyberPreKeyEntity::class,
         SessionEntity::class,
         SignalPreKeyCounterEntity::class,
+        RelayQueueEntity::class,
+        DontRelayFlagEntity::class,
+        PointsLedgerEntity::class,
+        PendingMessageEntity::class,
+        GroupEntity::class,
+        GroupMemberEntity::class,
+        GroupMessageEntity::class,
     ],
-    version = 5,
+    version = 9,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {
@@ -70,4 +101,10 @@ abstract class HopDatabase : RoomDatabase() {
     abstract fun signalKyberPreKeyDao(): SignalKyberPreKeyDao
     abstract fun signalSessionDao(): SignalSessionDao
     abstract fun signalPreKeyCounterDao(): SignalPreKeyCounterDao
+    abstract fun relayQueueDao(): RelayQueueDao
+    abstract fun dontRelayFlagDao(): DontRelayFlagDao
+    abstract fun pointsLedgerDao(): PointsLedgerDao
+    abstract fun pendingMessageDao(): PendingMessageDao
+    abstract fun groupDao(): GroupDao
+    abstract fun groupMessageDao(): GroupMessageDao
 }

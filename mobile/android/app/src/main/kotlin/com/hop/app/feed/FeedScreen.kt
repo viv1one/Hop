@@ -21,6 +21,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
+import kotlinx.coroutines.flow.first
 
 /**
  * Full-screen swipeable feed (PRD §5, modeled closely on Reels) -- replaces
@@ -50,6 +51,9 @@ fun FeedScreen(
                     postRepository = container.postRepository,
                     blockRepository = container.blockRepository,
                     reportRepository = container.reportRepository,
+                    dontRelayRepository = container.dontRelayRepository,
+                    getAttestedDeviceKey = { container.settingsRepository.attestedDeviceKey.first().orEmpty() },
+                    broadcastDontRelayFlag = { row -> container.transportManager.broadcastDontRelayFlag(row) },
                 )
             }
         },
@@ -79,6 +83,7 @@ fun FeedScreen(
             onBlock = { viewModel.blockSender(post.senderDeviceId) },
             onReport = { viewModel.reportPost(post.clipHash) },
             onMessage = { onMessageClick(post.senderDeviceId) },
+            onDontRelay = { viewModel.flagDontRelay(post) },
         )
     }
 }

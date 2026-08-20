@@ -159,6 +159,33 @@ class Frame(
         return result
     }
 
+    /**
+     * Returns a new [Frame] with the given fields overridden and every other
+     * field copied unchanged. General-purpose (not [hopCount]-specific): a
+     * relay hop needs to bump [hopCount] without touching anything else, and
+     * a "don't relay" signal (Slice 2, not built yet) needs to flip
+     * [dontRelay] on an already-persisted frame via the same decode/mutate/
+     * re-encode pattern -- both go through this one helper rather than two
+     * bespoke copy paths.
+     */
+    fun copy(
+        hopCount: Int = this.hopCount,
+        dontRelay: Boolean = this.dontRelay,
+    ): Frame = Frame(
+        version = version,
+        clipHash = clipHash,
+        senderDeviceId = senderDeviceId,
+        contentType = contentType,
+        hopCount = hopCount,
+        originatedAtMs = originatedAtMs,
+        ttlSeconds = ttlSeconds,
+        reachTier = reachTier,
+        dontRelay = dontRelay,
+        keyIncluded = keyIncluded,
+        contentEncryptionKey = contentEncryptionKey,
+        payload = payload,
+    )
+
     override fun toString(): String =
         "Frame(version=$version, clipHash=${clipHash.size}b, senderDeviceId=${senderDeviceId.size}b, " +
             "contentType=$contentType, hopCount=$hopCount, originatedAtMs=$originatedAtMs, ttlSeconds=$ttlSeconds, " +

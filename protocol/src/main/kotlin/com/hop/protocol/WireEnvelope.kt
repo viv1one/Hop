@@ -26,6 +26,15 @@ enum class WirePayloadType(val wireValue: Int) {
 
     /** Payload is a [MessageCiphertextEnvelope]-encoded Double Ratchet ciphertext. */
     MESSAGE_CIPHERTEXT(2),
+
+    /**
+     * Payload is a [DontRelayFlagEnvelope]-encoded "don't relay" signal
+     * (Phase 2 Slice 2) -- one attested device's flag that a given clipHash
+     * should stop being relayed further. Propagates through the mesh the
+     * same way [POST_FRAME] does, but never touches [Frame]'s own on-wire
+     * `dontRelay` bit -- see [DontRelayFlagEnvelope]'s own doc.
+     */
+    DONT_RELAY_FLAG(3),
     ;
 
     companion object {
@@ -47,7 +56,7 @@ enum class WirePayloadType(val wireValue: Int) {
  * This replaces the previous bare `[4-byte length][Frame bytes]` socket
  * framing with a tagged version, so a receiver can dispatch on [type] before
  * deciding how to interpret [payload] — a post [Frame], a [PreKeyBundleEnvelope],
- * or a [MessageCiphertextEnvelope]. This is a breaking change to the socket
+ * a [MessageCiphertextEnvelope], or a [DontRelayFlagEnvelope]. This is a breaking change to the socket
  * wire format: see /protocol/WIRE_FORMAT.md for why that's acceptable now.
  *
  * [WireEnvelope] never touches [Frame]'s internals — a [WirePayloadType.POST_FRAME]-

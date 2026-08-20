@@ -13,9 +13,14 @@ import com.hop.data.RoomDecayKeyStorage
 import com.hop.data.RoomSignalProtocolStore
 import com.hop.data.SettingsRepository
 import com.hop.data.toPeerIdHex
+import com.hop.protocol.RelayPolicy
 import com.hop.repository.BlockRepository
+import com.hop.repository.DontRelayRepository
 import com.hop.repository.MessageRepository
+import com.hop.repository.PendingMessageRepository
+import com.hop.repository.PointsRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import com.hop.repository.ReportRepository
 import com.hop.transport.TransportManager
 
@@ -70,6 +75,50 @@ class AppContainer(applicationContext: Context) {
     val reportRepository: ReportRepository = ReportRepository(hopDatabase.reportedPostDao())
 
     /**
+     * Phase 2 Slice 2's "don't relay" distinct-attested-device flag counter
+     * (see [DontRelayRepository]'s own doc). Shares the same [RelayPolicy]
+     * instance [relayRepository] uses below, so flag expiry and post expiry
+     * are evaluated against the same clock/`isExpired` logic.
+     */
+    val dontRelayRepository: DontRelayRepository = DontRelayRepository(
+        hopDatabase.dontRelayFlagDao(),
+        hopDatabase.relayQueueDao(),
+        RelayPolicy(),
+    )
+
+    /** Phase 2 Slice 2's non-tradeable local points counter for relay operators (see [PointsRepository]'s own doc). */
+    val pointsRepository: PointsRepository = PointsRepository(hopDatabase.pointsLedgerDao())
+
+    /**
+     * Phase 2 Slice 1's persisted store-and-forward relay queue (see
+     * [RelayRepository]'s own doc). [RelayPolicy] uses its default
+     * `maxHops`/system clock -- no tuning input for either exists yet (see
+     * [RelayPolicy.DEFAULT_MAX_HOPS]'s own doc). [dontRelayRepository]'s
+     * [DontRelayRepository.isSuppressed] is threaded in as the order-
+     * independence suppression check (Phase 2 Slice 2) -- see
+     * [RelayRepository]'s own `isFlaggedForSuppression` doc.
+     */
+    val relayRepository: RelayRepository = RelayRepository(
+        hopDatabase.relayQueueDao(),
+        RelayPolicy(),
+        isFlaggedForSuppression = dontRelayRepository::isSuppressed,
+    )
+
+    /**
+     * Phase 2 Slice 3's persisted relay-custody queue for offline 1:1
+     * message recipients (see [PendingMessageRepository]'s own doc). Shares
+     * the same default [RelayPolicy] shape [relayRepository] uses -- no
+     * separate tuning input exists for messages either (see
+     * `MessageCiphertextEnvelope.DEFAULT_TTL_SECONDS`'s own doc for why its
+     * TTL is a separate, shorter, unmeasured placeholder from posts', even
+     * though the hop-count bound is shared).
+     */
+    val pendingMessageRepository: PendingMessageRepository = PendingMessageRepository(
+        hopDatabase.pendingMessageDao(),
+        RelayPolicy(),
+    )
+
+    /**
      * Persistent Double Ratchet session/key store (Stage 1). Typed as the
      * concrete [RoomSignalProtocolStore] (not the plain libsignal-client
      * `SignalProtocolStore` interface) since [preKeyRotationManager] below
@@ -119,7 +168,7 @@ class AppContainer(applicationContext: Context) {
     }
 
     /**
-     * References [transportManager] inside its `sendToPeer` lambda via a
+     * References [transportManager] inside its `sendMessage` lambda via a
      * forward property reference -- resolved lazily at call time (when a
      * message is actually sent), not at construction time, by which point
      * [transportManager] below is fully constructed. Breaks what would
@@ -133,14 +182,20 @@ class AppContainer(applicationContext: Context) {
         signalIdentityDao = hopDatabase.signalIdentityDao(),
         signalProtocolStore = signalProtocolStore,
         blockRepository = blockRepository,
+        groupDao = hopDatabase.groupDao(),
+        groupMessageDao = hopDatabase.groupMessageDao(),
         getOwnPeerId = getOwnPeerId,
-        sendToPeer = { peerId, type, payload -> transportManager.sendToPeer(peerId, type, payload) },
+        sendMessage = { peerId, payload -> transportManager.sendMessage(peerId, payload) },
     )
 
     val transportManager: TransportManager = TransportManager(
         context = applicationContext,
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
+        dontRelayRepository = dontRelayRepository,
+        pointsRepository = pointsRepository,
+        pendingMessageRepository = pendingMessageRepository,
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,

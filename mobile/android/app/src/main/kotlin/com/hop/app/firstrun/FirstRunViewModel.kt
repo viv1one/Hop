@@ -21,11 +21,16 @@ import java.security.SecureRandom
  * there is no UI for the attest() call itself, and first-run setup proceeds
  * identically whether it passes or fails, except for a one-line fallback
  * message on [AttestationResult.Failed] (per the "no user-facing prompt
- * beyond a fallback message" requirement). The attestation result is not
- * otherwise acted on in this slice -- no real Play Integrity backing exists
- * yet ([com.hop.crypto.StubAttestationProvider] always passes), and nothing
- * downstream (faucets/rate-limits/"don't relay"/blocking) is wired to consume
- * it yet.
+ * beyond a fallback message" requirement). On [AttestationResult.Passed],
+ * this persists [AttestationResult.Passed.attestedPublicKey] (hex-encoded)
+ * via [SettingsRepository.setAttestedDeviceKey] -- as of Phase 2 Slice 2,
+ * this is the one-line fix that gives every downstream consumer (currently
+ * `com.hop.repository.DontRelayRepository`-backed "don't relay" flagging) a
+ * stable identity to flag with; before this slice the value was obtained and
+ * silently discarded. No real Play Integrity backing exists yet
+ * ([com.hop.crypto.StubAttestationProvider] always passes with a
+ * nonce-derived, non-hardware-bound key) -- see that class's own doc for why
+ * this is not yet a real Sybil-resistance guarantee.
  */
 class FirstRunViewModel(
     private val settingsRepository: SettingsRepository,
@@ -58,6 +63,9 @@ class FirstRunViewModel(
             // first-run blocker in this slice (no enforcement is wired to it
             // yet); only surface the fallback message.
             val failureMessage = (result as? AttestationResult.Failed)?.reason
+            if (result is AttestationResult.Passed) {
+                settingsRepository.setAttestedDeviceKey(result.attestedPublicKey.toHexString())
+            }
 
             val tier = _uiState.value.selectedTier
             settingsRepository.setDefaultReachTier(tier)
@@ -72,6 +80,8 @@ class FirstRunViewModel(
             }
         }
     }
+
+    private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
 
     private companion object {
         const val NONCE_SIZE_BYTES = 32

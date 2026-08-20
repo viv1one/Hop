@@ -262,6 +262,7 @@ which of the three it's looking at before it can decode it.
 | 0     | `POST_FRAME`         | Exactly a `Frame.encode()` output, unchanged. See "Byte layout (version 2)" above. |
 | 1     | `PREKEY_BUNDLE`      | A `PreKeyBundleEnvelope.encode()` output — see below.                       |
 | 2     | `MESSAGE_CIPHERTEXT` | A `MessageCiphertextEnvelope.encode()` output — see below.                  |
+| 3     | `DONT_RELAY_FLAG`    | A `DontRelayFlagEnvelope.encode()` output — see below.                      |
 
 Any other value is invalid for envelope version 1 and decoders must reject it
 rather than guess, matching `Frame`'s own decode discipline.
@@ -276,8 +277,56 @@ inherently variable-shaped, so there's no equivalent fixed-header win here):
   bytes][remaining bytes = opaque serialized PreKeyBundle bytes]`.
 - `MessageCiphertextEnvelope`: `[4-byte senderPeerId UTF-8 byte
   length][senderPeerId UTF-8 bytes][4-byte recipientPeerId UTF-8 byte
-  length][recipientPeerId UTF-8 bytes][remaining bytes = opaque Double
-  Ratchet ciphertext]`.
+  length][recipientPeerId UTF-8 bytes][1-byte hopCount][8-byte
+  originatedAtMs][remaining bytes = opaque Double Ratchet ciphertext]`.
+  `hopCount`/`originatedAtMs` were added in Phase 2 Slice 3 (store-and-forward
+  for offline 1:1 recipients) — a breaking change to this envelope's
+  previous shape, accepted under the same "no real users yet" justification
+  that covered `WireEnvelope`'s own introduction as a breaking change to the
+  socket framing (see below). They mirror `Frame.hopCount`/
+  `Frame.originatedAtMs` exactly (same uint8/int64 encoding, same semantics:
+  `hopCount` starts at `0` and increments by one per carrier hop;
+  `originatedAtMs` is epoch millis at first send) so a message relay-custody
+  row can be evaluated against the same `RelayPolicy.isEligibleForRelay`/
+  `RelayPolicy.isExpired` used for posts, unmodified. The TTL these are
+  checked against is `MessageCiphertextEnvelope.DEFAULT_TTL_SECONDS` — a
+  fixed constant every implementation must independently agree on,
+  deliberately **not** itself carried on the wire (unlike posts'
+  reach-tier-driven `Frame.ttlSeconds`): no per-message configurability is
+  needed, and messages are more sensitive to lingering carrier-side metadata
+  exposure than posts are, so this placeholder is deliberately shorter than
+  posts' own 24h TTL placeholder — see `com.hop.repository.PendingMessageRepository`'s
+  own "Limits" doc for why.
+
+`DontRelayFlagEnvelope` (Phase 2 Slice 2, PRD §4.6/ADR 0004's "don't relay"
+signal-counting) is shaped differently from the two opaque-payload wrappers
+above — every field is meaningful to `protocol/` itself (there is no opaque
+blob here), so it gets its own fixed-plus-one-length-prefixed layout instead:
+
+`[32-byte clipHash][4-byte attestedDeviceKey byte length][attestedDeviceKey
+bytes][8-byte flaggedAtMs][8-byte originatedAtMs][4-byte ttlSeconds]`.
+
+- `clipHash` identifies which post this flag refers to (same 32-byte
+  content-addressed hash `Frame.clipHash` uses).
+- `attestedDeviceKey` is the flagging device's attested public key
+  (ADR 0004) — length-prefixed, not fixed-size, since a real Play
+  Integrity/App Attest key will differ in size from
+  `StubAttestationProvider`'s nonce-sized stand-in; length-prefixing now
+  avoids a future wire-format bump once real attestation lands.
+- `flaggedAtMs` is when this device raised the flag (diagnostic only, not
+  used in any eligibility decision).
+- `originatedAtMs`/`ttlSeconds` are **denormalized off the post this flag
+  refers to**, not looked up locally: mesh delivery order isn't guaranteed,
+  so a device can receive a flag for a clipHash before it ever receives the
+  post itself. A flag has no other source for a TTL to bound its own
+  propagation against in that case, so the flagging device (which already
+  has these values from its own locally-held post) carries them on the flag
+  itself. This is what lets flag expiry reuse `RelayPolicy.isExpired`/
+  `expiresAtMs` exactly as posts already do.
+- Nothing that decodes this envelope ever rewrites a `Frame`'s own on-wire
+  `dontRelay` bit — see `DontRelayFlagEnvelope`'s own doc and
+  `com.hop.repository.DontRelayRepository`'s doc for the local,
+  per-device-only state this actually mutates.
 
 `peerId`/`senderPeerId`/`recipientPeerId` are opaque identifying strings as
 far as `protocol/` is concerned (in practice, the hex-encoded
@@ -326,3 +375,7 @@ module boundary:
   `protocol/src/main/kotlin/com/hop/protocol/MessageCiphertextEnvelope.kt` —
   the two opaque-payload wrapper shapes described above. Neither imports any
   `org.signal.libsignal.*` type.
+- `protocol/src/main/kotlin/com/hop/protocol/DontRelayFlagEnvelope.kt`
+  (Phase 2 Slice 2) — the "don't relay" flag payload shape described above.
+  Has no dependency on `crypto/` and imports no libsignal type, same posture
+  as `Frame.kt`/`WireEnvelope.kt`.

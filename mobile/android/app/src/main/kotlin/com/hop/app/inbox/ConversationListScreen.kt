@@ -35,6 +35,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
 import com.hop.app.theme.HopSpacing
 import com.hop.repository.ConversationSummary
+import com.hop.repository.GroupSummary
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
@@ -43,15 +44,19 @@ import java.util.Date
  * The Inbox tab's conversation list -- replaces [com.hop.app.HopNavHost]'s
  * "Inbox — coming soon" placeholder. Sources
  * [ConversationListViewModel.conversations] (already filtered against the
- * block list) and renders one row per peer. No display-name concept exists
- * anywhere in this app (no accounts, by design) -- each row is labeled with a
- * short fragment of [ConversationSummary.peerId], a named, deliberate rough
- * edge (see the Phase 1 messaging plan), not a nickname/profile system.
+ * block list, 1:1 and group rows combined into one chronological list -- see
+ * [InboxRow]'s own doc) and renders one row per conversation. No display-name
+ * concept exists anywhere in this app for a *peer* (no accounts, by design)
+ * -- a 1:1 row is labeled with a short fragment of [ConversationSummary.peerId],
+ * a named, deliberate rough edge (see the Phase 1 messaging plan), not a
+ * nickname/profile system. A group row, by contrast, has a real local
+ * display name (the name its creator gave it at creation time).
  */
 @Composable
 fun ConversationListScreen(
     container: AppContainer,
     onConversationClick: (peerId: String) -> Unit,
+    onGroupClick: (groupId: String, groupName: String) -> Unit,
 ) {
     val viewModel: ConversationListViewModel = viewModel(
         factory = viewModelFactory {
@@ -71,11 +76,26 @@ fun ConversationListScreen(
     }
 
     LazyColumn(modifier = Modifier.fillMaxSize()) {
-        items(conversations, key = { it.peerId }) { summary ->
-            ConversationRow(
-                summary = summary,
-                onClick = { onConversationClick(summary.peerId) },
-            )
+        items(
+            conversations,
+            key = { row ->
+                when (row) {
+                    is InboxRow.Direct -> "direct:${row.summary.peerId}"
+                    is InboxRow.Group -> "group:${row.summary.groupId}"
+                }
+            },
+        ) { row ->
+            when (row) {
+                is InboxRow.Direct -> ConversationRow(
+                    summary = row.summary,
+                    onClick = { onConversationClick(row.summary.peerId) },
+                )
+
+                is InboxRow.Group -> GroupConversationRow(
+                    summary = row.summary,
+                    onClick = { onGroupClick(row.summary.groupId, row.summary.name) },
+                )
+            }
         }
     }
 }
@@ -163,6 +183,55 @@ private fun ConversationRow(summary: ConversationSummary, onClick: () -> Unit) {
 }
 
 /**
+ * The group analog of [ConversationRow] -- same row shape, but keyed and
+ * labeled off a real local [GroupSummary.name] instead of a peer id fragment.
+ */
+@Composable
+private fun GroupConversationRow(summary: GroupSummary, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = HopSpacing.md, vertical = HopSpacing.sm + HopSpacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        GroupAvatar(name = summary.name)
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = HopSpacing.md),
+        ) {
+            Text(
+                text = summary.name,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = buildString {
+                    if (summary.lastMessageWasOutgoing) append("You: ")
+                    append(summary.lastMessagePreview)
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+        Text(
+            text = summary.lastMessageAtMs.toRelativeTimeLabel(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .padding(start = HopSpacing.sm)
+                .width(64.dp),
+            textAlign = TextAlign.End,
+        )
+    }
+}
+
+/**
  * Deterministic colored circle standing in for an avatar -- no accounts, no
  * profile photos, so [peerId] itself (the same value shown as text) is the
  * only identity this app can render. Same 2 hex chars as [shortPeerLabel]'s
@@ -183,6 +252,25 @@ internal fun PeerAvatar(peerId: String, size: androidx.compose.ui.unit.Dp = 44.d
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+    }
+}
+
+/** [PeerAvatar]'s group analog -- keyed off a group's real display [name] instead of a peer id fragment. */
+@Composable
+internal fun GroupAvatar(name: String, size: androidx.compose.ui.unit.Dp = 44.dp) {
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.secondaryContainer),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = name.take(2).uppercase().ifBlank { "?" },
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSecondaryContainer,
         )
     }
 }

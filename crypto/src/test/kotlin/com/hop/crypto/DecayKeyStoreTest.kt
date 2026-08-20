@@ -100,6 +100,77 @@ class DecayKeyStoreTest {
         }
     }
 
+    // --- store(contentId, wrappedCek, expiresAt: Instant) -- the absolute-expiry overload ---
+
+    @Test
+    fun `the Instant overload is retrievable before its absolute expiry`() {
+        val clock = MutableClock(Instant.parse("2026-01-01T00:00:00Z"))
+        val store = DecayKeyStore(clock)
+        val cek = randomBytes(32)
+
+        store.store("clip-1", cek, Instant.parse("2026-01-01T00:10:00Z"))
+        clock.advanceBy(Duration.ofMinutes(5))
+
+        assertContentEquals(cek, store.retrieve("clip-1"))
+    }
+
+    @Test
+    fun `the Instant overload is not retrievable after its absolute expiry, and is gone from the store`() {
+        val clock = MutableClock(Instant.parse("2026-01-01T00:00:00Z"))
+        val store = DecayKeyStore(clock)
+        val cek = randomBytes(32)
+
+        store.store("clip-1", cek, Instant.parse("2026-01-01T00:10:00Z"))
+        clock.advanceBy(Duration.ofMinutes(10).plusSeconds(1))
+
+        assertNull(store.retrieve("clip-1"))
+    }
+
+    @Test
+    fun `the Duration overload delegates to the Instant overload with clock now plus decayWindow`() {
+        val clock = MutableClock(Instant.parse("2026-01-01T00:00:00Z"))
+        val durationStore = DecayKeyStore(clock)
+        val instantStore = DecayKeyStore(clock)
+        val cek = randomBytes(32)
+
+        durationStore.store("clip-1", cek, Duration.ofMinutes(10))
+        instantStore.store("clip-1", cek, Instant.parse("2026-01-01T00:10:00Z"))
+
+        clock.advanceBy(Duration.ofMinutes(10).plusSeconds(1))
+        assertNull(durationStore.retrieve("clip-1"))
+        assertNull(instantStore.retrieve("clip-1"))
+    }
+
+    @Test
+    fun `an expiresAt already in the past at store() time is accepted and is immediately unretrievable`() {
+        // This is the case a multi-hop relay's queuing delay can produce
+        // once expiry is anchored to a post's true origination time (ADR
+        // 0003 / the transport layer's RelayPolicy.expiresAtMs) rather than
+        // local receipt time -- the store must not reject or clamp this, it
+        // must simply behave as though the key never had a live window.
+        val clock = MutableClock(Instant.parse("2026-01-01T00:00:00Z"))
+        val store = DecayKeyStore(clock)
+        val cek = randomBytes(32)
+
+        store.store("clip-1", cek, Instant.parse("2025-12-31T23:00:00Z")) // one hour in the past
+
+        assertNull(store.retrieve("clip-1"))
+    }
+
+    @Test
+    fun `the Instant overload overwrites any existing entry for the same contentId`() {
+        val clock = MutableClock(Instant.parse("2026-01-01T00:00:00Z"))
+        val store = DecayKeyStore(clock)
+        val firstCek = randomBytes(32)
+        val secondCek = randomBytes(32)
+
+        store.store("clip-1", firstCek, Instant.parse("2026-01-01T00:10:00Z"))
+        store.store("clip-1", secondCek, Instant.parse("2026-01-01T00:20:00Z"))
+        clock.advanceBy(Duration.ofMinutes(15))
+
+        assertContentEquals(secondCek, store.retrieve("clip-1"))
+    }
+
     // --- Integration: ContentEncryption + DecayKeyStore ---
 
     @Test

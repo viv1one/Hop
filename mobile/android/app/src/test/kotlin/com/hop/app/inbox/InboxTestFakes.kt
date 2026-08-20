@@ -1,11 +1,17 @@
 package com.hop.app.inbox
 
+import com.hop.data.GroupDao
+import com.hop.data.GroupEntity
+import com.hop.data.GroupMemberEntity
+import com.hop.data.GroupMessageDao
+import com.hop.data.GroupMessageEntity
 import com.hop.data.MessageDao
 import com.hop.data.MessageEntity
 import com.hop.data.RemoteIdentityEntity
 import com.hop.data.SignalIdentityDao
 import com.hop.repository.BlockRepository
 import com.hop.repository.ConversationSummary
+import com.hop.repository.GroupSummary
 import com.hop.repository.MessageRepository
 import com.hop.repository.SendResult
 import java.util.UUID
@@ -43,6 +49,24 @@ internal object NoOpMessageDao : MessageDao {
     override suspend fun insert(message: MessageEntity): Long = error("unused by this fake")
     override fun getMessagesForPeer(peerId: String): Flow<List<MessageEntity>> = error("unused by this fake")
     override fun getLatestMessagePerPeer(): Flow<List<MessageEntity>> = error("unused by this fake")
+}
+
+internal object NoOpGroupDao : GroupDao {
+    override suspend fun insertGroup(group: GroupEntity) = error("unused by this fake")
+    override suspend fun insertMembers(members: List<GroupMemberEntity>) = error("unused by this fake")
+    override suspend fun insertGroupWithMembers(group: GroupEntity, members: List<GroupMemberEntity>) =
+        error("unused by this fake")
+    override suspend fun getCreatorPeerId(groupId: String): String? = error("unused by this fake")
+    override suspend fun getGroup(groupId: String): GroupEntity? = error("unused by this fake")
+    override fun observeGroups(): Flow<List<GroupEntity>> = MutableStateFlow(emptyList())
+    override suspend fun isKnownMember(groupId: String, peerId: String): Boolean = error("unused by this fake")
+    override suspend fun getFanoutTargetPeerIds(groupId: String): List<String> = error("unused by this fake")
+}
+
+internal object NoOpGroupMessageDao : GroupMessageDao {
+    override suspend fun insert(message: GroupMessageEntity): Long = error("unused by this fake")
+    override fun getMessagesForGroup(groupId: String): Flow<List<GroupMessageEntity>> = error("unused by this fake")
+    override fun getLatestMessagePerGroup(): Flow<List<GroupMessageEntity>> = error("unused by this fake")
 }
 
 internal object NoOpSignalIdentityDao : SignalIdentityDao {
@@ -102,29 +126,51 @@ internal object NoOpSignalProtocolStore : SignalProtocolStore {
 /**
  * Configurable [MessageRepository] fake -- subclasses the real class per its
  * own `open`-for-testability doc (same shape as `FeedViewModelTest`'s
- * `CountingFakePostRepository`), overriding only the three methods this
- * package's view models actually call.
+ * `CountingFakePostRepository`), overriding only the methods this package's
+ * view models actually call (1:1 and, as of Phase 2 Slice 4, group).
  */
 internal class FakeMessageRepository(
     private val conversationSummaries: Flow<List<ConversationSummary>> = MutableStateFlow(emptyList()),
     private val conversationMessages: Flow<List<MessageEntity>> = MutableStateFlow(emptyList()),
+    private val groupSummaries: Flow<List<GroupSummary>> = MutableStateFlow(emptyList()),
+    private val groupMessages: Flow<List<GroupMessageEntity>> = MutableStateFlow(emptyList()),
     private val sendResults: MutableList<SendResult> = mutableListOf(),
+    private val sendToGroupResults: MutableList<SendResult> = mutableListOf(),
+    private val createGroupResult: String = "unused-group-id",
     var lastSendCall: Pair<String, String>? = null,
+    var lastSendToGroupCall: Pair<String, String>? = null,
+    var lastCreateGroupCall: Pair<String, List<String>>? = null,
 ) : MessageRepository(
     messageDao = NoOpMessageDao,
     signalIdentityDao = NoOpSignalIdentityDao,
     signalProtocolStore = NoOpSignalProtocolStore,
     blockRepository = BlockRepository(NoOpBlockedSenderDeviceDao),
+    groupDao = NoOpGroupDao,
+    groupMessageDao = NoOpGroupMessageDao,
     getOwnPeerId = { "unused" },
-    sendToPeer = { _, _, _ -> error("unused by this fake") },
+    sendMessage = { _, _ -> error("unused by this fake") },
 ) {
     override fun observeConversationSummaries(): Flow<List<ConversationSummary>> = conversationSummaries
 
     override fun observeConversation(peerId: String): Flow<List<MessageEntity>> = conversationMessages
 
+    override fun observeGroupSummaries(): Flow<List<GroupSummary>> = groupSummaries
+
+    override fun observeGroupConversation(groupId: String): Flow<List<GroupMessageEntity>> = groupMessages
+
     override suspend fun send(peerId: String, plaintext: String): SendResult {
         lastSendCall = peerId to plaintext
         return if (sendResults.isEmpty()) SendResult.Sent else sendResults.removeAt(0)
+    }
+
+    override suspend fun sendToGroup(groupId: String, text: String): SendResult {
+        lastSendToGroupCall = groupId to text
+        return if (sendToGroupResults.isEmpty()) SendResult.Sent else sendToGroupResults.removeAt(0)
+    }
+
+    override suspend fun createGroup(name: String, memberPeerIds: List<String>): String {
+        lastCreateGroupCall = name to memberPeerIds
+        return createGroupResult
     }
 }
 

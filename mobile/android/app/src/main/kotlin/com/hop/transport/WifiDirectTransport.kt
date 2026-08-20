@@ -8,14 +8,22 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.PreKeyBundleCodec
+import com.hop.data.DontRelayFlagEntity
+import com.hop.data.PendingMessageEntity
 import com.hop.data.PostEntity
 import com.hop.data.PreKeyRotationManager
+import com.hop.protocol.DontRelayFlagEnvelope
 import com.hop.protocol.Frame
 import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.PreKeyBundleEnvelope
+import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
+import com.hop.repository.DontRelayRepository
+import com.hop.repository.PendingMessageRepository
+import com.hop.repository.PointsRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import kotlinx.coroutines.runBlocking
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -25,7 +33,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -38,14 +46,22 @@ import java.util.concurrent.CopyOnWriteArrayList
  * open decision #5 for the density concerns that shaped the accept loop and
  * the duplicate-connection-event guard).
  *
- * Two structural differences from the spike:
- * - Send path is a session-scoped outbox ([broadcastPost]) instead of a
- *   single `pendingClip` -- every currently-queued post is offered to every
- *   peer this device connects to, not just the most recently queued one.
+ * Structural differences from the spike:
+ * - Send path pushes a new post live to every currently-connected peer
+ *   ([broadcastPost]) instead of a single `pendingClip` -- every queued post
+ *   is offered to every peer this device connects to, not just the most
+ *   recently queued one. As of Phase 2 Slice 1, both the live-push set and
+ *   the new-connection backlog are backed by [RelayRepository]'s persisted
+ *   relay queue (not a session-scoped in-memory list), so a post survives
+ *   this device's own process restart, not just a downstream relay's (see
+ *   [broadcastPost]/[registerConnectionAndGetBacklog]'s own docs).
  * - Receive path decodes and stores every queued frame a peer sends (loops
  *   until the socket closes/EOF), and stores ciphertext + key separately
  *   (matching [PostRepository]'s on-demand-decrypt design) instead of
- *   force-decrypting and handing off to a system viewer.
+ *   force-decrypting and handing off to a system viewer. A genuinely-new
+ *   frame also gets relay custody and an immediate live-push to every
+ *   *other* connected peer (see [handleNewlyReceivedFrame]) -- multi-hop
+ *   store-and-forward relay, not direct-peer-only delivery.
  *
  * As of the Phase 1 messaging slice, every blob crossing the socket is a
  * [WireEnvelope] (`[1-byte type][4-byte length][payload]`), not a bare
@@ -60,6 +76,43 @@ class WifiDirectTransport(
     private val channel: WifiP2pManager.Channel,
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
+    /**
+     * Phase 2 Slice 1's persisted store-and-forward relay queue (see its own
+     * doc) -- backs both [broadcastPost]'s self-authored-post custody
+     * (Finding B: a post surviving *this* device's own process restart, not
+     * just a downstream relay's) and [registerConnectionAndGetBacklog]'s
+     * new-connection backlog, replacing the old session-scoped in-memory
+     * `outbox` that never survived a process restart.
+     */
+    private val relayRepository: RelayRepository,
+    /**
+     * Phase 2 Slice 2's "don't relay" distinct-attested-device flag counter
+     * (see its own doc). Backs [broadcastDontRelayFlag] (this device's own
+     * outgoing flags), the [WirePayloadType.DONT_RELAY_FLAG] branch of
+     * [EnvelopeDispatcher.dispatch] (recording a peer's incoming flag), and
+     * [registerConnectionAndGetBacklog]'s flag backlog -- the same
+     * three-call-site shape [relayRepository] already has for posts.
+     */
+    private val dontRelayRepository: DontRelayRepository,
+    /**
+     * Phase 2 Slice 2's non-tradeable local points counter for relay
+     * operators (see its own doc). Awarded from [handleNewlyReceivedFrame]'s
+     * live-push loop and [sendBacklog] -- see each method's own doc for the
+     * exact award point and the self-authored-post exclusion.
+     */
+    private val pointsRepository: PointsRepository,
+    /**
+     * Phase 2 Slice 3's persisted relay-custody queue for offline 1:1
+     * message recipients (see its own doc). Backs [sendMessage]'s
+     * flood-on-failure fallback, the [WirePayloadType.MESSAGE_CIPHERTEXT]
+     * branch of [EnvelopeDispatcher.dispatch] (a message arriving for a
+     * peer other than this device -- taking relay custody rather than
+     * decrypting, since this device structurally has no session for that
+     * conversation), and [registerConnectionAndGetBacklog]'s message
+     * backlog -- the same three-call-site shape [relayRepository] already
+     * has for posts.
+     */
+    private val pendingMessageRepository: PendingMessageRepository,
     /**
      * Owns this device's one-time/signed/Kyber prekey pool and rotation
      * policy -- needed here (not just in `com.hop.repository.MessageRepository`)
@@ -134,37 +187,12 @@ class WifiDirectTransport(
     /** Routes a decoded [WireEnvelope] to the right handler -- see [EnvelopeDispatcher]'s own doc. */
     private val envelopeDispatcher = EnvelopeDispatcher(
         receivedFrameStore = receivedFrameStore,
+        dontRelayRepository = dontRelayRepository,
+        pendingMessageRepository = pendingMessageRepository,
+        getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
     )
-
-    /**
-     * Session-scoped, in-memory-only send outbox. [broadcastPost] appends and
-     * immediately pushes the new frame to every currently-open connection (see
-     * [activeConnections]); a peer that connects *after* the post was queued
-     * gets the full backlog as soon as it connects (see
-     * [registerConnectionAndGetBacklog]). Real-hardware finding: a WiFi Direct
-     * group commonly stays formed for the lifetime of both apps' foreground
-     * session, so "only send on connect" (the original design here) silently
-     * dropped every post made after the first connection -- confirmed on real
-     * hardware, the receiving phone never got a second post sent over an
-     * already-open group. [outboxLock] closes that gap without double-sending:
-     * see its doc.
-     *
-     * Holds already-[WireEnvelope]-wrapped bytes (`POST_FRAME`-tagged), not
-     * bare `Frame` bytes -- wrapped once in [broadcastPost], so backlog
-     * flushes ([sendBacklog]) never need to re-wrap.
-     *
-     * Deliberately no ack/retry, and nothing here re-sends a post queued in a
-     * *previous* app process/session -- this matches Phase 1's explicit scope
-     * ("direct peer-to-peer only, no relay/store-and-forward yet" --
-     * BUILD_PLAN.md Phase 1 vs. Phase 2). A post posted while this device has
-     * no peers, or while every current peer already has it, is simply never
-     * delivered to a peer that connects only after the process has died and
-     * restarted -- that gap is Phase 2's store-and-forward relay to close,
-     * not something this class should paper over.
-     */
-    private val outbox = mutableListOf<ByteArray>()
 
     /**
      * Every socket connection currently open to a peer (this device may be
@@ -180,53 +208,107 @@ class WifiDirectTransport(
     private val activeConnections = CopyOnWriteArrayList<PeerConnection>()
 
     /**
-     * Guards [outbox] mutation together with [activeConnections] reads (in
-     * [broadcastPost]) and, symmetrically, [activeConnections] mutation
-     * together with [outbox] reads (in [registerConnectionAndGetBacklog]) --
-     * the two operations that must never interleave. Without a single lock
-     * spanning both collections, a post queued exactly as a new connection is
-     * being registered could land in neither the new connection's backlog nor
-     * its live-push set (silently dropped) or in both (double-sent). Because
-     * both critical sections are tiny (a list add/read, no I/O), holding this
-     * lock never blocks on network or disk work -- the actual socket writes
-     * happen after release, in [PeerConnection.trySend].
+     * Guards [relayRepository]'s persisted-queue writes/reads together with
+     * [activeConnections] reads (in [broadcastPost]) and, symmetrically,
+     * [activeConnections] mutation together with [relayRepository] reads (in
+     * [registerConnectionAndGetBacklog]) -- the two operations that must
+     * never interleave. Without a single lock spanning both, a post queued
+     * exactly as a new connection is being registered could land in neither
+     * the new connection's backlog nor its live-push set (silently dropped)
+     * or in both (double-sent).
+     *
+     * Historical note: before Phase 2 Slice 1, this guarded an in-memory
+     * `outbox` list plus [activeConnections], and both critical sections
+     * were genuinely tiny (list add/read, no I/O). That's no longer strictly
+     * true -- [relayRepository]'s persisted-queue calls now do real Room I/O
+     * while this lock is held. That tradeoff is deliberate: correctness of
+     * the write+live-push-vs-connect+backlog-query race matters more here
+     * than strict "never block on I/O while holding a monitor" purity, and
+     * both call sites already run on background threads (never the main
+     * thread -- see [handleConnection]/[receivePosts]'s own docs), so this
+     * never risks blocking UI work.
      */
     private val outboxLock = Any()
 
     /**
-     * Queues [encoded] (an already `EncryptedFrameCodec`-encoded frame, built
-     * by the caller -- this class never constructs a [Frame] on the send
-     * path) to be sent to every peer this device connects to for the rest of
-     * this session, and immediately pushes it to every peer already
-     * connected right now. See [outbox]'s doc for what "for the rest of this
-     * session" does and doesn't mean.
+     * Decodes [encoded] once (this class never constructs a [Frame] on the
+     * send path -- the caller, [com.hop.app.composer.PostComposerViewModel],
+     * already built it), takes relay custody of it via [relayRepository]
+     * (Finding B: without this, a self-authored post surviving *this
+     * device's own* process restart -- not just a downstream relay's -- was
+     * never possible, since the old in-memory `outbox` was wiped by any
+     * process death, including this device's), then immediately pushes it to
+     * every peer already connected right now. A peer that connects *after*
+     * this call gets it from [registerConnectionAndGetBacklog]'s
+     * [relayRepository]-backed backlog instead of a live push.
      *
      * Wraps [encoded] in a [WirePayloadType.POST_FRAME]-tagged [WireEnvelope]
-     * exactly once here -- everything downstream ([outbox], [sendBacklog],
-     * live push below) deals in already-wrapped bytes.
+     * exactly once here -- everything downstream ([sendBacklog], live push
+     * below) deals in already-wrapped bytes.
      *
      * Note for future maintainers: this class does not build frames on send,
      * so the Phase 0 spike's `senderDeviceId`-regenerated-per-send bug
      * ([com.hop.spike.WifiDirectSpike.sendPayload]) has no structural
-     * equivalent here -- the caller ([com.hop.app.composer.PostComposerViewModel])
-     * already builds the frame once, using a stable per-install id from
-     * `SettingsRepository.getOrCreateStableSenderDeviceId()`. Don't
-     * reintroduce per-send frame construction (and therefore a fresh id) in
-     * this class later.
+     * equivalent here -- the caller already builds the frame once, using a
+     * stable per-install id from `SettingsRepository.getOrCreateStableSenderDeviceId()`.
+     * Don't reintroduce per-send frame construction (and therefore a fresh
+     * id) in this class later.
      */
     fun broadcastPost(encoded: ByteArray) {
         val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, encoded)
         val connectionsSnapshot: List<PeerConnection>
-        val outboxSize: Int
         synchronized(outboxLock) {
-            outbox.add(envelope)
-            outboxSize = outbox.size
+            try {
+                runBlocking { relayRepository.considerForRelay(Frame.decode(encoded)) }
+            } catch (e: Exception) {
+                onLog("Could not take relay custody of own broadcast post: ${e.message}")
+            }
             connectionsSnapshot = activeConnections.toList()
         }
-        onLog("Queued post for broadcast (${encoded.size} bytes); outbox size=$outboxSize")
+        onLog("Broadcasting post (${encoded.size} bytes) to ${connectionsSnapshot.size} connected peer(s)")
         for (connection in connectionsSnapshot) {
             if (!connection.trySend(envelope)) {
                 onLog("Live send failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
+     * Records [row] locally via [dontRelayRepository] and, only if it was
+     * genuinely new (not a duplicate flag from this device's own attested
+     * key -- see [DontRelayRepository.recordFlag]'s own doc), pushes it live
+     * to every peer already connected right now. A peer that connects
+     * *after* this call gets it from [registerConnectionAndGetBacklog]'s
+     * [dontRelayRepository]-backed flag backlog instead. Mirrors
+     * [broadcastPost]'s own shape.
+     *
+     * Shares [outboxLock] with [broadcastPost]/[registerConnectionAndGetBacklog]
+     * for the same reason [broadcastPost] does: without it, a flag recorded
+     * exactly as a new connection is being registered could land in neither
+     * that connection's backlog nor its live-push set, or in both.
+     */
+    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) {
+        val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
+        val connectionsSnapshot: List<PeerConnection>
+        val isNew: Boolean
+        synchronized(outboxLock) {
+            isNew = try {
+                runBlocking { dontRelayRepository.recordFlag(row) }
+            } catch (e: Exception) {
+                onLog("Could not record own \"don't relay\" flag: ${e.message}")
+                false
+            }
+            connectionsSnapshot = activeConnections.toList()
+        }
+        if (!isNew) {
+            onLog("\"Don't relay\" flag was already recorded (or already expired); not re-broadcasting")
+            return
+        }
+        onLog("Broadcasting a \"don't relay\" flag to ${connectionsSnapshot.size} connected peer(s)")
+        for (connection in connectionsSnapshot) {
+            if (!connection.trySend(envelope)) {
+                onLog("Live \"don't relay\" flag send failed to a connected peer; dropping that connection")
                 activeConnections.remove(connection)
             }
         }
@@ -242,10 +324,10 @@ class WifiDirectTransport(
      * Returns `false` (never throws) if no currently-open connection is
      * tagged with [peerId] -- either this peer isn't connected right now, or
      * this device has never received a PREKEY_BUNDLE/MESSAGE_CIPHERTEXT
-     * envelope identifying which open connection is theirs. Phase 1 has no
-     * store-and-forward, so this is a real, expected "can't deliver right
-     * now" outcome, not a bug -- callers (`MessageRepository.send`) still
-     * persist the outgoing message locally regardless.
+     * envelope identifying which open connection is theirs. Still used
+     * as-is for [WirePayloadType.PREKEY_BUNDLE] sends (bundles are never
+     * relay-queued -- see [PendingMessageRepository]'s "No bundle-relay"
+     * Limits note) and as [sendMessage]'s own fast-path attempt.
      */
     fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean {
         val connection = activeConnections.firstOrNull { it.remotePeerId == peerId } ?: return false
@@ -253,14 +335,105 @@ class WifiDirectTransport(
     }
 
     /**
-     * Atomically registers [connection] as active and returns every post
-     * queued before this call -- see [outboxLock]'s doc for why this must
-     * share a lock with [broadcastPost] rather than read [outbox] separately.
+     * Phase 2 Slice 3: unicast-first, flood-on-failure send for a
+     * [WirePayloadType.MESSAGE_CIPHERTEXT] envelope already addressed to
+     * [recipientPeerId] (i.e. [payload] is a [MessageCiphertextEnvelope]-
+     * encoded blob, decodable as one).
+     *
+     * **Fast path**: if [recipientPeerId] is a currently-connected, already-
+     * identified peer, [sendToPeer] delivers it directly -- no relay custody
+     * is taken, nothing is flooded, and no metadata beyond the direct peer is
+     * exposed to anyone else. This is unchanged from pre-Slice-3 behavior and
+     * is the common case ("both devices are right next to each other").
+     *
+     * **Fallback (only on fast-path failure)**: takes relay custody via
+     * [pendingMessageRepository.considerForRelay] (so this message survives
+     * this device's own process restart even if delivered to no one yet --
+     * mirrors [broadcastPost]'s own Finding B rationale), then live-pushes
+     * the same envelope bytes to every currently-connected peer, mirroring
+     * [broadcastPost]'s shape exactly. This is the *only* path that ever
+     * takes custody of a message: a message that unicasts successfully never
+     * touches [PendingMessageEntity] at all, since there's nothing left
+     * needing restart-survival once the bytes are already on the wire.
+     *
+     * Deliberately **not** symmetric with [broadcastPost]'s uniform flood --
+     * see this class's own doc / the Phase 2 Slice 3 plan for why collapsing
+     * the common "both devices in range" case into flood-and-persist would
+     * leak sender/recipient metadata to every bystander for zero benefit and
+     * contradict PRD §7's NFR that in-range delivery is a faster, implicitly
+     * more private path than store-and-forward.
+     *
+     * Returns `false` when the fast path fails (even though custody was
+     * taken and a flood was attempted) -- mirrors [sendToPeer]'s own
+     * "delivered right now, yes or no" contract; callers (`MessageRepository.send`)
+     * still persist the outgoing message to local history regardless, same
+     * as before this slice.
+     */
+    fun sendMessage(recipientPeerId: String, payload: ByteArray): Boolean {
+        if (sendToPeer(recipientPeerId, WirePayloadType.MESSAGE_CIPHERTEXT, payload)) {
+            return true
+        }
+
+        val envelope = try {
+            MessageCiphertextEnvelope.decode(payload)
+        } catch (e: Exception) {
+            onLog("Could not decode outgoing message envelope for relay custody: ${e.message}")
+            return false
+        }
+
+        val wireBytes: ByteArray
+        val connectionsSnapshot: List<PeerConnection>
+        synchronized(outboxLock) {
+            try {
+                runBlocking { pendingMessageRepository.considerForRelay(envelope) }
+            } catch (e: Exception) {
+                onLog("Could not take relay custody of an outgoing message: ${e.message}")
+            }
+            wireBytes = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, payload)
+            connectionsSnapshot = activeConnections.toList()
+        }
+        onLog("Recipient not directly connected -- flood-offering a message to ${connectionsSnapshot.size} connected peer(s)")
+        for (connection in connectionsSnapshot) {
+            if (!connection.trySend(wireBytes)) {
+                onLog("Live message flood-offer failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+        return false
+    }
+
+    /**
+     * Atomically registers [connection] as active and returns every
+     * currently relay-eligible post from [relayRepository]'s persisted
+     * queue, each already re-encoded with `hopCount + 1` and
+     * [WireEnvelope]-wrapped, followed by every non-expired "don't relay"
+     * flag from [dontRelayRepository]'s persisted queue, followed by every
+     * relay-eligible message from [pendingMessageRepository]'s persisted
+     * queue (Phase 2 Slice 3) -- see
+     * [outboxLock]'s doc for why this must share a lock with
+     * [broadcastPost]/[broadcastDontRelayFlag]/[sendMessage] rather than
+     * query any repository separately. [dontRelayRepository]'s flag backlog is offered
+     * independent of whether this device also holds/relays the underlying
+     * post -- see [DontRelayRepository.buildOutgoingFlagBacklog]'s own doc
+     * for why (order-independence: a flag can legitimately exist here for a
+     * clipHash this device has never received a post for). Room-backed, so
+     * (unlike the old in-memory `outbox` this replaced) all three backlogs
+     * survive this device's own process restart.
+     *
+     * The message backlog here is the blind, connect-time flood that gives
+     * any newly-connected peer a chance to pick up custody or, if they turn
+     * out to be the recipient, self-identify (see [DispatchResult.NewRelayableMessage])
+     * and receive it -- offered independent of whether this connection's
+     * remote peer id is known yet, mirroring the post/flag backlogs' own
+     * unconditional-offer posture.
      */
     private fun registerConnectionAndGetBacklog(connection: PeerConnection): List<ByteArray> =
         synchronized(outboxLock) {
             activeConnections.add(connection)
-            outbox.toList()
+            val postBacklog = runBlocking { relayRepository.buildOutgoingBacklog() }
+            val flagBacklog = runBlocking { dontRelayRepository.buildOutgoingFlagBacklog() }
+            val messageBacklog = runBlocking { pendingMessageRepository.buildOutgoingBacklog() }
+            postBacklog + flagBacklog + messageBacklog
         }
 
     /**
@@ -555,13 +728,62 @@ class WifiDirectTransport(
         Thread({ receivePosts(socket, connection) }, "hop-receive").start()
     }
 
-    /** Flushes every post queued before this connection registered -- new posts arrive via [broadcastPost]'s live push instead. */
+    /**
+     * Flushes every post/flag queued before this connection registered --
+     * new posts/flags arrive via [broadcastPost]/[broadcastDontRelayFlag]'s
+     * live push instead. After each successful send of a
+     * [WirePayloadType.POST_FRAME] entry, awards a point for the hand-off
+     * via [maybeAwardPointsForRelayedFrame] -- see that method's own doc for
+     * the self-authored exclusion and why repeated calls across backlog
+     * resends on reconnect are harmless by construction.
+     */
     private fun sendBacklog(connection: PeerConnection, backlog: List<ByteArray>) {
-        onLog("Sending ${backlog.size} queued post(s) to connected peer")
-        for (envelope in backlog) {
-            if (!connection.trySend(envelope)) {
+        onLog("Sending ${backlog.size} queued item(s) to connected peer")
+        for (envelopeBytes in backlog) {
+            if (!connection.trySend(envelopeBytes)) {
                 onLog("Send error while flushing backlog to a connected peer")
                 break
+            }
+            maybeAwardPointsForBacklogEntry(envelopeBytes)
+        }
+    }
+
+    /**
+     * Decodes [envelopeBytes] only far enough to check whether it's a
+     * [WirePayloadType.POST_FRAME] (flag backlog entries never earn points),
+     * then delegates to [maybeAwardPointsForRelayedFrame]. Swallows decode
+     * errors -- a malformed backlog entry should never crash the send loop
+     * that already successfully wrote it to the socket.
+     */
+    private fun maybeAwardPointsForBacklogEntry(envelopeBytes: ByteArray) {
+        try {
+            val envelope = WireEnvelope.decode(envelopeBytes)
+            if (envelope.type == WirePayloadType.POST_FRAME) {
+                maybeAwardPointsForRelayedFrame(Frame.decode(envelope.payload))
+            }
+        } catch (e: Exception) {
+            onLog("Could not evaluate a backlog entry for a points award: ${e.message}")
+        }
+    }
+
+    /**
+     * Awards one point via [pointsRepository] for successfully handing
+     * [frame] to a peer -- gated on [frame] not being self-authored (its
+     * `senderDeviceId` differs from this device's own [getOwnPeerId]) so a
+     * device never earns credit for its own posts, only for genuinely
+     * relaying someone else's. Called from both [handleNewlyReceivedFrame]'s
+     * live-push loop and [sendBacklog] -- [pointsRepository]'s underlying
+     * `points_ledger` table is clipHash-primary-keyed with an insert-IGNORE
+     * conflict strategy, so repeated calls for the same clipHash (backlog
+     * resend on every WiFi Direct reconnect, or a live push to several
+     * peers) are harmless by construction. Never add a second "have I
+     * already awarded this" check here -- let that DB constraint do it.
+     */
+    private fun maybeAwardPointsForRelayedFrame(frame: Frame) {
+        runBlocking {
+            val ownPeerId = getOwnPeerId()
+            if (frame.senderDeviceId.toHexString() != ownPeerId) {
+                pointsRepository.award(frame.clipHash.toHexString())
             }
         }
     }
@@ -604,9 +826,19 @@ class WifiDirectTransport(
                 input.readFully(payload)
                 try {
                     val envelope = WireEnvelope(WirePayloadType.fromWireValue(typeByte), payload)
-                    val identifiedPeerId = runBlocking { envelopeDispatcher.dispatch(envelope) }
-                    if (identifiedPeerId != null) {
-                        connection.remotePeerId = identifiedPeerId
+                    when (val result = runBlocking { envelopeDispatcher.dispatch(envelope) }) {
+                        is DispatchResult.PeerIdentified -> {
+                            connection.remotePeerId = result.peerId
+                            deliverAnyPendingMessagesTo(result.peerId, connection)
+                        }
+                        is DispatchResult.NewPostFrame -> handleNewlyReceivedFrame(result.frame, arrivedOn = connection)
+                        is DispatchResult.NewDontRelayFlag -> handleNewlyReceivedDontRelayFlag(result.row, arrivedOn = connection)
+                        is DispatchResult.NewRelayableMessage -> {
+                            connection.remotePeerId = result.senderPeerId
+                            handleNewlyReceivedMessage(result.row, arrivedOn = connection)
+                            deliverAnyPendingMessagesTo(result.senderPeerId, connection)
+                        }
+                        DispatchResult.NoOp -> Unit
                     }
                     onLog("Received and handled a ${envelope.type} envelope")
                 } catch (e: Exception) {
@@ -624,6 +856,111 @@ class WifiDirectTransport(
             onLog("Receive error: ${e.message}")
         } finally {
             activeConnections.remove(connection)
+        }
+    }
+
+    /**
+     * Called once per genuinely-new [Frame] this device receives (see
+     * [DispatchResult.NewPostFrame]) -- takes relay custody of it via
+     * [relayRepository] (so it survives this device's own process death and
+     * gets offered as backlog to any peer that connects later, see
+     * [registerConnectionAndGetBacklog]), then immediately live-pushes a
+     * re-encoded copy (`hopCount + 1`) to every *other* currently-connected
+     * peer, never back to [arrivedOn] -- there is no reason to echo a frame
+     * to the peer that just sent it, and [ReceivedFrameStore]'s clipHash
+     * dedup would just no-op it there anyway.
+     *
+     * This is what closes the "only reaches already-connected peers on
+     * their *next* reconnect" gap: without this live push, a peer connected
+     * to this device on a different link right now would not see a
+     * just-relayed post until it happened to reconnect and re-request the
+     * backlog. Mirrors [broadcastPost]'s own live-push for a self-authored
+     * post.
+     */
+    private fun handleNewlyReceivedFrame(frame: Frame, arrivedOn: PeerConnection) {
+        runBlocking { relayRepository.considerForRelay(frame) }
+        val outgoingFrame = frame.copy(hopCount = frame.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, outgoingFrame.encode())
+        for (connection in activeConnections) {
+            if (connection === arrivedOn) continue
+            if (connection.trySend(envelope)) {
+                maybeAwardPointsForRelayedFrame(frame)
+            } else {
+                onLog("Live relay push failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
+     * Called once per genuinely-new [DontRelayFlagEntity] this device
+     * records (see [DispatchResult.NewDontRelayFlag]) -- live-pushes it
+     * onward to every *other* currently-connected peer, never back to
+     * [arrivedOn], mirroring [handleNewlyReceivedFrame]'s own shape. Flags
+     * never touch [relayRepository]/hop-count-based eligibility -- their own
+     * propagation bound is TTL plus distinct-attested-key dedup alone (see
+     * [DontRelayFlagEnvelope]'s own doc), and [dontRelayRepository.recordFlag]
+     * has already been called by [EnvelopeDispatcher.dispatch] by the time
+     * this runs.
+     */
+    private fun handleNewlyReceivedDontRelayFlag(row: DontRelayFlagEntity, arrivedOn: PeerConnection) {
+        val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
+        for (connection in activeConnections) {
+            if (connection === arrivedOn) continue
+            if (!connection.trySend(envelope)) {
+                onLog("Live \"don't relay\" flag relay push failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
+     * Called once per genuinely-new [PendingMessageEntity] this device takes
+     * custody of on behalf of someone else's conversation (see
+     * [DispatchResult.NewRelayableMessage]) -- live-pushes a `hopCount + 1`
+     * re-encoded copy to every *other* currently-connected peer, never back
+     * to [arrivedOn], mirroring [handleNewlyReceivedFrame]'s own shape
+     * exactly (Phase 2 Slice 3's flood-on-failure fallback applies just as
+     * much to a message this device is only carrying as to one it
+     * originated -- see [sendMessage]'s own doc). [pendingMessageRepository
+     * .considerForRelay] has already been called by
+     * [EnvelopeDispatcher.dispatch] by the time this runs.
+     */
+    private fun handleNewlyReceivedMessage(row: PendingMessageEntity, arrivedOn: PeerConnection) {
+        val storedEnvelope = MessageCiphertextEnvelope.decode(row.encodedEnvelope)
+        val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, outgoingEnvelope.encode())
+        for (connection in activeConnections) {
+            if (connection === arrivedOn) continue
+            if (!connection.trySend(envelope)) {
+                onLog("Live message relay push failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
+     * Phase 2 Slice 3's local delivery-confirmation stop signal (see this
+     * class's own doc for why no wire-level delivery-ack primitive exists
+     * instead): once [connection]'s remote peer id is positively identified
+     * as [identifiedPeerId] (via [DispatchResult.PeerIdentified] or
+     * [DispatchResult.NewRelayableMessage]), checks
+     * [pendingMessageRepository] for any locally-held rows addressed to
+     * [identifiedPeerId], hands each directly over [connection], and on
+     * success, deletes the row -- a self-observed fact ("I just handed this
+     * directly to the peer it's addressed to"), never a claim asserted by
+     * another device, so it isn't forgeable by a hostile peer. A `trySend`
+     * failure leaves the row in place untouched -- it's still eligible for
+     * [buildOutgoingBacklog]'s ordinary flood path next connection.
+     */
+    private fun deliverAnyPendingMessagesTo(identifiedPeerId: String, connection: PeerConnection) {
+        val rows = runBlocking { pendingMessageRepository.findByRecipient(identifiedPeerId) }
+        for (row in rows) {
+            val envelope = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, row.encodedEnvelope)
+            if (connection.trySend(envelope)) {
+                runBlocking { pendingMessageRepository.delete(row.ciphertextHash) }
+                onLog("Delivered a relay-held message directly to its now-identified recipient; dropped local custody")
+            }
         }
     }
 }
@@ -646,16 +983,48 @@ internal class ReceivedFrameStore(
     private val postRepository: PostRepository,
     private val decayKeyStore: DecayKeyStore,
     private val postsDir: File,
+    /**
+     * Used only to decide whether this frame has already decayed as of
+     * receipt (see [handle]'s "skip the store() call entirely" branch) --
+     * a separate, injectable instance (rather than reaching for a
+     * `RelayPolicy` owned elsewhere) so a test can advance its clock
+     * independently of, or in lockstep with, [decayKeyStore]'s own clock.
+     * Defaults to a real system clock in production, matching
+     * [DecayKeyStore]'s own default.
+     */
+    private val relayPolicy: RelayPolicy = RelayPolicy(),
 ) {
     /**
      * Decodes [bytes] as a version-2 [Frame]. If a post with the same
      * `clipHash` is already stored (this device has already seen this post,
      * whether via this same peer reconnecting or a different peer), skips it
-     * without touching [decayKeyStore] or the filesystem and returns `false`.
-     * Otherwise stores the wrapped content-encryption key on the frame's own
-     * `ttlSeconds` decay window, writes the ciphertext payload to
+     * without touching [decayKeyStore] or the filesystem and returns `null`.
+     * Otherwise anchors the decay-key expiry to this post's *original*
+     * schedule (`frame.originatedAtMs + frame.ttlSeconds`, via
+     * [RelayPolicy.expiresAtMs]) -- not to local receipt time -- stores the
+     * wrapped content-encryption key under that absolute expiry unless it's
+     * already in the past (see below), writes the ciphertext payload to
      * `$postsDir/$clipHash.enc`, inserts a [PostEntity] with
-     * `receivedAtMs = now`, and returns `true`.
+     * `receivedAtMs = now`, and returns the decoded [Frame].
+     *
+     * Anchoring to [Frame.originatedAtMs] rather than receipt time is a
+     * correctness fix (Finding A), not a stylistic choice: at direct-hop
+     * distance the two are nearly identical, so anchoring to receipt time
+     * was harmless in Phase 1. Once multi-hop relay (Phase 2) adds queuing
+     * delay between origination and this device's receipt, anchoring to
+     * receipt time would silently re-extend a post's decryption-key
+     * lifetime to "full TTL from whenever this relay hop happened to
+     * forward it," defeating ADR 0003's decay guarantee for every
+     * downstream recipient.
+     *
+     * If the frame has *already* decayed as of receipt (its origin-anchored
+     * expiry is already in the past -- plausible after enough relay hops/
+     * delay), the [decayKeyStore] `store()` call is skipped entirely rather
+     * than storing a key that would be immediately unretrievable anyway.
+     * The [PostEntity] row is still inserted either way, so the post still
+     * renders as [com.hop.repository.PostRepository.DecryptResult.Decayed]
+     * in the feed -- the same outcome as any other decayed post, not a
+     * special case.
      *
      * This never decrypts -- it stores ciphertext + key separately, matching
      * [PostRepository]'s on-demand-decrypt design (`PostRepository.decrypt`),
@@ -663,28 +1032,32 @@ internal class ReceivedFrameStore(
      *
      * Runs real blocking I/O (file write, Room via [postRepository]/
      * [decayKeyStore]) synchronously via `runBlocking` -- callers must invoke
-     * this off the main thread. Returns `false` (without throwing) if [bytes]
+     * this off the main thread. Returns `null` (without throwing) if [bytes]
      * doesn't decode as a valid frame.
      */
-    fun handle(bytes: ByteArray): Boolean {
+    fun handle(bytes: ByteArray): Frame? {
         val frame = try {
             Frame.decode(bytes)
         } catch (e: Exception) {
-            return false
+            return null
         }
 
         val clipHashHex = frame.clipHash.toHexString()
 
         return runBlocking {
             if (postRepository.getByClipHash(clipHashHex) != null) {
-                return@runBlocking false
+                return@runBlocking null
             }
 
-            decayKeyStore.store(
-                contentId = clipHashHex,
-                wrappedCek = frame.contentEncryptionKey,
-                decayWindow = Duration.ofSeconds(frame.ttlSeconds),
-            )
+            if (!relayPolicy.isExpired(frame.originatedAtMs, frame.ttlSeconds)) {
+                decayKeyStore.store(
+                    contentId = clipHashHex,
+                    wrappedCek = frame.contentEncryptionKey,
+                    expiresAt = Instant.ofEpochMilli(
+                        relayPolicy.expiresAtMs(frame.originatedAtMs, frame.ttlSeconds),
+                    ),
+                )
+            }
 
             postsDir.mkdirs()
             val payloadFile = File(postsDir, "$clipHashHex.enc")
@@ -703,7 +1076,7 @@ internal class ReceivedFrameStore(
                     encryptedPayloadFilePath = payloadFile.absolutePath,
                 ),
             )
-            true
+            frame
         }
     }
 
@@ -732,31 +1105,138 @@ internal class ReceivedFrameStore(
  */
 internal class EnvelopeDispatcher(
     private val receivedFrameStore: ReceivedFrameStore,
+    /**
+     * Phase 2 Slice 2's "don't relay" flag counter -- [dispatch] calls
+     * [DontRelayRepository.recordFlag] directly for a
+     * [WirePayloadType.DONT_RELAY_FLAG] envelope, the same "this class does
+     * the store/dedup step itself" shape [receivedFrameStore] already has
+     * for posts.
+     */
+    private val dontRelayRepository: DontRelayRepository,
+    /**
+     * Phase 2 Slice 3's persisted relay-custody queue for offline 1:1
+     * message recipients -- [dispatch]'s [WirePayloadType.MESSAGE_CIPHERTEXT]
+     * branch calls [PendingMessageRepository.considerForRelay] directly
+     * whenever a decoded envelope's `recipientPeerId` does **not** match
+     * [getOwnPeerId] -- i.e. this device is being asked to carry the message
+     * for someone else, not decrypt it. Only the *matching* branch ever
+     * calls [onMessageCiphertextReceived] (`crypto/`-touching) -- see this
+     * class's own doc for why that split is the load-bearing property here.
+     */
+    private val pendingMessageRepository: PendingMessageRepository,
+    /**
+     * This device's own stable messaging identity -- a suspend function
+     * (mirroring the same `getOwnPeerId: suspend () -> String` pattern
+     * already used by [WifiDirectTransport]/`MessageRepository`) rather than
+     * a plain value, since it's ultimately backed by
+     * `SettingsRepository.getOrCreateStableSenderDeviceId()` (DataStore,
+     * suspend). Used by [dispatch] to decide whether an arriving
+     * [WirePayloadType.MESSAGE_CIPHERTEXT] envelope is genuinely addressed to
+     * this device or must be relay-queued instead.
+     */
+    private val getOwnPeerId: suspend () -> String,
     private val onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit,
     private val onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit,
 ) {
     /**
-     * Handles [envelope] and returns the peer id it identified its sender as,
-     * if any -- `null` for a [WirePayloadType.POST_FRAME] envelope, which
-     * carries no peer-messaging identity. Callers use a non-null result to
-     * tag the connection this envelope arrived on (see
-     * [WifiDirectTransport.PeerConnection.remotePeerId]) so a later
-     * peer-targeted send ([WifiDirectTransport.sendToPeer]) can find it.
+     * Handles [envelope] and returns what the caller needs to act on next --
+     * see [DispatchResult]'s own doc for the five cases.
      */
-    suspend fun dispatch(envelope: WireEnvelope): String? = when (envelope.type) {
+    suspend fun dispatch(envelope: WireEnvelope): DispatchResult = when (envelope.type) {
         WirePayloadType.POST_FRAME -> {
-            receivedFrameStore.handle(envelope.payload)
-            null
+            val frame = receivedFrameStore.handle(envelope.payload)
+            if (frame != null) DispatchResult.NewPostFrame(frame) else DispatchResult.NoOp
         }
         WirePayloadType.PREKEY_BUNDLE -> {
             val bundleEnvelope = PreKeyBundleEnvelope.decode(envelope.payload)
             onPreKeyBundleReceived(bundleEnvelope.peerId, bundleEnvelope.bundleBytes)
-            bundleEnvelope.peerId
+            DispatchResult.PeerIdentified(bundleEnvelope.peerId)
         }
         WirePayloadType.MESSAGE_CIPHERTEXT -> {
             val messageEnvelope = MessageCiphertextEnvelope.decode(envelope.payload)
-            onMessageCiphertextReceived(messageEnvelope.senderPeerId, messageEnvelope.ciphertext)
-            messageEnvelope.senderPeerId
+            if (messageEnvelope.recipientPeerId == getOwnPeerId()) {
+                // Genuinely for me -- unchanged pre-Slice-3 behavior.
+                onMessageCiphertextReceived(messageEnvelope.senderPeerId, messageEnvelope.ciphertext)
+                DispatchResult.PeerIdentified(messageEnvelope.senderPeerId)
+            } else {
+                // I'm being asked to carry this for someone else -- this
+                // device has no Signal Protocol session for this
+                // conversation at all and structurally cannot decrypt it
+                // (see PendingMessageRepository's own doc).
+                val row = pendingMessageRepository.considerForRelay(messageEnvelope)
+                if (row != null) {
+                    DispatchResult.NewRelayableMessage(row, messageEnvelope.senderPeerId)
+                } else {
+                    DispatchResult.NoOp
+                }
+            }
+        }
+        WirePayloadType.DONT_RELAY_FLAG -> {
+            val flagEnvelope = DontRelayFlagEnvelope.decode(envelope.payload)
+            val row = flagEnvelope.toEntity()
+            val isNew = dontRelayRepository.recordFlag(row)
+            if (isNew) DispatchResult.NewDontRelayFlag(row) else DispatchResult.NoOp
         }
     }
 }
+
+/**
+ * The result of [EnvelopeDispatcher.dispatch] -- callers act differently
+ * depending on which envelope type arrived:
+ * - [PeerIdentified]: tag the connection this envelope arrived on with the
+ *   peer id it identified (see
+ *   [WifiDirectTransport.PeerConnection.remotePeerId]) so a later
+ *   peer-targeted send ([WifiDirectTransport.sendToPeer]) can find it, and
+ *   (Phase 2 Slice 3) check whether this device is holding any relay-custody
+ *   messages addressed to that now-identified peer (see
+ *   [WifiDirectTransport.deliverAnyPendingMessagesTo]).
+ * - [NewPostFrame]: a genuinely-new [WirePayloadType.POST_FRAME] arrived
+ *   ([ReceivedFrameStore.handle] stored it) -- take relay custody and
+ *   live-push it onward (see
+ *   [WifiDirectTransport.handleNewlyReceivedFrame]).
+ * - [NewDontRelayFlag]: a genuinely-new [WirePayloadType.DONT_RELAY_FLAG]
+ *   arrived (already recorded via [DontRelayRepository.recordFlag]) --
+ *   live-push it onward (see
+ *   [WifiDirectTransport.handleNewlyReceivedDontRelayFlag]).
+ * - [NewRelayableMessage] (Phase 2 Slice 3): a genuinely-new
+ *   [WirePayloadType.MESSAGE_CIPHERTEXT] envelope arrived addressed to a
+ *   peer other than this device -- already taken into relay custody via
+ *   [PendingMessageRepository.considerForRelay] by the time this is
+ *   returned. Callers tag the connection with [senderPeerId] (same as
+ *   [PeerIdentified]), live-push it onward (see
+ *   [WifiDirectTransport.handleNewlyReceivedMessage]), and check for a local
+ *   delivery-confirmation opportunity (same as [PeerIdentified]).
+ * - [NoOp]: nothing further for the caller to do -- either an envelope that
+ *   turned out to be an already-seen clipHash/already-recorded flag/
+ *   already-held message custody, or bytes that didn't decode.
+ */
+internal sealed interface DispatchResult {
+    data class PeerIdentified(val peerId: String) : DispatchResult
+    data class NewPostFrame(val frame: Frame) : DispatchResult
+    data class NewDontRelayFlag(val row: DontRelayFlagEntity) : DispatchResult
+    data class NewRelayableMessage(val row: PendingMessageEntity, val senderPeerId: String) : DispatchResult
+    data object NoOp : DispatchResult
+}
+
+/** Converts a decoded [DontRelayFlagEnvelope] to the hex-encoded [DontRelayFlagEntity] shape Room persists. */
+private fun DontRelayFlagEnvelope.toEntity(): DontRelayFlagEntity = DontRelayFlagEntity(
+    clipHash = clipHash.toHexString(),
+    attestedDeviceKey = attestedDeviceKey.toHexString(),
+    flaggedAtMs = flaggedAtMs,
+    originatedAtMs = originatedAtMs,
+    ttlSeconds = ttlSeconds,
+)
+
+/** Converts a persisted [DontRelayFlagEntity] back to its on-wire [DontRelayFlagEnvelope] shape. */
+private fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayFlagEnvelope(
+    clipHash = clipHash.hexToByteArray(),
+    attestedDeviceKey = attestedDeviceKey.hexToByteArray(),
+    flaggedAtMs = flaggedAtMs,
+    originatedAtMs = originatedAtMs,
+    ttlSeconds = ttlSeconds,
+)
+
+private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
+
+private fun String.hexToByteArray(): ByteArray =
+    ByteArray(length / 2) { i -> ((Character.digit(this[i * 2], 16) shl 4) + Character.digit(this[i * 2 + 1], 16)).toByte() }

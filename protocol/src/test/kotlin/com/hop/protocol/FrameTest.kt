@@ -256,6 +256,62 @@ class FrameTest {
         }
     }
 
+    // --- copy() -- general-purpose field override helper (Phase 2 Slice 1) ---
+
+    @Test
+    fun `copy with no arguments returns a frame equal to the original`() {
+        val original = sampleFrame(hopCount = 3, dontRelay = false)
+        val copied = original.copy()
+        assertEquals(original, copied)
+    }
+
+    @Test
+    fun `copy overrides hopCount and leaves every other field unchanged`() {
+        val original = sampleFrame(hopCount = 3, dontRelay = false)
+        val copied = original.copy(hopCount = 4)
+
+        assertEquals(4, copied.hopCount)
+        assertEquals(original.dontRelay, copied.dontRelay)
+        assertTrue(original.clipHash.contentEquals(copied.clipHash))
+        assertTrue(original.senderDeviceId.contentEquals(copied.senderDeviceId))
+        assertEquals(original.contentType, copied.contentType)
+        assertEquals(original.originatedAtMs, copied.originatedAtMs)
+        assertEquals(original.ttlSeconds, copied.ttlSeconds)
+        assertEquals(original.reachTier, copied.reachTier)
+        assertEquals(original.keyIncluded, copied.keyIncluded)
+        assertTrue(original.contentEncryptionKey.contentEquals(copied.contentEncryptionKey))
+        assertTrue(original.payload.contentEquals(copied.payload))
+    }
+
+    @Test
+    fun `copy overrides dontRelay and leaves every other field unchanged`() {
+        val original = sampleFrame(dontRelay = false)
+        val copied = original.copy(dontRelay = true)
+
+        assertEquals(true, copied.dontRelay)
+        assertEquals(original.hopCount, copied.hopCount)
+    }
+
+    @Test
+    fun `copy can override both hopCount and dontRelay at once`() {
+        val original = sampleFrame(hopCount = 1, dontRelay = false)
+        val copied = original.copy(hopCount = 2, dontRelay = true)
+
+        assertEquals(2, copied.hopCount)
+        assertEquals(true, copied.dontRelay)
+    }
+
+    @Test
+    fun `copy result round trips through encode-decode identically to a hand-built frame`() {
+        val original = sampleFrame(hopCount = 0)
+        val copied = original.copy(hopCount = 1)
+
+        val decoded = Frame.decode(copied.encode())
+
+        assertEquals(copied, decoded)
+        assertEquals(1, decoded.hopCount)
+    }
+
     @Test
     fun `constructing a frame with a wrong-sized contentEncryptionKey throws`() {
         assertFailsWith<IllegalArgumentException> {

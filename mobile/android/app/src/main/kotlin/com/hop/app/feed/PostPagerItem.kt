@@ -13,6 +13,7 @@ import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Warning
@@ -58,6 +59,19 @@ import java.io.File
  * same `senderDeviceId` as the Inbox conversation's `peerId` (see
  * `com.hop.app.inbox`'s "one identity, reused everywhere" doc).
  */
+/**
+ * The "proof of local receipt" gate for the "Stop sharing this post" action
+ * (Phase 2 Slice 2, PRD §4.6/ADR 0004): a stock client only lets a user flag
+ * something they've actually decrypted, never before -- `null` (still
+ * decrypting) and [PostRepository.DecryptResult.Decayed] (never successfully
+ * decrypted, or no longer decryptable) both leave it disabled. A plain,
+ * unit-testable predicate (not inlined into the Composable below) so this
+ * gating logic has JVM test coverage without needing a Compose UI test
+ * harness, which this repo doesn't have set up yet.
+ */
+internal fun dontRelayActionEnabled(result: PostRepository.DecryptResult?): Boolean =
+    result is PostRepository.DecryptResult.Decrypted
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun PostPagerItem(
@@ -68,6 +82,7 @@ fun PostPagerItem(
     onBlock: () -> Unit,
     onReport: () -> Unit,
     onMessage: () -> Unit = {},
+    onDontRelay: () -> Unit = {},
 ) {
     var result by remember(post.clipHash) { mutableStateOf<PostRepository.DecryptResult?>(null) }
 
@@ -97,6 +112,8 @@ fun PostPagerItem(
             onBlock = onBlock,
             onReport = onReport,
             onMessage = onMessage,
+            onDontRelay = onDontRelay,
+            dontRelayEnabled = dontRelayActionEnabled(result),
         )
     }
 }
@@ -161,6 +178,8 @@ private fun BlockReportAffordance(
     onBlock: () -> Unit,
     onReport: () -> Unit,
     onMessage: () -> Unit,
+    onDontRelay: () -> Unit,
+    dontRelayEnabled: Boolean,
 ) {
     var sheetOpen by remember { mutableStateOf(false) }
 
@@ -209,6 +228,24 @@ private fun BlockReportAffordance(
                     sheetOpen = false
                 },
             )
+            // Distinct, genuinely new primitive from "Report this post" above
+            // (which is already documented as local-only hiding, explicitly
+            // not the real distributed mechanism -- both actions stay in this
+            // sheet, they mean different things). No mesh/relay jargon in the
+            // label (hop-dev invariant #5 -- "relay" itself is a banned term
+            // in user-facing strings). Enabled only once this post has
+            // actually been decrypted -- see [dontRelayActionEnabled]'s own
+            // doc for why that's the "proof of local receipt" gate.
+            SheetAction(
+                icon = Icons.Filled.Clear,
+                label = "Stop sharing this post",
+                tint = MaterialTheme.colorScheme.error,
+                enabled = dontRelayEnabled,
+                onClick = {
+                    onDontRelay()
+                    sheetOpen = false
+                },
+            )
         }
     }
 }
@@ -219,12 +256,22 @@ private fun SheetAction(
     label: String,
     onClick: () -> Unit,
     tint: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.primary,
+    enabled: Boolean = true,
 ) {
     TextButton(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.padding(end = HopSpacing.sm))
-        Text(label, color = MaterialTheme.colorScheme.onSurface)
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = if (enabled) tint else tint.copy(alpha = 0.38f),
+            modifier = Modifier.padding(end = HopSpacing.sm),
+        )
+        Text(
+            label,
+            color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+        )
     }
 }

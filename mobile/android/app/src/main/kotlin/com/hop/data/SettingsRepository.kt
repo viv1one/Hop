@@ -40,10 +40,32 @@ class SettingsRepository(private val context: Context) {
         val HAS_COMPLETED_FIRST_RUN = booleanPreferencesKey("has_completed_first_run")
         val DEFAULT_REACH_TIER = stringPreferencesKey("default_reach_tier")
         val SENDER_DEVICE_ID = stringPreferencesKey("sender_device_id_b64")
+        val ATTESTED_DEVICE_KEY = stringPreferencesKey("attested_device_key_hex")
     }
 
     val hasCompletedFirstRun: Flow<Boolean> =
         context.dataStore.data.map { prefs -> prefs[Keys.HAS_COMPLETED_FIRST_RUN] ?: false }
+
+    /**
+     * This device's own attested public key (ADR 0004), hex-encoded --
+     * `null` until first-run setup completes (see [FirstRunViewModel]). Prior
+     * to Phase 2 Slice 2 this value was obtained via
+     * [com.hop.crypto.AttestationProvider.attest] at first-run and silently
+     * discarded; persisting it here is the one-line prerequisite that gives
+     * "don't relay" flag-counting (`DontRelayRepository`) a stable identity
+     * to flag *with*.
+     *
+     * NOT itself a Sybil-resistance guarantee -- see
+     * `com.hop.crypto.StubAttestationProvider`'s own doc: until real Play
+     * Integrity/App Attest replaces the stub, this value is only as
+     * trustworthy as the (currently zero) hardware binding behind it.
+     */
+    val attestedDeviceKey: Flow<String?> =
+        context.dataStore.data.map { prefs -> prefs[Keys.ATTESTED_DEVICE_KEY] }
+
+    suspend fun setAttestedDeviceKey(hex: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.ATTESTED_DEVICE_KEY] = hex }
+    }
 
     val defaultReachTier: Flow<ReachTier?> =
         context.dataStore.data.map { prefs ->

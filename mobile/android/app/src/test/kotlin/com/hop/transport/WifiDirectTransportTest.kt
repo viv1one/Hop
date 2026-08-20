@@ -14,7 +14,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -56,7 +57,7 @@ class WifiDirectTransportTest {
 
         val stored = store.handle(encodedFrame("first"))
 
-        assertTrue(stored)
+        assertNotNull(stored, "a newly received frame must be returned so callers can act on it (e.g. relay custody)")
         assertEquals(1, postDao.inserted.size)
     }
 
@@ -74,8 +75,8 @@ class WifiDirectTransportTest {
         val firstResult = store.handle(frameBytes)
         val secondResult = store.handle(frameBytes)
 
-        assertTrue(firstResult, "first receipt of a new clipHash must be stored")
-        assertFalse(secondResult, "re-receiving the same clipHash (reconnect / second peer) must be skipped, not re-inserted")
+        assertNotNull(firstResult, "first receipt of a new clipHash must be stored")
+        assertNull(secondResult, "re-receiving the same clipHash (reconnect / second peer) must be skipped, not re-inserted")
         assertEquals(
             1,
             postDao.inserted.size,
@@ -84,7 +85,7 @@ class WifiDirectTransportTest {
     }
 
     @Test
-    fun handleReturnsFalseForAnUndecodableFrameWithoutThrowing() {
+    fun handleReturnsNullForAnUndecodableFrameWithoutThrowing() {
         val postDao = FakePostDao()
         val store = ReceivedFrameStore(
             postRepository = PostRepository(postDao, DecayKeyStore()),
@@ -94,9 +95,77 @@ class WifiDirectTransportTest {
 
         val stored = store.handle(byteArrayOf(1, 2, 3))
 
-        assertFalse(stored)
+        assertNull(stored)
         assertTrue(postDao.inserted.isEmpty())
     }
+
+    /**
+     * Finding A's regression test at the JVM/[ReceivedFrameStore] level
+     * (the fuller multi-hop version lives in the instrumented suite): the
+     * decay key's expiry must be anchored to `Frame.originatedAtMs +
+     * Frame.ttlSeconds`, not to whenever [ReceivedFrameStore.handle] happens
+     * to be called. Simulates "receipt happens well after origination" (the
+     * multi-hop relay queuing-delay case) by using an [originatedAtMs] far
+     * in the past relative to the fixed clock both [DecayKeyStore] and
+     * [ReceivedFrameStore]'s internal [com.hop.protocol.RelayPolicy] share.
+     */
+    @Test
+    fun handleAnchorsDecayKeyExpiryToOriginationTimeNotReceiptTime() {
+        val clock = java.time.Clock.fixed(
+            java.time.Instant.ofEpochMilli(1_700_000_000_000L + 3_000_000L), // 3,000s after origination
+            java.time.ZoneOffset.UTC,
+        )
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore(clock)
+        val store = ReceivedFrameStore(
+            postRepository = PostRepository(postDao, decayKeyStore),
+            decayKeyStore = decayKeyStore,
+            postsDir = tempFolder.newFolder("posts"),
+            relayPolicy = com.hop.protocol.RelayPolicy(clock = clock),
+        )
+        // originatedAtMs = 1_700_000_000_000L, ttlSeconds = 3600 (1 hour) --
+        // "receipt" (this clock) happens 3,000s (50min) after origination,
+        // well within the 3600s window but close to its edge. If expiry
+        // were (buggily) anchored to receipt time instead, the key would be
+        // readable for another full hour from now; anchored correctly to
+        // origination, only ~600s (10min) of window remain.
+        val frame = encodedFrame("decay-anchor")
+        val clipHashHex = Frame.decode(frame).clipHash.toHexString()
+
+        val stored = store.handle(frame)
+        assertNotNull(stored)
+
+        // Still within the *origin-anchored* window (600s remain) -- key must be live.
+        assertNotNull(decayKeyStore.retrieve(clipHashHex), "key must still be live within the origin-anchored window")
+    }
+
+    @Test
+    fun handleSkipsStoringAnAlreadyDecayedKeyButStillInsertsThePost() {
+        // originatedAtMs = 1_700_000_000_000L, ttlSeconds = 3600 -- clock is
+        // set 2 hours (7200s) past origination, well past the 1-hour window.
+        val clock = java.time.Clock.fixed(
+            java.time.Instant.ofEpochMilli(1_700_000_000_000L + 7_200_000L),
+            java.time.ZoneOffset.UTC,
+        )
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore(clock)
+        val store = ReceivedFrameStore(
+            postRepository = PostRepository(postDao, decayKeyStore),
+            decayKeyStore = decayKeyStore,
+            postsDir = tempFolder.newFolder("posts"),
+            relayPolicy = com.hop.protocol.RelayPolicy(clock = clock),
+        )
+        val frame = encodedFrame("already-decayed-on-arrival")
+        val clipHashHex = Frame.decode(frame).clipHash.toHexString()
+
+        val stored = store.handle(frame)
+
+        assertNotNull(stored, "the frame is still stored as a PostEntity even though its key already decayed")
+        assertEquals(1, postDao.inserted.size)
+        assertNull(decayKeyStore.retrieve(clipHashHex), "an already-decayed key must never become retrievable")
+    }
+
+    private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
 
     /** Minimal fake [PostDao], matching [PostComposerViewModelTest]/[FeedViewModelTest]'s pattern. */
     private class FakePostDao : PostDao {

@@ -12,10 +12,13 @@ import com.hop.data.PEER_DEVICE_ID
 import com.hop.data.PreKeyRotationManager
 import com.hop.data.RoomSignalProtocolStore
 import com.hop.protocol.PreKeyBundleEnvelope
+import com.hop.protocol.RelayPolicy
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BlockRepository
+import com.hop.repository.DontRelayRepository
 import com.hop.repository.MessageRepository
+import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.SendResult
 import kotlinx.coroutines.flow.first
@@ -106,12 +109,29 @@ class WifiDirectTransportMessagingTest {
             signalIdentityDao = db.signalIdentityDao(),
             signalProtocolStore = store,
             blockRepository = blockRepository,
+            groupDao = db.groupDao(),
+            groupMessageDao = db.groupMessageDao(),
             getOwnPeerId = { peerId },
-            sendToPeer = { _, type, payload -> link.send(type, payload) },
+            sendMessage = { _, payload -> link.send(WirePayloadType.MESSAGE_CIPHERTEXT, payload) },
+        )
+
+        private val dontRelayRepository = DontRelayRepository(
+            db.dontRelayFlagDao(),
+            db.relayQueueDao(),
+            RelayPolicy(),
+        )
+
+        /** Phase 2 Slice 3's persisted relay-custody queue -- see [PendingMessageRepository]'s own doc. */
+        val pendingMessageRepository = PendingMessageRepository(
+            db.pendingMessageDao(),
+            RelayPolicy(),
         )
 
         val dispatcher = EnvelopeDispatcher(
             receivedFrameStore = receivedFrameStore,
+            dontRelayRepository = dontRelayRepository,
+            pendingMessageRepository = pendingMessageRepository,
+            getOwnPeerId = { peerId },
             onPreKeyBundleReceived = messageRepository::cachePeerBundle,
             onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
         )
