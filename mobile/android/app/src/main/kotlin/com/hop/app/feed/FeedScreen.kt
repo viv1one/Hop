@@ -1,26 +1,26 @@
 package com.hop.app.feed
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshContainer
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -44,8 +44,28 @@ import kotlinx.coroutines.flow.first
  * [PostPagerItem]'s `BlockReportAffordance`) -- fired with the exact same
  * `senderDeviceId` hex string already passed to [onBlock]/`onReport`, no
  * separate identity concept for messaging.
+ *
+ * **Pull-to-refresh, not a button:** [rememberPullToRefreshState]'s
+ * [androidx.compose.material3.pulltorefresh.PullToRefreshState.nestedScrollConnection]
+ * is attached to the outer [Box] so it sees every vertical drag before
+ * [VerticalPager] (or, in the empty-feed case, the
+ * [androidx.compose.foundation.verticalScroll] container below) consumes it.
+ * This works with [VerticalPager] specifically because of *where* in the
+ * gesture it activates: [VerticalPager] only ever consumes as much of a drag
+ * as it can actually turn into a page change, so at the very first page --
+ * the only place a downward pull is physically possible from -- a further
+ * downward drag has nothing left for the pager to consume and bubbles up
+ * to this nested-scroll connection as leftover delta, which is exactly what
+ * drives the pull animation. Elsewhere in the pager (mid-list), the pager
+ * consumes the whole drag itself and no pull-to-refresh gesture can start,
+ * which is the same "only at the top" constraint Instagram's own plain
+ * scroll feed has. [EmptyFeed] has no scrollable content of its own, so it's
+ * wrapped in a plain [androidx.compose.foundation.verticalScroll] purely so a
+ * drag gesture has something to originate a nested-scroll chain from --
+ * without it, dragging over static empty-state text would never reach
+ * [nestedScroll] at all.
  */
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun FeedScreen(
     container: AppContainer,
@@ -91,8 +111,27 @@ fun FeedScreen(
     )
     val posts by viewModel.posts.collectAsStateWithLifecycle()
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
+    val pullToRefreshState = rememberPullToRefreshState()
 
-    Box(Modifier.fillMaxSize()) {
+    // Bridges the gesture's own internal "pulled past threshold and
+    // released" trigger (PullToRefreshState.isRefreshing flips to true
+    // entirely inside the library, no explicit call from this code) to the
+    // real work in FeedViewModel.refresh -- and, the other direction,
+    // FeedViewModel.isRefreshing finishing back to ending the gesture's
+    // spinner. Two separate LaunchedEffects (not one) since they key off,
+    // and react to, two independently-changing booleans.
+    if (pullToRefreshState.isRefreshing) {
+        LaunchedEffect(Unit) { viewModel.refresh() }
+    }
+    LaunchedEffect(isRefreshing) {
+        if (!isRefreshing) pullToRefreshState.endRefresh()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(pullToRefreshState.nestedScrollConnection),
+    ) {
         if (posts.isEmpty()) {
             EmptyFeed(onComposeClick = onComposeClick)
         } else {
@@ -119,39 +158,27 @@ fun FeedScreen(
             }
         }
 
-        // Instagram-style manual refresh affordance -- a tap button, not a
-        // pull-down gesture: this feed is a full-screen VerticalPager where
-        // vertical drag already means "swipe to the next/previous post," so
-        // a pull-to-refresh gesture on the same axis would fight that
-        // existing swipe instead of layering cleanly on top of it (unlike
-        // Instagram's own feed, which is a plain vertical scroll list with
-        // no competing gesture). A top-corner icon button sidesteps that
-        // conflict entirely while still giving the same "I asked for fresh
-        // content" affordance. See FeedViewModel.refresh's own doc for what
-        // this button actually re-runs.
-        IconButton(
-            onClick = viewModel::refresh,
-            enabled = !isRefreshing,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 40.dp, end = 12.dp),
-        ) {
-            if (isRefreshing) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(24.dp),
-                    color = Color.White,
-                    strokeWidth = 2.dp,
-                )
-            } else {
-                Icon(Icons.Filled.Refresh, contentDescription = "Refresh feed", tint = Color.White)
-            }
-        }
+        PullToRefreshContainer(
+            state = pullToRefreshState,
+            modifier = Modifier.align(Alignment.TopCenter),
+        )
     }
 }
 
 @Composable
 private fun EmptyFeed(onComposeClick: () -> Unit) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            // No scrollable content of its own -- this exists purely so a
+            // downward drag over the empty state has something to originate
+            // a nested-scroll chain from (see FeedScreen's own doc). The
+            // content's height never exceeds the viewport, so this never
+            // actually scrolls anything; it only participates in the
+            // gesture-consumption chain pull-to-refresh depends on.
+            .verticalScroll(rememberScrollState()),
+        contentAlignment = Alignment.Center,
+    ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.padding(24.dp),
