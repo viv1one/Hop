@@ -8,8 +8,21 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * The Kademlia RPCs this slice speaks over UDP: liveness (PING/PONG, Slice 3)
- * and FIND_NODE (Slice 4).
+ * Answers an inbound FIND_VALUE_REQUEST: either this device knows of
+ * announced holders for the requested key ([Holders]) or it doesn't and
+ * offers closer routing candidates instead ([CloserNodes]) -- mirrors
+ * [FindValueResponseMessage]'s own found/not-found duality (BitTorrent
+ * Mainline DHT's `get_peers` "values xor nodes" shape).
+ */
+sealed class FindValueOutcome {
+    data class Holders(val contacts: List<Contact>) : FindValueOutcome()
+    data class CloserNodes(val contacts: List<Contact>) : FindValueOutcome()
+}
+
+/**
+ * The Kademlia RPCs this slice speaks over UDP: liveness (PING/PONG, Slice 3),
+ * FIND_NODE (Slice 4), and STORE/FIND_VALUE (Slice 5) -- the announce/
+ * get-peers primitive [DhtStore] backs.
  *
  * **UDP, not TCP -- deliberately.** [RoutingTable] holds up to thousands of
  * *known-of* contacts, not *connected-to* peers: TCP would force either
@@ -41,7 +54,8 @@ class DhtUdpTransport(
     private val ownId: NodeId,
     /**
      * Fires for EVERY valid inbound message (PING, PONG, FIND_NODE_REQUEST,
-     * or FIND_NODE_RESPONSE), keyed to the packet's OBSERVED source address
+     * FIND_NODE_RESPONSE, STORE_REQUEST, STORE_RESPONSE, FIND_VALUE_REQUEST,
+     * or FIND_VALUE_RESPONSE), keyed to the packet's OBSERVED source address
      * -- never a self-reported field, per this class's hard rule. This is
      * the actual routing-table self-population mechanism.
      *
@@ -59,16 +73,36 @@ class DhtUdpTransport(
      * [DhtNode]'s `init` block.
      */
     var onFindNodeRequested: (targetId: NodeId, excludeId: NodeId) -> List<Contact> = { _, _ -> emptyList() },
+    /**
+     * Answers an inbound STORE_REQUEST: [announcer] is built from the
+     * requested key plus the packet's *observed* source address, never a
+     * self-reported field -- [StoreRequestMessage] carries no address of its
+     * own, only [StoreRequestMessage.senderId], per this class's hard rule
+     * and that message's own trust-model doc. `var` with a no-op default for
+     * the same reason as [onMessageObserved] -- wired by [DhtNode]'s `init`
+     * block.
+     */
+    var onStoreRequested: (key: NodeId, announcer: Contact) -> Unit = { _, _ -> },
+    /**
+     * Answers an inbound FIND_VALUE_REQUEST: given the requested key and the
+     * id to exclude (the requester itself), returns either known holders or
+     * closer routing candidates. `var` with a no-op default for the same
+     * reason as [onMessageObserved] -- wired by [DhtNode]'s `init` block.
+     */
+    var onFindValueRequested: (key: NodeId, excludeId: NodeId) -> FindValueOutcome =
+        { _, _ -> FindValueOutcome.CloserNodes(emptyList()) },
     private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
 ) {
     /**
-     * Pending outbound requests (PING or FIND_NODE_REQUEST) awaiting a
-     * matching response, keyed by [TransactionId] (content-based equality --
-     * see that class's own doc for why a raw `ByteArray` key would silently
-     * break every correlation lookup). Deferred with the raw response bytes,
-     * not a shared typed message -- [FindNodeResponseMessage] is not a
-     * [DhtMessage], so parsing is left to each caller ([ping]/[findNode])
-     * rather than forced into one shared decode. [ConcurrentHashMap] since
+     * Pending outbound requests (PING, FIND_NODE_REQUEST, STORE_REQUEST, or
+     * FIND_VALUE_REQUEST) awaiting a matching response, keyed by
+     * [TransactionId] (content-based equality -- see that class's own doc
+     * for why a raw `ByteArray` key would silently break every correlation
+     * lookup). Deferred with the raw response bytes, not a shared typed
+     * message -- most response types here are not a [DhtMessage] (the
+     * STORE_RESPONSE ack is the one exception), so parsing is left to each
+     * caller ([ping]/[findNode]/[store]/[findValue]) rather than forced into
+     * one shared decode. [ConcurrentHashMap] since
      * the receive thread and any number of concurrent callers touch this map
      * independently.
      */
@@ -135,11 +169,55 @@ class DhtUdpTransport(
     }
 
     /**
-     * Shared primitive both [ping] and [findNode] build on: registers a
-     * pending deferred for [transactionId], sends [requestBytes] to
-     * [destination], and suspends up to [requestTimeoutMs] for a matching
-     * response's raw bytes (or `null` on timeout). Always cleans up the
-     * pending-request entry, success or not.
+     * Sends a STORE_REQUEST announcing this device as a holder of [key] to
+     * [contact] and suspends until either a matching STORE_RESPONSE ack
+     * arrives (`true`) or [requestTimeoutMs] elapses (`false`). Same
+     * never-throw-on-timeout/malformed-response posture as [ping]/[findNode].
+     */
+    suspend fun store(contact: Contact, key: NodeId): Boolean {
+        val transactionId = TransactionId.random()
+        val message = StoreRequestMessage(transactionId = transactionId, senderId = ownId, key = key)
+        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return false
+        return try {
+            DhtMessage.decode(responseBytes).type == DhtMessageType.STORE_RESPONSE
+        } catch (e: DhtMessageDecodeException) {
+            false
+        }
+    }
+
+    /**
+     * Sends a FIND_VALUE_REQUEST for [key] to [contact] and suspends until
+     * either a matching FIND_VALUE_RESPONSE arrives (decoded into a
+     * [FindValueOutcome]) or [requestTimeoutMs] elapses. Returns `null` on
+     * timeout, a malformed response, or a response that doesn't decode as a
+     * FIND_VALUE_RESPONSE -- never trusts payload shape from the transaction
+     * id match alone, and never throws for any of these cases. Same posture
+     * as [findNode].
+     */
+    suspend fun findValue(contact: Contact, key: NodeId): FindValueOutcome? {
+        val transactionId = TransactionId.random()
+        val message = FindValueRequestMessage(transactionId = transactionId, senderId = ownId, key = key)
+        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
+        return try {
+            val response = FindValueResponseMessage.decode(responseBytes)
+            if (response.found) {
+                FindValueOutcome.Holders(response.contacts)
+            } else {
+                FindValueOutcome.CloserNodes(response.contacts)
+            }
+        } catch (e: DhtMessageDecodeException) {
+            null
+        }
+    }
+
+    /**
+     * Shared primitive [ping], [findNode], [store], and [findValue] all build
+     * on: registers a pending deferred for [transactionId], sends
+     * [requestBytes] to [destination], and suspends up to [requestTimeoutMs]
+     * for a matching response's raw bytes (or `null` on timeout). Always
+     * cleans up the pending-request entry, success or not.
      */
     private suspend fun sendAndAwait(
         destination: InetSocketAddress,
@@ -233,6 +311,54 @@ class DhtUdpTransport(
             }
             DhtMessageType.FIND_NODE_RESPONSE -> {
                 val message = FindNodeResponseMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.STORE_REQUEST -> {
+                val message = StoreRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                // The announcer's address is ALWAYS the packet's observed source,
+                // never a self-reported field -- StoreRequestMessage carries no
+                // address of its own, only senderId (this message's own
+                // trust-model doc: a peer can only ever announce itself).
+                val announcer = Contact(
+                    id = message.senderId,
+                    address = observedAddress.encode(),
+                    lastSeenAtMs = System.currentTimeMillis(),
+                )
+                onStoreRequested(message.key, announcer)
+                val ack = DhtMessage(type = DhtMessageType.STORE_RESPONSE, transactionId = message.transactionId, senderId = ownId)
+                val bytes = ack.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+            }
+            DhtMessageType.STORE_RESPONSE -> {
+                val message = DhtMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.FIND_VALUE_REQUEST -> {
+                val message = FindValueRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                val outcome = onFindValueRequested(message.key, message.senderId)
+                val response = when (outcome) {
+                    is FindValueOutcome.Holders -> FindValueResponseMessage(
+                        transactionId = message.transactionId,
+                        senderId = ownId,
+                        found = true,
+                        contacts = outcome.contacts,
+                    )
+                    is FindValueOutcome.CloserNodes -> FindValueResponseMessage(
+                        transactionId = message.transactionId,
+                        senderId = ownId,
+                        found = false,
+                        contacts = outcome.contacts,
+                    )
+                }
+                val bytes = response.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+            }
+            DhtMessageType.FIND_VALUE_RESPONSE -> {
+                val message = FindValueResponseMessage.decode(payload)
                 observe(message.senderId, observedAddress)
                 pendingRequests[message.transactionId]?.complete(payload)
             }

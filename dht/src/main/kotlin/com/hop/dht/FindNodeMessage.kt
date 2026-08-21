@@ -89,25 +89,13 @@ data class FindNodeResponseMessage(
     val contacts: List<Contact>,
 ) {
     fun encode(): ByteArray {
-        require(contacts.size <= MAX_CONTACTS) {
-            "FindNodeResponseMessage cannot carry more than $MAX_CONTACTS contacts, had ${contacts.size}"
-        }
-
-        val bodySize = contacts.sumOf { NodeId.SIZE_BYTES + 1 + it.address.size }
+        val bodySize = ContactListCodec.encodedSize(contacts)
         val buffer = ByteBuffer.allocate(HEADER_SIZE + bodySize).order(ByteOrder.BIG_ENDIAN)
         buffer.put(DhtMessage.CURRENT_VERSION.toByte())
         buffer.put(DhtMessageType.FIND_NODE_RESPONSE.wireValue.toByte())
         buffer.put(transactionId.bytes)
         buffer.put(senderId.bytes)
-        buffer.put(contacts.size.toByte())
-        for (contact in contacts) {
-            require(contact.address.size <= 0xFF) {
-                "Contact address must fit in a uint8 length prefix, was ${contact.address.size} bytes for ${contact.id}"
-            }
-            buffer.put(contact.id.bytes)
-            buffer.put(contact.address.size.toByte())
-            buffer.put(contact.address)
-        }
+        ContactListCodec.encode(buffer, contacts, MAX_CONTACTS, "FindNodeResponseMessage")
         return buffer.array()
     }
 
@@ -162,27 +150,74 @@ data class FindNodeResponseMessage(
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val contactCount = buffer.get().toInt() and 0xFF
-
-            val receivedAtMs = System.currentTimeMillis()
-            val contacts = ArrayList<Contact>(contactCount)
-            for (index in 0 until contactCount) {
-                if (buffer.remaining() < NodeId.SIZE_BYTES + 1) {
-                    throw DhtMessageDecodeException(
-                        "Truncated FindNodeResponseMessage: not enough bytes remaining for contact ${index + 1}'s id+addressLength"
-                    )
-                }
-                val contactId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
-                val addressLength = buffer.get().toInt() and 0xFF
-                if (buffer.remaining() < addressLength) {
-                    throw DhtMessageDecodeException(
-                        "Truncated FindNodeResponseMessage: declared addressLength=$addressLength for contact ${index + 1} but only ${buffer.remaining()} bytes remain"
-                    )
-                }
-                val address = ByteArray(addressLength).also { buffer.get(it) }
-                contacts.add(Contact(id = contactId, address = address, lastSeenAtMs = receivedAtMs))
-            }
+            val contacts = ContactListCodec.decode(buffer, contactCount, "FindNodeResponseMessage")
 
             return FindNodeResponseMessage(transactionId = transactionId, senderId = senderId, contacts = contacts)
         }
+    }
+}
+
+/**
+ * Shared per-contact-list wire encode/decode, factored out of
+ * [FindNodeResponseMessage] (Slice 4) so [FindValueResponseMessage] (Slice 5)
+ * doesn't grow a second copy of the same truncation-guard logic to drift out
+ * of sync -- additive-only refactor, [FindNodeResponseMessage]'s own public
+ * contract (its wire bytes, its `encode`/`decode` signatures and exceptions)
+ * is unchanged by this extraction.
+ *
+ * Handles only the `[1B contactCount][repeated: 32B NodeId + 1B addressLength
+ * + addressLength bytes]` portion -- every other header field (version, type,
+ * transactionId, senderId, and, for [FindValueResponseMessage], the `found`
+ * flag) is still each message type's own responsibility, written/read
+ * immediately before this codec is invoked.
+ */
+internal object ContactListCodec {
+    /** Sum of each contact's `32B NodeId + 1B addressLength + addressLength bytes` -- does NOT include the leading count byte, which every caller's own `HEADER_SIZE` already reserves. */
+    fun encodedSize(contacts: List<Contact>): Int = contacts.sumOf { NodeId.SIZE_BYTES + 1 + it.address.size }
+
+    /** Writes the 1-byte contact count followed by each contact's `32B NodeId + 1B addressLength + addressLength bytes` entry. */
+    fun encode(buffer: ByteBuffer, contacts: List<Contact>, maxContacts: Int, messageTypeName: String) {
+        require(contacts.size <= maxContacts) {
+            "$messageTypeName cannot carry more than $maxContacts contacts, had ${contacts.size}"
+        }
+        buffer.put(contacts.size.toByte())
+        for (contact in contacts) {
+            require(contact.address.size <= 0xFF) {
+                "Contact address must fit in a uint8 length prefix, was ${contact.address.size} bytes for ${contact.id}"
+            }
+            buffer.put(contact.id.bytes)
+            buffer.put(contact.address.size.toByte())
+            buffer.put(contact.address)
+        }
+    }
+
+    /**
+     * Reads exactly [contactCount] contact entries from [buffer] (the count
+     * byte itself is read by the caller, not here, matching each message
+     * type's own established decode order). Rejects a truncated per-contact
+     * id/addressLength or a declared `addressLength` exceeding the bytes
+     * actually remaining. Every decoded [Contact.lastSeenAtMs] is stamped at
+     * decode time (this wire format carries no self-reported timestamp).
+     */
+    fun decode(buffer: ByteBuffer, contactCount: Int, messageTypeName: String): List<Contact> {
+        val receivedAtMs = System.currentTimeMillis()
+        val contacts = ArrayList<Contact>(contactCount)
+        for (index in 0 until contactCount) {
+            if (buffer.remaining() < NodeId.SIZE_BYTES + 1) {
+                throw DhtMessageDecodeException(
+                    "Truncated $messageTypeName: not enough bytes remaining for contact ${index + 1}'s id+addressLength"
+                )
+            }
+            val contactId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
+            val addressLength = buffer.get().toInt() and 0xFF
+            if (buffer.remaining() < addressLength) {
+                throw DhtMessageDecodeException(
+                    "Truncated $messageTypeName: declared addressLength=$addressLength for contact ${index + 1} but only ${buffer.remaining()} bytes remain"
+                )
+            }
+            val address = ByteArray(addressLength).also { buffer.get(it) }
+            contacts.add(Contact(id = contactId, address = address, lastSeenAtMs = receivedAtMs))
+        }
+        return contacts
     }
 }

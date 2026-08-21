@@ -42,6 +42,10 @@ class DhtNodeTest {
             lastSeenAtMs = 0L,
         )
 
+    /** Every DhtNode in these tests binds to loopback -- this is its ownAddress, Slice 5's new required constructor param. */
+    private fun ownAddressFor(socket: DatagramSocket): PeerAddress =
+        PeerAddress.from(InetAddress.getLoopbackAddress(), socket.localPort)
+
     /**
      * [DhtNode.observe] launches the ping-then-evict outcome as a fire-and-
      * forget child coroutine on [scope] -- this joins every child of [scope]'s
@@ -70,7 +74,7 @@ class DhtNodeTest {
         try {
             val routingTable = RoutingTable(ownId = ownId, k = 1)
             val scope = CoroutineScope(Job() + Dispatchers.Default)
-            val node = DhtNode(routingTable, ownTransport, scope)
+            val node = DhtNode(routingTable, ownTransport, scope, ownAddressFor(ownSocket))
 
             val evictionCandidate = contactAt(evictionCandidateId, evictionCandidateSocket)
             val replacementCandidate = contactAt(replacementCandidateId, ownSocket) // address irrelevant, never pinged
@@ -124,7 +128,7 @@ class DhtNodeTest {
         try {
             val routingTable = RoutingTable(ownId = ownId, k = 1)
             val scope = CoroutineScope(Job() + Dispatchers.Default)
-            val node = DhtNode(routingTable, ownTransport, scope)
+            val node = DhtNode(routingTable, ownTransport, scope, ownAddressFor(ownSocket))
 
             val evictionCandidate = contactAt(evictionCandidateId, evictionCandidateSocket)
             val replacementCandidate = contactAt(replacementCandidateId, ownSocket) // address irrelevant, never pinged
@@ -219,9 +223,10 @@ class DhtNodeTest {
         val routingTable = RoutingTable(ownId = ownId, k = k)
         listOf(c1, dummyContact(requesterId), c3, c4, farAway).forEach { routingTable.insertOrUpdate(it) }
 
-        val transport = DhtUdpTransport(loopbackSocket(), ownId, onMessageObserved = {})
+        val ownSocket = loopbackSocket()
+        val transport = DhtUdpTransport(ownSocket, ownId, onMessageObserved = {})
         val scope = CoroutineScope(Job() + Dispatchers.Default)
-        DhtNode(routingTable, transport, scope) // init block wires transport.onFindNodeRequested
+        DhtNode(routingTable, transport, scope, ownAddressFor(ownSocket)) // init block wires transport.onFindNodeRequested
 
         val response = transport.onFindNodeRequested(target, requesterId)
 
@@ -257,16 +262,16 @@ class DhtNodeTest {
 
         val aTable = RoutingTable(aId)
         val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
-        val aNode = DhtNode(aTable, aTransport, scope)
+        val aNode = DhtNode(aTable, aTransport, scope, ownAddressFor(aSocket))
 
         val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
-        val bNode = DhtNode(RoutingTable(bId), bTransport, scope)
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket))
 
         val cTransport = DhtUdpTransport(cSocket, cId, onMessageObserved = {})
-        val cNode = DhtNode(RoutingTable(cId), cTransport, scope)
+        val cNode = DhtNode(RoutingTable(cId), cTransport, scope, ownAddressFor(cSocket))
 
         val dTransport = DhtUdpTransport(dSocket, dId, onMessageObserved = {})
-        DhtNode(RoutingTable(dId), dTransport, scope) // init block wires dTransport's callbacks; D itself knows nobody
+        DhtNode(RoutingTable(dId), dTransport, scope, ownAddressFor(dSocket)) // init block wires dTransport's callbacks; D itself knows nobody
 
         val transports = listOf(aTransport, bTransport, cTransport, dTransport)
         transports.forEach { it.start() }
@@ -319,16 +324,16 @@ class DhtNodeTest {
 
         val aTable = RoutingTable(aId)
         val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
-        val aNode = DhtNode(aTable, aTransport, scope)
+        val aNode = DhtNode(aTable, aTransport, scope, ownAddressFor(aSocket))
 
         val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
-        val bNode = DhtNode(RoutingTable(bId), bTransport, scope)
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket))
 
         val cTransport = DhtUdpTransport(cSocket, cId, onMessageObserved = {})
-        val cNode = DhtNode(RoutingTable(cId), cTransport, scope)
+        val cNode = DhtNode(RoutingTable(cId), cTransport, scope, ownAddressFor(cSocket))
 
         val dTransport = DhtUdpTransport(dSocket, dId, onMessageObserved = {})
-        DhtNode(RoutingTable(dId), dTransport, scope)
+        DhtNode(RoutingTable(dId), dTransport, scope, ownAddressFor(dSocket))
 
         val transports = listOf(aTransport, bTransport, cTransport, dTransport)
         transports.forEach { it.start() }
@@ -360,7 +365,12 @@ class DhtNodeTest {
         val aId = chainNodeId(21)
         val aSocket = loopbackSocket()
         val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 300)
-        val aNode = DhtNode(RoutingTable(aId), aTransport, scope = CoroutineScope(Job() + Dispatchers.Default))
+        val aNode = DhtNode(
+            RoutingTable(aId),
+            aTransport,
+            scope = CoroutineScope(Job() + Dispatchers.Default),
+            ownAddress = ownAddressFor(aSocket),
+        )
         aTransport.start()
         try {
             // Bind and immediately close a socket to obtain a real port guaranteed
@@ -373,6 +383,140 @@ class DhtNodeTest {
             assertEquals(emptyList(), result, "an unanswered bootstrap ping must yield emptyList(), not hang or throw")
         } finally {
             aTransport.stop()
+        }
+    }
+
+    // ---- Slice 5 additions ----
+
+    /**
+     * Two real nodes, A knowing only B: [DhtNode.store] must do BOTH of its
+     * documented things -- unconditional local self-registration (A can
+     * answer its own [DhtNode.findValue] for the key immediately, no network
+     * round trip) AND a real STORE_REQUEST to the externally-known-closest
+     * peer (B, the only candidate [DhtNode.findNode] can find from A's
+     * single-entry routing table) that B must actually record.
+     */
+    @Test
+    fun `store registers self locally and announces to the closest known peer over the network`() = runBlocking {
+        val aId = chainNodeId(31)
+        val bId = chainNodeId(32)
+        val key = chainNodeId(99)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket))
+
+        val transports = listOf(aTransport, bTransport)
+        transports.forEach { it.start() }
+        try {
+            aNode.observe(socketContact(bId, bSocket))
+
+            aNode.store(key)
+
+            val localResult = aNode.findValue(key)
+            assertTrue(localResult is FindValueResult.Found, "A must be able to answer its own findValue for a key it just stored, with no network round trip")
+            assertEquals(listOf(aId), localResult.holders.map { it.id })
+
+            val remoteResult = bNode.findValue(key)
+            assertTrue(remoteResult is FindValueResult.Found, "B must have recorded A as a holder via a real STORE_REQUEST")
+            assertEquals(listOf(aId), remoteResult.holders.map { it.id })
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    /**
+     * The early-termination race itself, over real sockets in a chain
+     * topology (A knows only B, B knows only C): C is the true holder (via
+     * its own local [DhtNode.store] self-registration only -- C's routing
+     * table knows nobody, so no STORE ever reaches the network). A's local
+     * store is empty, so [DhtNode.findValue] must fall through to
+     * [IterativeLookup], get a not-found/closer-nodes answer from B pointing
+     * at C, then query C and terminate EARLY on C's "found" answer -- proven
+     * by the fact this returns C as a holder at all, since a full lookup
+     * with no early-termination would still (eventually) reach the same
+     * answer, but the point of this slice's race-from-outside design is that
+     * it doesn't need to exhaust the lookup to get there.
+     */
+    @Test
+    fun `findValue discovers a holder through the network and early-terminates on the found answer`() = runBlocking {
+        val aId = chainNodeId(41)
+        val bId = chainNodeId(42)
+        val cId = chainNodeId(43)
+        val key = chainNodeId(100)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val cSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket))
+
+        val cTransport = DhtUdpTransport(cSocket, cId, onMessageObserved = {})
+        val cNode = DhtNode(RoutingTable(cId), cTransport, scope, ownAddressFor(cSocket))
+
+        val transports = listOf(aTransport, bTransport, cTransport)
+        transports.forEach { it.start() }
+        try {
+            aNode.observe(socketContact(bId, bSocket))
+            bNode.observe(socketContact(cId, cSocket))
+
+            // C's routing table knows nobody, so this only self-registers
+            // locally -- it never reaches the network.
+            cNode.store(key)
+
+            val result = aNode.findValue(key)
+
+            assertTrue(result is FindValueResult.Found, "A must discover C as the holder through the B -> C chain")
+            assertEquals(listOf(cId), result.holders.map { it.id })
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    /**
+     * Nobody in the network holds [key]: [DhtNode.findValue] must return
+     * [FindValueResult.NotFound] carrying the closest-known contacts (same
+     * "closest known" answer [DhtNode.findNode] would have returned), not
+     * hang, throw, or fabricate a holder.
+     */
+    @Test
+    fun `findValue returns NotFound with the closest known contacts when nobody holds the key`() = runBlocking {
+        val aId = chainNodeId(51)
+        val bId = chainNodeId(52)
+        val key = chainNodeId(101)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket)) // nobody ever stores `key`
+
+        val transports = listOf(aTransport, bTransport)
+        transports.forEach { it.start() }
+        try {
+            aNode.observe(socketContact(bId, bSocket))
+
+            val result = aNode.findValue(key)
+
+            assertTrue(result is FindValueResult.NotFound, "no holder anywhere must yield NotFound, not hang, throw, or fabricate a holder")
+            assertEquals(listOf(bId), result.closestKnown.map { it.id })
+        } finally {
+            transports.forEach { it.stop() }
         }
     }
 }

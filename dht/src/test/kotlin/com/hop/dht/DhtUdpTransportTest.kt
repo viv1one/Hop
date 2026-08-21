@@ -241,4 +241,104 @@ class DhtUdpTransportTest {
             aTransport.stop()
         }
     }
+
+    // ---- Slice 5 additions ----
+
+    @Test
+    fun `store round trip acks and fires onStoreRequested with the announced key and observed-address announcer`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val key = nodeId(42)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        var receivedKey: NodeId? = null
+        var receivedAnnouncer: Contact? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onStoreRequested = { keyArg, announcerArg ->
+            receivedKey = keyArg
+            receivedAnnouncer = announcerArg
+        }
+        aTransport.start()
+        bTransport.start()
+        try {
+            val result = aTransport.store(contactFor(bSocket, bId), key)
+            assertTrue(result, "a STORE_REQUEST to a live, responding peer must ack true")
+            assertEquals(key, receivedKey)
+            assertEquals(aId, receivedAnnouncer?.id, "the announcer's id must be StoreRequestMessage.senderId")
+            assertEquals(
+                PeerAddress.from(InetAddress.getLoopbackAddress(), aSocket.localPort).encode().toList(),
+                receivedAnnouncer?.address?.toList(),
+                "the announcer's address must be the packet's OBSERVED source, never a self-reported field -- StoreRequestMessage carries none",
+            )
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `findValue round trip returns holders when the responder has them`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val key = nodeId(42)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        val holder = Contact(
+            id = nodeId(7),
+            address = PeerAddress.from(InetAddress.getLoopbackAddress(), 12345).encode(),
+            lastSeenAtMs = 0L,
+        )
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onFindValueRequested = { _, _ -> FindValueOutcome.Holders(listOf(holder)) }
+        aTransport.start()
+        bTransport.start()
+        try {
+            val result = aTransport.findValue(contactFor(bSocket, bId), key)
+            assertTrue(result is FindValueOutcome.Holders, "a found=true response must decode as FindValueOutcome.Holders")
+            assertEquals(listOf(holder.id), result.contacts.map { it.id })
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `findValue round trip returns closer nodes and passes the requester's id to exclude when nobody holds the key`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val key = nodeId(42)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        val closer = Contact(
+            id = nodeId(8),
+            address = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321).encode(),
+            lastSeenAtMs = 0L,
+        )
+        var receivedExcludeId: NodeId? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onFindValueRequested = { _, excludeIdArg ->
+            receivedExcludeId = excludeIdArg
+            FindValueOutcome.CloserNodes(listOf(closer))
+        }
+        aTransport.start()
+        bTransport.start()
+        try {
+            val result = aTransport.findValue(contactFor(bSocket, bId), key)
+            assertTrue(result is FindValueOutcome.CloserNodes, "a found=false response must decode as FindValueOutcome.CloserNodes")
+            assertEquals(listOf(closer.id), result.contacts.map { it.id })
+            assertEquals(aId, receivedExcludeId, "b's onFindValueRequested must receive a's id as the id to exclude")
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
 }
