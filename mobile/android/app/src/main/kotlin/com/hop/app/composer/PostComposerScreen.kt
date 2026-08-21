@@ -82,6 +82,28 @@ fun PostComposerScreen(
                     decayKeyStore = container.decayKeyStore,
                     postsDir = File(context.filesDir, "posts"),
                     broadcastPost = { encoded -> container.transportManager.broadcastPost(encoded) },
+                    // Phase 4 Slice 7: composes LocationProvider + DhtNodeManager
+                    // into the single narrow suspend capability
+                    // PostComposerViewModel.post() calls for every reach tier
+                    // above Locality. Never called for Locality -- see that
+                    // view model's own doc for why that guard lives there, not
+                    // here. Either half being unavailable (no location fix,
+                    // DHT node not ready within its bounded wait) just skips
+                    // this attempt -- logged, never surfaced to the user (mesh
+                    // mechanics stay invisible, PRD §5).
+                    publishToDht = { tier ->
+                        val location = container.locationProvider.currentLocation()
+                        if (location == null) {
+                            android.util.Log.d("PostComposerScreen", "Skipping DHT publish for $tier -- no location available")
+                        } else {
+                            val subscription = container.dhtNodeManager.awaitTopicSubscription()
+                            if (subscription == null) {
+                                android.util.Log.d("PostComposerScreen", "Skipping DHT publish for $tier -- DHT node not ready")
+                            } else {
+                                subscription.publish(location.latitude, location.longitude, tier)
+                            }
+                        }
+                    },
                 )
             }
         },

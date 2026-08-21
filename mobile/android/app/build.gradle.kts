@@ -26,11 +26,45 @@ android {
         // Was unset before this module had instrumented tests (com.hop.data's Room
         // DAO tests) -- JVM-unit-test-only until now.
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Phase 4 Slice 7: dev/test-only DHT bootstrap address, read by
+        // com.hop.app.dht.DhtNodeManager. Blank host / port 0 (this default)
+        // means "don't attempt bootstrapJoin at all" -- rendezvous/ (ADR 0002)
+        // is still an empty module, so there is no real bootstrap node to
+        // point this at in production yet. See DhtNodeManager.maybeBootstrap's
+        // own doc for the full reasoning. Override locally for manual
+        // multi-device testing via a Gradle property, e.g.:
+        //   ./gradlew :app:assembleDebug -PdhtBootstrapHost=192.168.1.23 -PdhtBootstrapPort=41234
+        buildConfigField(
+            "String",
+            "DHT_BOOTSTRAP_HOST",
+            "\"${(project.findProperty("dhtBootstrapHost") as String?).orEmpty()}\"",
+        )
+        buildConfigField(
+            "int",
+            "DHT_BOOTSTRAP_PORT",
+            (project.findProperty("dhtBootstrapPort") as String?)?.toIntOrNull()?.toString() ?: "0",
+        )
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+    }
+
+    testOptions {
+        unitTests {
+            // Without this, any android.util.Log.* call reached by a plain
+            // JVM unit test throws "RuntimeException: Method ... not mocked"
+            // (AGP's stub android.jar throws by default instead of no-op'ing)
+            // -- confirmed by PostComposerViewModelTest's
+            // postSucceedsLocallyEvenWhenPublishToDhtThrows, which exercises
+            // PostComposerViewModel.post()'s catch block that logs via
+            // android.util.Log.e. That catch block is pre-existing (not new
+            // to Phase 4 Slice 7), so this was a latent gap in every test run
+            // until now -- no test had previously driven that code path.
+            isReturnDefaultValues = true
         }
     }
 
@@ -70,6 +104,9 @@ android {
 
     buildFeatures {
         compose = true
+        // Required for the DHT_BOOTSTRAP_HOST/DHT_BOOTSTRAP_PORT buildConfigField
+        // entries above (com.hop.app.dht.DhtNodeManager's dev/test bootstrap seam).
+        buildConfig = true
     }
 
     composeOptions {
@@ -118,6 +155,20 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.1")
     implementation(project(":protocol"))
     implementation(project(":crypto"))
+    // Phase 4 Slice 7: :dht directly (com.hop.dht.Contact/NodeId/DhtNode/etc.,
+    // referenced by com.hop.app.dht.DhtNodeManager and com.hop.app.feed.FeedViewModel)
+    // and :topics (com.hop.topics.TopicSubscription, the geohash-prefix-topic
+    // bridge between :protocol and :dht -- see topics/'s own build.gradle.kts
+    // for why :dht isn't exposed transitively through it: that module declares
+    // its own :dht dependency as `implementation`, not `api`, matching every
+    // other project-to-project dependency in this build).
+    implementation(project(":dht"))
+    implementation(project(":topics"))
+    // Location read for Town/City/Country-tier DHT topic-subscription
+    // (com.hop.app.location.FusedLocationProvider) -- gated on the same
+    // ACCESS_FINE_LOCATION/ACCESS_COARSE_LOCATION grant already requested for
+    // WiFi Direct peer discovery, never a second permission ask.
+    implementation("com.google.android.gms:play-services-location:21.3.0")
     // org.signal:libsignal-android:0.86.5 -- deliberately NOT
     // org.signal:libsignal-client (the artifact crypto/build.gradle.kts
     // pins), even though :app needs the exact same Java API surface that

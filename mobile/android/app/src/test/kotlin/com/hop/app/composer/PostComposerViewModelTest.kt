@@ -163,6 +163,75 @@ class PostComposerViewModelTest {
         assertEquals(ReachTier.COUNTRY.name, postDao.inserted.single().reachTier)
     }
 
+    @Test
+    fun postNeverCallsPublishToDhtForLocalityTier() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        var publishedTier: ReachTier? = null
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.LOCALITY),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, DecayKeyStore()),
+            decayKeyStore = DecayKeyStore(),
+            postsDir = tempFolder.newFolder("posts-locality"),
+            broadcastPost = {},
+            publishToDht = { tier -> publishedTier = tier },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.post(bytes = "x".toByteArray(), contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete)
+        assertEquals(null, publishedTier, "publishToDht must never be called for LOCALITY -- ADR 0003, Locality never touches the DHT")
+    }
+
+    @Test
+    fun postCallsPublishToDhtWithSelectedTierForNonLocalityTiers() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        var publishedTier: ReachTier? = null
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.CITY),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, DecayKeyStore()),
+            decayKeyStore = DecayKeyStore(),
+            postsDir = tempFolder.newFolder("posts-city"),
+            broadcastPost = {},
+            publishToDht = { tier -> publishedTier = tier },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.post(bytes = "x".toByteArray(), contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete)
+        assertEquals(ReachTier.CITY, publishedTier)
+    }
+
+    @Test
+    fun postSucceedsLocallyEvenWhenPublishToDhtThrows() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.TOWN),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, DecayKeyStore()),
+            decayKeyStore = DecayKeyStore(),
+            postsDir = tempFolder.newFolder("posts-town"),
+            broadcastPost = {},
+            publishToDht = { throw RuntimeException("DHT unreachable") },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.post(bytes = "x".toByteArray(), contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete, "a DHT publish failure must never undo/fail a post that already saved locally")
+        assertEquals(null, viewModel.uiState.value.errorMessage)
+        assertEquals(1, postDao.inserted.size)
+    }
+
     /** Minimal fake [PostDao] -- only [upsert] is exercised by [PostRepository.insert]. */
     private class FakePostDao : PostDao {
         private val state = MutableStateFlow<List<PostEntity>>(emptyList())

@@ -2,6 +2,9 @@ package com.hop.app
 
 import android.content.Context
 import androidx.room.Room
+import com.hop.app.dht.DhtNodeManager
+import com.hop.app.location.FusedLocationProvider
+import com.hop.app.location.LocationProvider
 import com.hop.crypto.AttestationProvider
 import com.hop.crypto.DecayKeyStore
 import com.hop.crypto.StubAttestationProvider
@@ -58,6 +61,36 @@ import com.hop.transport.TransportManager
 class AppContainer(applicationContext: Context) {
     val settingsRepository: SettingsRepository = SettingsRepository(applicationContext)
     val attestationProvider: AttestationProvider = StubAttestationProvider()
+
+    /** Real on-device location read, used only to compute this device's current geohash-prefix cell -- see [LocationProvider]'s own doc for the "never put raw coordinates on the wire" invariant. */
+    val locationProvider: LocationProvider = FusedLocationProvider(applicationContext)
+
+    /**
+     * Phase 4 Slice 7: this device's DHT participation lifecycle owner (see
+     * [DhtNodeManager]'s own doc for the full lifecycle/bootstrap/address
+     * posture). Registers itself against `ProcessLifecycleOwner` at
+     * construction time -- same posture as [transportManager] below, and
+     * constructing this container is what wires the DHT into the app's
+     * lifecycle, exactly as with transport.
+     *
+     * [DhtNodeManager.getOwnNodeIdSeed] reuses
+     * [SettingsRepository.getOrCreateStableSenderDeviceId] -- the same
+     * per-install identity already used for messaging/blocking/Feed sender
+     * ids (see `com.hop.data.PeerIdentity`'s doc) -- rather than minting a
+     * new identity concept just for the DHT.
+     *
+     * `BuildConfig.DHT_BOOTSTRAP_HOST`/`DHT_BOOTSTRAP_PORT` are blank/`0` in
+     * every real build (see `app/build.gradle.kts`'s own comment) --
+     * `rendezvous/` (ADR 0002) is still an empty module, so there is no real
+     * bootstrap node to join through yet; see
+     * [DhtNodeManager]'s `maybeBootstrap` doc for the full explanation of
+     * what that means for this device's DHT reachability today.
+     */
+    val dhtNodeManager: DhtNodeManager = DhtNodeManager(
+        getOwnNodeIdSeed = { settingsRepository.getOrCreateStableSenderDeviceId() },
+        bootstrapHost = BuildConfig.DHT_BOOTSTRAP_HOST,
+        bootstrapPort = BuildConfig.DHT_BOOTSTRAP_PORT,
+    )
 
     val hopDatabase: HopDatabase = Room.databaseBuilder(
         applicationContext,

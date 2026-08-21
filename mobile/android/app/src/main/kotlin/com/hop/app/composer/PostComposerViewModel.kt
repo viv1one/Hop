@@ -68,6 +68,20 @@ import java.time.Duration
  * reason: `TransportManager` is a concrete `Context`/`WifiP2pManager`-backed
  * class with no fake-friendly seam, so a plain no-op lambda is all a JVM unit
  * test needs to stand in for it.
+ *
+ * [publishToDht] is Phase 4 Slice 7's DHT topic-subscription publish (see
+ * [com.hop.topics.TopicSubscription.publish]) for reach tiers above
+ * Locality -- another narrow suspend-function capability, same pattern as
+ * [broadcastPost], so this view model never needs to fake
+ * `com.hop.app.location.LocationProvider`/`com.hop.app.dht.DhtNodeManager`
+ * directly. [post] below calls it for every tier EXCEPT
+ * [ReachTier.LOCALITY] -- that tier never touches the DHT (ADR 0003) and
+ * resolves entirely over BLE/WiFi Direct instead; this view model enforces
+ * that "never for Locality" invariant itself (not left to whatever composes
+ * this lambda at [PostComposerScreen]), and a failure here is caught and
+ * logged, never allowed to undo or fail the post itself -- by the time
+ * [publishToDht] runs, the post already exists locally and has already been
+ * handed to [broadcastPost].
  */
 class PostComposerViewModel(
     private val defaultReachTier: Flow<ReachTier?>,
@@ -76,6 +90,7 @@ class PostComposerViewModel(
     private val decayKeyStore: DecayKeyStore,
     private val postsDir: File,
     private val broadcastPost: (ByteArray) -> Unit,
+    private val publishToDht: suspend (ReachTier) -> Unit = {},
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
 
@@ -125,6 +140,10 @@ class PostComposerViewModel(
 
         viewModelScope.launch {
             try {
+                // Read once, up front -- reused after the withContext block
+                // below decides whether/what to publish to the DHT.
+                val reachTier = _uiState.value.selectedReachTier
+
                 // viewModelScope.launch runs on Dispatchers.Main.immediate by
                 // default. decayKeyStore.store() (-> RoomDecayKeyStorage ->
                 // DecayKeyDao.insertOrReplace, deliberately non-suspend/blocking
@@ -138,7 +157,6 @@ class PostComposerViewModel(
                 // exception, silently swallowed by the catch block below before
                 // this fix also added logging (see catch).
                 withContext(ioDispatcher) {
-                    val reachTier = _uiState.value.selectedReachTier
                     val clipHash = MessageDigest.getInstance("SHA-256").digest(bytes)
                     val senderDeviceId = getOrCreateSenderDeviceId()
                     val ttlSeconds = ttlSecondsFor(reachTier)
@@ -189,6 +207,21 @@ class PostComposerViewModel(
                     )
 
                     broadcastPost(encoded)
+                }
+
+                // ADR 0003 / hop-dev skill invariant: Locality never touches
+                // the DHT, resolving entirely over BLE/WiFi Direct instead --
+                // publishToDht is never even called for it. Best-effort for
+                // every other tier: a DHT publish failure (no location, DHT
+                // node not ready, network hiccup) is logged and swallowed
+                // here, never allowed to undo the post that already succeeded
+                // locally and was already handed to broadcastPost above.
+                if (reachTier != ReachTier.LOCALITY) {
+                    try {
+                        publishToDht(reachTier)
+                    } catch (e: Exception) {
+                        android.util.Log.e("PostComposerViewModel", "DHT publish failed (post already saved locally)", e)
+                    }
                 }
 
                 _uiState.update { it.copy(isPosting = false, postComplete = true) }

@@ -11,6 +11,8 @@ import com.hop.data.RelayQueueDao
 import com.hop.data.RelayQueueEntity
 import com.hop.data.ReportedPostDao
 import com.hop.data.ReportedPostEntity
+import com.hop.dht.Contact
+import com.hop.dht.NodeId
 import com.hop.protocol.RelayPolicy
 import com.hop.repository.BlockRepository
 import com.hop.repository.DontRelayRepository
@@ -153,6 +155,43 @@ class FeedViewModelTest {
         assertEquals("own-attested-key", broadcastRow?.attestedDeviceKey)
         assertEquals(post.originatedAtMs, broadcastRow?.originatedAtMs)
         assertEquals(post.ttlSeconds, broadcastRow?.ttlSeconds)
+    }
+
+    @Test
+    fun `discoveredRemoteHolders reflects what browseNearbyDht returns`() = runTest(testDispatcher) {
+        val fakeContact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { it.toByte() }),
+            address = ByteArray(7),
+            lastSeenAtMs = 0L,
+        )
+
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            browseNearbyDht = { listOf(fakeContact) },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf(fakeContact), viewModel.discoveredRemoteHolders.value)
+    }
+
+    @Test
+    fun `discoveredRemoteHolders defaults to empty when browseNearbyDht is not provided`() = runTest(testDispatcher) {
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(emptyList(), viewModel.discoveredRemoteHolders.value)
     }
 
     private class FakePostDao(initial: List<PostEntity>) : PostDao {

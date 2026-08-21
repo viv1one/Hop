@@ -21,6 +21,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
+import com.hop.protocol.ReachTier
 import kotlinx.coroutines.flow.first
 
 /**
@@ -54,6 +55,29 @@ fun FeedScreen(
                     dontRelayRepository = container.dontRelayRepository,
                     getAttestedDeviceKey = { container.settingsRepository.attestedDeviceKey.first().orEmpty() },
                     broadcastDontRelayFlag = { row -> container.transportManager.broadcastDontRelayFlag(row) },
+                    // Phase 4 Slice 7: composes SettingsRepository +
+                    // LocationProvider + DhtNodeManager into the single narrow
+                    // suspend capability FeedViewModel calls once at
+                    // construction. LOCALITY is skipped here, before ever
+                    // reaching a location read or the DHT -- that tier never
+                    // touches the DHT (ADR 0003).
+                    browseNearbyDht = {
+                        val tier = container.settingsRepository.defaultReachTier.first()
+                        if (tier == null || tier == ReachTier.LOCALITY) {
+                            emptyList()
+                        } else {
+                            val location = container.locationProvider.currentLocation()
+                            if (location == null) {
+                                android.util.Log.d("FeedScreen", "Skipping DHT browse for $tier -- no location available")
+                                emptyList()
+                            } else {
+                                val subscription = container.dhtNodeManager.awaitTopicSubscription()
+                                val holders = subscription?.browse(location.latitude, location.longitude, tier) ?: emptyList()
+                                android.util.Log.d("FeedScreen", "DHT browse ($tier) found ${holders.size} remote holder(s)")
+                                holders
+                            }
+                        }
+                    },
                 )
             }
         },

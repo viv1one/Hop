@@ -4,12 +4,15 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PostEntity
+import com.hop.dht.Contact
 import com.hop.repository.BlockRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.ReportRepository
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -47,6 +50,24 @@ class FeedViewModel(
     private val getAttestedDeviceKey: suspend () -> String,
     /** Delegates to `TransportManager.broadcastDontRelayFlag` -- propagates this device's own flag onto the mesh. */
     private val broadcastDontRelayFlag: suspend (DontRelayFlagEntity) -> Unit,
+    /**
+     * Phase 4 Slice 7: best-effort DHT topic-subscription browse (see
+     * [com.hop.topics.TopicSubscription.browse]) for this device's current
+     * browse-tier reach setting -- a narrow suspend capability, same pattern
+     * as [broadcastDontRelayFlag]/[getAttestedDeviceKey] above, so this class
+     * stays unit-testable with a trivial fake lambda instead of needing to
+     * fake `SettingsRepository`/`com.hop.app.location.LocationProvider`/
+     * `com.hop.app.dht.DhtNodeManager` here. [FeedScreen] composes the real
+     * one: reads `SettingsRepository.defaultReachTier` (the SAME single
+     * reach-tier value posts use, per that repository's own doc -- not a
+     * second "browse radius" setting), skips entirely for
+     * [com.hop.protocol.ReachTier.LOCALITY] (that tier never touches the DHT
+     * -- ADR 0003, resolved entirely over BLE/WiFi Direct instead), reads a
+     * location, and calls `TopicSubscription.browse`. Defaults to
+     * `{ emptyList() }` so every test that doesn't care about DHT browsing
+     * doesn't need to fake this at all.
+     */
+    private val browseNearbyDht: suspend () -> List<Contact> = { emptyList() },
 ) : ViewModel() {
 
     val posts: StateFlow<List<PostEntity>> = combine(
@@ -58,6 +79,39 @@ class FeedViewModel(
             post.senderDeviceId !in blockedSenderIds && post.clipHash !in reportedClipHashes
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _discoveredRemoteHolders = MutableStateFlow<List<Contact>>(emptyList())
+
+    /**
+     * Devices [browseNearbyDht] found claiming to hold content in this
+     * device's current browse-tier cell(s) (Town/City/Country only -- see
+     * [browseNearbyDht]'s own doc). Populated once, at construction --
+     * matches this app's "open the app to see what's nearby" MVP posture
+     * (no continuous polling/live refresh here yet).
+     *
+     * **What this is NOT (yet):** [com.hop.topics.TopicSubscription.browse]
+     * returns [Contact]s only -- who claims to hold something -- never
+     * content itself (see that class's own doc: it is topic-routing
+     * plumbing, not a content-fetch mechanism). There is no transport here
+     * that fetches an actual clip FROM one of these contacts -- that needs
+     * an internet-mode content-transfer equivalent to
+     * `com.hop.transport.WifiDirectTransport`, which does not exist yet and
+     * is explicitly a separate future slice's job, not built here. This
+     * [StateFlow] exists so a real DHT discovery result is not silently
+     * thrown away, not because anything downstream can currently act on it.
+     * Deliberately not rendered by [FeedScreen] either: surfacing "N people
+     * are posting somewhere out of BLE/WiFi-Direct range" is a real
+     * product/UX decision (what copy, what affordance, whether it's wanted
+     * at all, given mesh mechanics are supposed to stay invisible to the
+     * user per PRD §5) that hasn't been made -- not an oversight.
+     */
+    val discoveredRemoteHolders: StateFlow<List<Contact>> = _discoveredRemoteHolders.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            _discoveredRemoteHolders.value = browseNearbyDht()
+        }
+    }
 
     private val decryptCacheMutex = Mutex()
 
