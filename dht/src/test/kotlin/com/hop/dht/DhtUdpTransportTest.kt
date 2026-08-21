@@ -165,4 +165,80 @@ class DhtUdpTransportTest {
             bTransport.stop()
         }
     }
+
+    @Test
+    fun `findNode round trip returns the responder's answer over real loopback sockets`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val targetId = nodeId(42)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        val answerContact = Contact(
+            id = nodeId(7),
+            address = PeerAddress.from(InetAddress.getLoopbackAddress(), 12345).encode(),
+            lastSeenAtMs = 0L,
+        )
+        var receivedTargetId: NodeId? = null
+        var receivedExcludeId: NodeId? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onFindNodeRequested = { targetIdArg, excludeIdArg ->
+            receivedTargetId = targetIdArg
+            receivedExcludeId = excludeIdArg
+            listOf(answerContact)
+        }
+        aTransport.start()
+        bTransport.start()
+        try {
+            val result = aTransport.findNode(contactFor(bSocket, bId), targetId)
+            assertEquals(listOf(answerContact.id), result?.map { it.id })
+            assertEquals(targetId, receivedTargetId, "b's onFindNodeRequested must receive the requested targetId")
+            assertEquals(aId, receivedExcludeId, "b's onFindNodeRequested must receive a's id as the id to exclude")
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `findNode returns null when the response's type byte doesn't match what was expected`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 1000)
+        aTransport.start()
+        try {
+            // An "attacker" socket that answers any inbound FIND_NODE_REQUEST with
+            // a PONG carrying the same transaction id -- a's findNode() must not
+            // trust this as a real FIND_NODE_RESPONSE.
+            val attackerSocket = DatagramSocket(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            val attackerThread = Thread {
+                val buffer = ByteArray(2048)
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    attackerSocket.receive(packet)
+                    val request = FindNodeRequestMessage.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                    val bogusPong = DhtMessage(DhtMessageType.PONG, request.transactionId, nodeId(2)).encode()
+                    attackerSocket.send(DatagramPacket(bogusPong, bogusPong.size, packet.address, packet.port))
+                } catch (e: Exception) {
+                    // socket closed underneath us at test teardown -- fine.
+                }
+            }
+            attackerThread.start()
+
+            val attackerContact = Contact(
+                id = nodeId(2),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), attackerSocket.localPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+            val result = aTransport.findNode(attackerContact, nodeId(42))
+            assertEquals(null, result, "a type-mismatched response must be treated as failure, never trusted")
+
+            attackerSocket.close()
+            attackerThread.join(1000)
+        } finally {
+            aTransport.stop()
+        }
+    }
 }

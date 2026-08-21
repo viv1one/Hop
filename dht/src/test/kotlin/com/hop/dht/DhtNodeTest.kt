@@ -5,6 +5,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -85,11 +86,20 @@ class DhtNodeTest {
 
             // Reachable -> markAlive: the eviction candidate stays, the
             // replacement candidate is never promoted into the live bucket.
-            assertEquals(
-                listOf(evictionCandidate),
-                routingTable.bucketFor(evictionCandidateId).contacts(),
-                "a reachable eviction candidate must be kept (markAlive), not evicted",
-            )
+            //
+            // Note: as of Slice 4's required DhtNode.observe wiring fix,
+            // ownTransport.onMessageObserved is no longer the no-op passed at
+            // construction -- DhtNode's init block overwrites it to the real
+            // node.observe. That means the eviction candidate's own PONG
+            // (received here as a side effect of the liveness ping this test
+            // triggers) now legitimately re-observes it and refreshes
+            // lastSeenAtMs -- correct behavior, not a regression -- so this
+            // assertion checks id/address identity rather than exact Contact
+            // equality (which would also compare the now-updated timestamp).
+            val keptContacts = routingTable.bucketFor(evictionCandidateId).contacts()
+            assertEquals(1, keptContacts.size, "a reachable eviction candidate must be kept (markAlive), not evicted")
+            assertEquals(evictionCandidateId, keptContacts[0].id)
+            assertTrue(evictionCandidate.address.contentEquals(keptContacts[0].address))
             assertEquals(listOf(replacementCandidate), routingTable.bucketFor(evictionCandidateId).replacementCandidates())
         } finally {
             ownTransport.stop()
@@ -139,6 +149,230 @@ class DhtNodeTest {
         } finally {
             ownTransport.stop()
             evictionCandidateSocket.close()
+        }
+    }
+
+    // ---- Slice 4 additions ----
+
+    private fun chainNodeId(byteValue: Int): NodeId {
+        val bytes = ByteArray(NodeId.SIZE_BYTES)
+        bytes[NodeId.SIZE_BYTES - 1] = byteValue.toByte()
+        return NodeId(bytes)
+    }
+
+    /**
+     * All-zero bytes except a single bit set at [bitPosition] (0-indexed,
+     * MSB-first) -- gives an id whose [NodeId.sharedPrefixLength] against an
+     * all-zero id is exactly [bitPosition], and whose magnitude (hence its
+     * XOR-distance to an all-zero target) decreases as [bitPosition]
+     * increases. Lets a test pick an exact, easy-to-reason-about
+     * closest-to-target ranking among several ids without depending on
+     * SecureRandom.
+     */
+    private fun idWithBitSet(bitPosition: Int): NodeId {
+        val bytes = ByteArray(NodeId.SIZE_BYTES)
+        val byteIndex = bitPosition / 8
+        val bitInByte = bitPosition % 8
+        bytes[byteIndex] = (0x80 ushr bitInByte).toByte()
+        return NodeId(bytes)
+    }
+
+    private fun dummyContact(id: NodeId): Contact =
+        Contact(id = id, address = PeerAddress.from(InetAddress.getLoopbackAddress(), 1).encode(), lastSeenAtMs = 0L)
+
+    private fun socketContact(id: NodeId, socket: DatagramSocket): Contact =
+        Contact(
+            id = id,
+            address = PeerAddress.from(InetAddress.getLoopbackAddress(), socket.localPort).encode(),
+            lastSeenAtMs = 0L,
+        )
+
+    /**
+     * The Q5/design-point-3 off-by-one regression test: filtering the
+     * requester's own contact out of a FIND_NODE response must happen
+     * *before* truncating to k (over-fetch k+1, filter, then take k) -- not
+     * truncate-to-k-then-filter, which would silently cost a real,
+     * legitimately k-th-closest contact its slot whenever the requester
+     * itself would have occupied it.
+     *
+     * Target is the all-zero id, so XOR-distance-to-target is just each
+     * contact's raw id value -- [idWithBitSet] with a higher bit position
+     * gives a smaller (closer) id. Ranking, closest first: c1, requester,
+     * c3, c4, farAway. With k=3: a naive truncate-then-filter would compute
+     * top-3 = [c1, requester, c3], filter out requester, and wrongly return
+     * only [c1, c3] -- silently dropping c4, which should have taken
+     * requester's slot. The correct over-fetch-then-filter-then-take
+     * behavior returns [c1, c3, c4].
+     */
+    @Test
+    fun `onFindNodeRequested over-fetches before filtering -- doesn't drop a legitimately k-th-closest contact`() {
+        val ownId = zeroId()
+        val target = zeroId()
+        val k = 3
+
+        val requesterId = idWithBitSet(200)
+        val c1 = dummyContact(idWithBitSet(210)) // closest
+        val c3 = dummyContact(idWithBitSet(190))
+        val c4 = dummyContact(idWithBitSet(180)) // legitimately 4th-closest -- must survive the exclusion
+        val farAway = dummyContact(idWithBitSet(50)) // 5th-closest -- must never appear in a k=3 response regardless
+
+        val routingTable = RoutingTable(ownId = ownId, k = k)
+        listOf(c1, dummyContact(requesterId), c3, c4, farAway).forEach { routingTable.insertOrUpdate(it) }
+
+        val transport = DhtUdpTransport(loopbackSocket(), ownId, onMessageObserved = {})
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+        DhtNode(routingTable, transport, scope) // init block wires transport.onFindNodeRequested
+
+        val response = transport.onFindNodeRequested(target, requesterId)
+
+        assertFalse(response.any { it.id == requesterId }, "the requester's own contact must never appear in its own FIND_NODE response")
+        assertEquals(
+            listOf(c1.id, c3.id, c4.id),
+            response.map { it.id },
+            "c4 (legitimately k-th-closest once the requester is excluded) must not be dropped, and farAway must not appear",
+        )
+    }
+
+    /**
+     * Real loopback UDP sockets across four [DhtUdpTransport]/[RoutingTable]/
+     * [DhtNode] instances in a deliberate chain topology (A knows only B, B
+     * knows only C, C knows only D, D knows nobody) -- the low-density,
+     * near-broken-chain case this codebase's conventions call out as the one
+     * that actually breaks a mesh/relay design in the field, not the dense
+     * fully-connected happy path.
+     */
+    @Test
+    fun `findNode discovers peers along a chain topology and populates the routing table as it runs`() = runBlocking {
+        val aId = chainNodeId(1)
+        val bId = chainNodeId(2)
+        val cId = chainNodeId(3)
+        val dId = chainNodeId(4)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val cSocket = loopbackSocket()
+        val dSocket = loopbackSocket()
+
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val aTable = RoutingTable(aId)
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(aTable, aTransport, scope)
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope)
+
+        val cTransport = DhtUdpTransport(cSocket, cId, onMessageObserved = {})
+        val cNode = DhtNode(RoutingTable(cId), cTransport, scope)
+
+        val dTransport = DhtUdpTransport(dSocket, dId, onMessageObserved = {})
+        DhtNode(RoutingTable(dId), dTransport, scope) // init block wires dTransport's callbacks; D itself knows nobody
+
+        val transports = listOf(aTransport, bTransport, cTransport, dTransport)
+        transports.forEach { it.start() }
+        try {
+            aNode.observe(socketContact(bId, bSocket))
+            bNode.observe(socketContact(cId, cSocket))
+            cNode.observe(socketContact(dId, dSocket))
+
+            val discovered = aNode.findNode(dId)
+
+            assertTrue(discovered.any { it.id == dId }, "findNode from A must discover D through the B->C->D chain")
+            assertTrue(discovered.any { it.id == cId }, "findNode from A must discover the intermediate hop C")
+
+            // The point of findNode isn't just the return value -- every contact
+            // discovered along the way must have been fed back through observe()
+            // as the lookup ran, not just collected into the final list.
+            val aKnownIds = aTable.findClosest(dId, 10).map { it.id }.toSet()
+            assertTrue(
+                aKnownIds.containsAll(listOf(bId, cId, dId)),
+                "A's routing table must end up populated with B, C, and D, not just have them in the returned list",
+            )
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    /**
+     * Bootstrap-join needs only an address, never a [NodeId], up front: a
+     * fresh [DhtNode] with an empty routing table, given only the bootstrap
+     * node's [PeerAddress], ends up with populated routing-table entries for
+     * every other node in a small pre-seeded real-socket topology --
+     * confirming the real, correctly-id'd bootstrap entry comes exclusively
+     * from [DhtUdpTransport.onMessageObserved] firing off the bootstrap's
+     * PONG (this only works because of Slice 4's required DhtNode.observe
+     * wiring fix).
+     */
+    @Test
+    fun `bootstrapJoin populates a fresh routing table from just an address`() = runBlocking {
+        val aId = chainNodeId(11)
+        val bId = chainNodeId(12) // the bootstrap node
+        val cId = chainNodeId(13)
+        val dId = chainNodeId(14)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val cSocket = loopbackSocket()
+        val dSocket = loopbackSocket()
+
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val aTable = RoutingTable(aId)
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(aTable, aTransport, scope)
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope)
+
+        val cTransport = DhtUdpTransport(cSocket, cId, onMessageObserved = {})
+        val cNode = DhtNode(RoutingTable(cId), cTransport, scope)
+
+        val dTransport = DhtUdpTransport(dSocket, dId, onMessageObserved = {})
+        DhtNode(RoutingTable(dId), dTransport, scope)
+
+        val transports = listOf(aTransport, bTransport, cTransport, dTransport)
+        transports.forEach { it.start() }
+        try {
+            // Pre-seeded topology B -> C -> D. A starts knowing nobody -- not
+            // even bootstrap B's NodeId, only its address.
+            bNode.observe(socketContact(cId, cSocket))
+            cNode.observe(socketContact(dId, dSocket))
+
+            val bootstrapAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), bSocket.localPort)
+            val discovered = aNode.bootstrapJoin(bootstrapAddress)
+
+            assertTrue(discovered.any { it.id == bId }, "bootstrapJoin must discover the bootstrap node B itself")
+            assertTrue(discovered.any { it.id == cId }, "bootstrapJoin must discover C via B")
+            assertTrue(discovered.any { it.id == dId }, "bootstrapJoin must discover D via C")
+
+            val aKnownIds = aTable.findClosest(aId, 10).map { it.id }.toSet()
+            assertTrue(
+                aKnownIds.containsAll(listOf(bId, cId, dId)),
+                "A's routing table must end up populated with B, C, and D after joining through only B's address",
+            )
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    @Test
+    fun `bootstrapJoin returns emptyList when the bootstrap node never answers`() = runBlocking {
+        val aId = chainNodeId(21)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 300)
+        val aNode = DhtNode(RoutingTable(aId), aTransport, scope = CoroutineScope(Job() + Dispatchers.Default))
+        aTransport.start()
+        try {
+            // Bind and immediately close a socket to obtain a real port guaranteed
+            // to have nothing listening on it.
+            val deadSocket = loopbackSocket()
+            val deadPort = deadSocket.localPort
+            deadSocket.close()
+
+            val result = aNode.bootstrapJoin(PeerAddress.from(InetAddress.getLoopbackAddress(), deadPort))
+            assertEquals(emptyList(), result, "an unanswered bootstrap ping must yield emptyList(), not hang or throw")
+        } finally {
+            aTransport.stop()
         }
     }
 }

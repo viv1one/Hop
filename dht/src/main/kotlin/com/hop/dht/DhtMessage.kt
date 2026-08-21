@@ -12,10 +12,25 @@ import java.nio.ByteOrder
  */
 class DhtMessageDecodeException(message: String) : Exception(message)
 
-/** The RPC types this slice defines. FIND_NODE/FIND_VALUE/STORE are later slices. */
+/**
+ * The RPC types across every message kind in this module -- shared because
+ * every wire format here (this file's [DhtMessage] and, as of Slice 4,
+ * `FindNodeMessage.kt`'s independent `FindNodeRequestMessage`/
+ * `FindNodeResponseMessage`) puts its type byte at the same fixed offset 1
+ * (`[1B version][1B type]...`), letting a receiver dispatch on this one byte
+ * before choosing which type's decoder to invoke. FIND_NODE_REQUEST/
+ * FIND_NODE_RESPONSE are wire-value constants only -- [DhtMessage] itself
+ * (this class's `encode`/`decode`, its fixed 42-byte [WIRE_SIZE]) is
+ * untouched by Slice 4 and never constructed with those two type values;
+ * their actual encode/decode logic lives entirely in `FindNodeMessage.kt`'s
+ * own types, deliberately not a retrofit of [DhtMessage] into a sealed
+ * hierarchy. FIND_VALUE/STORE are still later slices.
+ */
 enum class DhtMessageType(val wireValue: Int) {
     PING(0),
     PONG(1),
+    FIND_NODE_REQUEST(2),
+    FIND_NODE_RESPONSE(3),
     ;
 
     companion object {
