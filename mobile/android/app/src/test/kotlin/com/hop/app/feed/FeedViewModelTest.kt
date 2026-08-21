@@ -194,6 +194,69 @@ class FeedViewModelTest {
         assertEquals(emptyList(), viewModel.discoveredRemoteHolders.value)
     }
 
+    @Test
+    fun `refresh re-runs browseNearbyDht and updates discoveredRemoteHolders`() = runTest(testDispatcher) {
+        val firstContact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { it.toByte() }),
+            address = ByteArray(7),
+            lastSeenAtMs = 0L,
+        )
+        val secondContact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { (it + 1).toByte() }),
+            address = ByteArray(7),
+            lastSeenAtMs = 0L,
+        )
+        var callCount = 0
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            browseNearbyDht = {
+                callCount++
+                if (callCount == 1) listOf(firstContact) else listOf(firstContact, secondContact)
+            },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, callCount, "construction must already have run browseNearbyDht once")
+        assertEquals(listOf(firstContact), viewModel.discoveredRemoteHolders.value)
+
+        viewModel.refresh()
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(2, callCount, "refresh() must re-run browseNearbyDht rather than reuse the construction-time result")
+        assertEquals(listOf(firstContact, secondContact), viewModel.discoveredRemoteHolders.value)
+        assertEquals(false, viewModel.isRefreshing.value, "isRefreshing must settle back to false once refresh completes")
+    }
+
+    @Test
+    fun `a second refresh call while one is already in flight is dropped, not queued`() = runTest(testDispatcher) {
+        var callCount = 0
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            browseNearbyDht = { callCount++; emptyList() },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+        assertEquals(1, callCount)
+
+        // Both calls happen before either's coroutine has had a chance to run
+        // on the (paused-until-advanced) test dispatcher -- isRefreshing is
+        // still true from the first call's still-pending launch when the
+        // second fires, so the second must see the guard and no-op.
+        viewModel.refresh()
+        viewModel.refresh()
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(2, callCount, "the overlapping second refresh() call must be dropped, not run a third time")
+    }
+
     private class FakePostDao(initial: List<PostEntity>) : PostDao {
         private val state = MutableStateFlow(initial)
 

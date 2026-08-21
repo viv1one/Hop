@@ -85,9 +85,9 @@ class FeedViewModel(
     /**
      * Devices [browseNearbyDht] found claiming to hold content in this
      * device's current browse-tier cell(s) (Town/City/Country only -- see
-     * [browseNearbyDht]'s own doc). Populated once, at construction --
-     * matches this app's "open the app to see what's nearby" MVP posture
-     * (no continuous polling/live refresh here yet).
+     * [browseNearbyDht]'s own doc). Populated once at construction, and
+     * again on every user-triggered [refresh] -- see that function's own
+     * doc for why a manual refresh only re-runs this, not [posts] itself.
      *
      * **What this is NOT (yet):** [com.hop.topics.TopicSubscription.browse]
      * returns [Contact]s only -- who claims to hold something -- never
@@ -107,9 +107,50 @@ class FeedViewModel(
      */
     val discoveredRemoteHolders: StateFlow<List<Contact>> = _discoveredRemoteHolders.asStateFlow()
 
+    private val _isRefreshing = MutableStateFlow(false)
+
+    /** Backs [FeedScreen]'s refresh-button spinner. `true` only for the duration of a [refresh] call. */
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
     init {
+        launchDiscovery()
+    }
+
+    /**
+     * The Instagram-style manual refresh button's action ([FeedScreen]'s
+     * `IconButton`). A no-op re-entrancy guard, not a queue -- a second tap
+     * while one is already in flight is dropped rather than stacked. The
+     * guard flag is set synchronously, in this function, before [launchDiscovery]
+     * ever suspends -- not inside the launched coroutine -- so two [refresh]
+     * calls made back-to-back on the same thread (e.g. a double-tap, or two
+     * calls in the same test body before the dispatcher advances) can never
+     * both slip past the check.
+     *
+     * **Deliberately does NOT reload [posts].** [PostRepository.observeAllPosts]
+     * is a Room-backed [kotlinx.coroutines.flow.Flow] that already emits every
+     * local insert/update the instant it happens -- there is nothing to
+     * manually re-fetch there, unlike a server-backed feed's REST refresh.
+     * The only part of this feed that is a one-shot snapshot rather than a
+     * live subscription is [discoveredRemoteHolders] (Town/City/Country DHT
+     * discovery, Phase 4 Slice 7) -- re-running [browseNearbyDht] is the one
+     * actionable thing a "refresh the whole feed" gesture can honestly mean
+     * here today. Skips itself entirely (no DHT round trip at all) when
+     * [browseNearbyDht] would anyway -- see that parameter's own doc for the
+     * Locality/no-location/DHT-not-ready cases it already no-ops on.
+     */
+    fun refresh() {
+        if (_isRefreshing.value) return
+        launchDiscovery()
+    }
+
+    private fun launchDiscovery() {
+        _isRefreshing.value = true
         viewModelScope.launch {
-            _discoveredRemoteHolders.value = browseNearbyDht()
+            try {
+                _discoveredRemoteHolders.value = browseNearbyDht()
+            } finally {
+                _isRefreshing.value = false
+            }
         }
     }
 
