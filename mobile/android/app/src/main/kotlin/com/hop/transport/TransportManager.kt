@@ -20,6 +20,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.hop.crypto.DecayKeyStore
 import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PreKeyRotationManager
+import com.hop.protocol.TierKeyRequestEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
@@ -214,6 +215,9 @@ class TransportManager(
 
     /** Delegates to [WifiDirectTransport.broadcastDontRelayFlag] -- see its doc for the persisted flag queue's propagation semantics. */
     fun broadcastDontRelayFlag(row: DontRelayFlagEntity) = wifiDirectTransport.broadcastDontRelayFlag(row)
+
+    /** Delegates to [WifiDirectTransport.broadcastTierKeyRequest] -- see its doc for the fire-and-forget, no-backlog/no-retry semantics. */
+    fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) = wifiDirectTransport.broadcastTierKeyRequest(request)
 
     /** Delegates to [WifiDirectTransport.sendToPeer] -- see its doc for the peer-specific (non-broadcast) send semantics. */
     fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean =

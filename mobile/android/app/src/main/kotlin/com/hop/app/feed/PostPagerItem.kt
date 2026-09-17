@@ -98,6 +98,14 @@ fun PostPagerItem(
             // FirstRunScreen's DataStore-read loading-state comment).
             null -> Unit
             is PostRepository.DecryptResult.Decayed -> DecayedPostPlaceholder()
+            // Not (yet) decayed -- this device just hasn't obtained a key for
+            // this Town/City/Country post yet. FeedViewModel.decrypt already
+            // fired a best-effort tier-key request on this outcome; the
+            // user's own next pull-to-refresh is what picks up a key that
+            // arrives in the meantime (see that function's own doc). Distinct
+            // copy from the Decayed case above -- "expired" would overclaim.
+            is PostRepository.DecryptResult.AwaitingKey ->
+                DecayedPostPlaceholder(message = "This post isn't available yet")
             is PostRepository.DecryptResult.Decrypted -> when (post.contentType) {
                 "PHOTO" -> PhotoPage(bytes = current.bytes)
                 "VIDEO" -> VideoPage(bytes = current.bytes, clipHash = post.clipHash)

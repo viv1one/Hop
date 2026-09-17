@@ -28,6 +28,14 @@ class PostPagerItemTest {
     }
 
     @Test
+    fun `disabled while decrypt result is AwaitingKey`() {
+        // Phase 4 Slice 10: a post this device hasn't obtained a key for yet
+        // is just as un-decrypted as Decayed from this gate's point of view
+        // -- "proof of local receipt" requires an actual Decrypted result.
+        assertFalse(dontRelayActionEnabled(PostRepository.DecryptResult.AwaitingKey))
+    }
+
+    @Test
     fun `enabled once decrypt result is Decrypted`() {
         assertTrue(dontRelayActionEnabled(PostRepository.DecryptResult.Decrypted(byteArrayOf(1, 2, 3))))
     }

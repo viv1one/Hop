@@ -5,6 +5,9 @@ import androidx.lifecycle.viewModelScope
 import com.hop.data.DontRelayFlagEntity
 import com.hop.data.PostEntity
 import com.hop.dht.Contact
+import com.hop.protocol.ReachTier
+import com.hop.protocol.TierKeyRequestEnvelope
+import com.hop.protocol.TierMembershipClaim
 import com.hop.repository.BlockRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PostRepository
@@ -68,6 +71,32 @@ class FeedViewModel(
      * doesn't need to fake this at all.
      */
     private val browseNearbyDht: suspend () -> List<Contact> = { emptyList() },
+    /**
+     * Phase 4 Slice 10: delegates to `TransportManager.broadcastTierKeyRequest`
+     * -- a narrow suspend capability, same pattern as [broadcastDontRelayFlag]/
+     * [getAttestedDeviceKey] above, so this class stays unit-testable with a
+     * trivial fake lambda instead of a real `TransportManager`. Fired
+     * best-effort from [decrypt] on an [PostRepository.DecryptResult.AwaitingKey]
+     * outcome -- see that function's own doc for the cache-miss trigger and
+     * [maybeRequestTierKey]'s cooldown.
+     */
+    private val broadcastTierKeyRequest: suspend (TierKeyRequestEnvelope) -> Unit = {},
+    /**
+     * Phase 4 Slice 10: builds a fresh [TierMembershipClaim] for [tier] from
+     * this device's *current* location -- the same narrow suspend-lambda
+     * capability shape as [browseNearbyDht]/`PostComposerScreen`'s own
+     * `getOriginGeohashPrefix` (see that lambda's doc for why this stays a
+     * capability rather than a direct `LocationProvider` dependency here).
+     * Returns `null` exactly when no location fix is available right now
+     * (mirrors `LocationProvider.currentLocation()`'s own contract) --
+     * [maybeRequestTierKey] treats that as "skip this attempt," logged, never
+     * surfaced to the user (mesh mechanics stay invisible, PRD §5). Never
+     * called with [ReachTier.LOCALITY] -- [decrypt] only reaches this for an
+     * [PostRepository.DecryptResult.AwaitingKey] outcome, which [PostRepository.decrypt]
+     * never returns for Locality (ADR 0003: that tier never touches the
+     * separate key-distribution path this claim is for).
+     */
+    private val buildTierMembershipClaim: suspend (ReachTier) -> TierMembershipClaim? = { null },
 ) : ViewModel() {
 
     val posts: StateFlow<List<PostEntity>> = combine(
@@ -166,11 +195,66 @@ class FeedViewModel(
         ): Boolean = size > MAX_CACHE_SIZE
     }
 
-    suspend fun decrypt(post: PostEntity): PostRepository.DecryptResult = decryptCacheMutex.withLock {
-        decryptCache[post.clipHash]?.let { cached -> return@withLock cached }
-        val result = postRepository.decrypt(post)
-        decryptCache[post.clipHash] = result
-        result
+    /**
+     * Every [tierKeyRequestAttemptedAtMs]-throttled best-effort key request
+     * fired so far this process, keyed by [PostEntity.clipHash] -- see
+     * [maybeRequestTierKey]'s own doc. Deliberately a plain, unsynchronized
+     * map, not a [java.util.concurrent.ConcurrentHashMap] like
+     * `TransportManager.lastConnectAttemptMs` -- unlike that class's
+     * multi-thread `WifiP2pManager` callbacks, every call into this
+     * [ViewModel] (Compose's `LaunchedEffect`s, [refresh]) runs on the main
+     * thread, so there is no concurrent-write hazard to guard against here.
+     * In-memory only, same as [decryptCache] -- lost on process death, never
+     * persisted; a fresh process re-attempts on the next cache-miss decrypt.
+     */
+    private val tierKeyRequestAttemptedAtMs = mutableMapOf<String, Long>()
+
+    suspend fun decrypt(post: PostEntity): PostRepository.DecryptResult {
+        val result = decryptCacheMutex.withLock {
+            decryptCache[post.clipHash]?.let { cached -> return@withLock cached }
+            val fresh = postRepository.decrypt(post)
+            decryptCache[post.clipHash] = fresh
+            fresh
+        }
+        if (result is PostRepository.DecryptResult.AwaitingKey) {
+            maybeRequestTierKey(post)
+        }
+        return result
+    }
+
+    /**
+     * Fires a best-effort [TierKeyRequestEnvelope] broadcast for [post] --
+     * called only when [decrypt] just observed
+     * [PostRepository.DecryptResult.AwaitingKey] for it (a Town/City/Country
+     * post this device holds ciphertext for but has no live key for yet).
+     *
+     * Throttled independently of [decryptCache]'s own LRU eviction via
+     * [tierKeyRequestAttemptedAtMs]: a cache eviction and later re-miss for
+     * the same post must NOT bypass this cooldown, so this map is checked
+     * regardless of whether [decrypt]'s own result just came from the cache
+     * or a fresh [PostRepository.decrypt] call. [TIER_KEY_REQUEST_COOLDOWN_MS]
+     * is an unmeasured placeholder, matching `TransportManager.CONNECT_COOLDOWN_MS`'s
+     * own "not tuned against real data" posture.
+     *
+     * No correlation, timeout, retry-with-backoff, or polling here by design
+     * (see [com.hop.protocol.ReachTierKeyDistribution]'s "Explicitly out of
+     * scope" note) -- the user's own next pull-to-refresh (see [refresh]'s
+     * doc) is what re-drives [decrypt] and, if a key arrived in the meantime,
+     * picks it up. A `null` [buildTierMembershipClaim] result (no location
+     * fix right now) skips the broadcast for this attempt but still records
+     * the cooldown timestamp, matching `TransportManager.maybeConnect`'s own
+     * "record the attempt, not just the success" shape.
+     */
+    private suspend fun maybeRequestTierKey(post: PostEntity) {
+        val now = System.currentTimeMillis()
+        val lastAttempt = tierKeyRequestAttemptedAtMs[post.clipHash]
+        if (lastAttempt != null && now - lastAttempt < TIER_KEY_REQUEST_COOLDOWN_MS) return
+        tierKeyRequestAttemptedAtMs[post.clipHash] = now
+
+        val reachTier = ReachTier.valueOf(post.reachTier)
+        val claim = buildTierMembershipClaim(reachTier) ?: return
+        val request = TierKeyRequestEnvelope(contentId = post.clipHash.hexToByteArray(), claim = claim)
+        broadcastTierKeyRequest(request)
     }
 
     fun blockSender(senderDeviceId: String) {
@@ -210,5 +294,27 @@ class FeedViewModel(
 
     private companion object {
         const val MAX_CACHE_SIZE = 3
+
+        /**
+         * Unmeasured placeholder, matching `TransportManager.CONNECT_COOLDOWN_MS`'s
+         * own "not tuned against real data" posture -- revisit once real
+         * mesh-density/request-latency numbers exist. Deliberately shorter
+         * than [PostRepository.decrypt]'s underlying [DecayKeyStore] lookups'
+         * own TTLs; this bounds how often this device pesters the mesh for
+         * the same post's key, not how long a granted key stays valid.
+         */
+        const val TIER_KEY_REQUEST_COOLDOWN_MS = 30_000L
+    }
+}
+
+/** Decodes a lowercase hex string (as produced by `EncryptedFrameCodec`'s own
+ * `"%02x"`-per-byte encoding) back into raw bytes -- mirrors [PostRepository]'s
+ * own private helper of the same shape, needed here to build the
+ * [TierKeyRequestEnvelope.contentId] this class sends. */
+private fun String.hexToByteArray(): ByteArray {
+    require(length % 2 == 0) { "hex string must have an even length, was $length: $this" }
+    return ByteArray(length / 2) { i ->
+        val start = i * 2
+        substring(start, start + 2).toInt(16).toByte()
     }
 }

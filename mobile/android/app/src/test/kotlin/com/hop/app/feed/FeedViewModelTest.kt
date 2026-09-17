@@ -13,7 +13,13 @@ import com.hop.data.ReportedPostDao
 import com.hop.data.ReportedPostEntity
 import com.hop.dht.Contact
 import com.hop.dht.NodeId
+import com.hop.protocol.ContentType
+import com.hop.protocol.EncryptedFrameCodec
+import com.hop.protocol.Frame
+import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
+import com.hop.protocol.TierKeyRequestEnvelope
+import com.hop.protocol.TierMembershipClaim
 import com.hop.repository.BlockRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PostRepository
@@ -29,8 +35,13 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
+import java.security.MessageDigest
 import java.time.Clock
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.assertEquals
@@ -45,6 +56,9 @@ import kotlin.test.assertEquals
 @OptIn(ExperimentalCoroutinesApi::class)
 class FeedViewModelTest {
 
+    @get:Rule
+    val tempFolder = TemporaryFolder()
+
     private val testDispatcher = StandardTestDispatcher()
 
     @Before
@@ -57,17 +71,77 @@ class FeedViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun samplePost(clipHash: String, senderDeviceId: String = "sender-1") = PostEntity(
+    private fun samplePost(
+        clipHash: String,
+        senderDeviceId: String = "sender-1",
+        reachTier: String = "LOCALITY",
+    ) = PostEntity(
         clipHash = clipHash,
         senderDeviceId = senderDeviceId,
         contentType = "PHOTO",
         originatedAtMs = 1_700_000_000_000L,
         ttlSeconds = 3600,
-        reachTier = "LOCALITY",
+        reachTier = reachTier,
         dontRelay = false,
         receivedAtMs = 1000L,
         encryptedPayloadFilePath = "/unused/for/this/test/$clipHash.enc",
     )
+
+    /** SHA-256 hex digest of [seed] -- a valid 32-byte hex clipHash, as [TierKeyRequestEnvelope.contentId] requires (unlike this file's other, non-hex sample clipHashes such as "clip-1"). */
+    private fun sha256Hex(seed: String): String =
+        MessageDigest.getInstance("SHA-256").digest(seed.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
+
+    /**
+     * Builds a real Town/City/Country [PostEntity] (real [EncryptedFrameCodec]-encoded
+     * ciphertext on disk, matching [com.hop.repository.PostRepositoryTest]'s own
+     * pattern) with no key ever stored under any [DecayKeyStore] composition,
+     * and inserts it into [postDao] -- used by the "never triggers a broadcast"
+     * test below, which needs [PostRepository.decrypt]'s *real* AwaitingKey-vs-Decayed
+     * decision (not a canned [StubPostRepository] result) to prove FeedViewModel
+     * only ever broadcasts for the genuine AwaitingKey case.
+     */
+    private suspend fun insertKeylessPost(
+        postDao: FakePostDao,
+        reachTier: ReachTier,
+        originatedAtMs: Long,
+        ttlSeconds: Long,
+        originGeohashPrefix: String = "",
+    ): PostEntity {
+        val plaintext = "keyless post for $reachTier at $originatedAtMs".toByteArray()
+        val clipHash = MessageDigest.getInstance("SHA-256").digest(plaintext)
+        val clipHashHex = clipHash.toHexString()
+        val encodeResult = EncryptedFrameCodec.encode(
+            plaintext = plaintext,
+            clipHash = clipHash,
+            senderDeviceId = ByteArray(Frame.SENDER_DEVICE_ID_SIZE) { it.toByte() },
+            contentType = ContentType.PHOTO,
+            hopCount = 0,
+            originatedAtMs = originatedAtMs,
+            ttlSeconds = ttlSeconds,
+            reachTier = reachTier,
+            dontRelay = false,
+            originGeohashPrefix = originGeohashPrefix,
+        )
+        val frame = Frame.decode(encodeResult.encoded)
+        val payloadFile = File(tempFolder.newFolder("posts-${System.nanoTime()}"), "$clipHashHex.enc")
+        payloadFile.writeBytes(frame.payload)
+        val entity = PostEntity(
+            clipHash = clipHashHex,
+            senderDeviceId = "sender",
+            contentType = ContentType.PHOTO.name,
+            originatedAtMs = originatedAtMs,
+            ttlSeconds = ttlSeconds,
+            reachTier = reachTier.name,
+            originGeohashPrefix = originGeohashPrefix,
+            dontRelay = false,
+            receivedAtMs = System.currentTimeMillis(),
+            encryptedPayloadFilePath = payloadFile.absolutePath,
+        )
+        postDao.upsert(entity)
+        return entity
+    }
 
     @Test
     fun postsFlowFiltersBlockedAndReportedEntries() = runTest(testDispatcher) {
@@ -124,6 +198,110 @@ class FeedViewModelTest {
         // hold the whole feed's plaintext.
         viewModel.decrypt(posts.first())
         assertEquals(5, countingPostRepository.decryptCallCount)
+    }
+
+    @Test
+    fun `decrypt on a cache-miss AwaitingKey post triggers exactly one tier-key request broadcast with a correctly-shaped claim`() = runTest(testDispatcher) {
+        val clipHash = sha256Hex("clip-awaiting-key")
+        val post = samplePost(clipHash, reachTier = "TOWN")
+        val stubRepository = StubPostRepository(mapOf(clipHash to PostRepository.DecryptResult.AwaitingKey))
+        val broadcastRequests = mutableListOf<TierKeyRequestEnvelope>()
+
+        val viewModel = FeedViewModel(
+            postRepository = stubRepository,
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            broadcastTierKeyRequest = { request -> broadcastRequests.add(request) },
+            buildTierMembershipClaim = { tier ->
+                TierMembershipClaim(reachTier = tier, geohashPrefix = "9q8yy", claimedAtMs = 1_000L)
+            },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        val result = viewModel.decrypt(post)
+
+        assertEquals(PostRepository.DecryptResult.AwaitingKey, result)
+        assertEquals(1, broadcastRequests.size)
+        val sentRequest = broadcastRequests.single()
+        assertEquals(clipHash, sentRequest.contentId.toHexString())
+        assertEquals(ReachTier.TOWN, sentRequest.claim.reachTier)
+        assertEquals("9q8yy", sentRequest.claim.geohashPrefix)
+    }
+
+    @Test
+    fun `a second decrypt call for the same AwaitingKey post within the cooldown window does not re-trigger a broadcast`() = runTest(testDispatcher) {
+        val clipHash = sha256Hex("clip-awaiting-cooldown")
+        val post = samplePost(clipHash, reachTier = "CITY")
+        val stubRepository = StubPostRepository(mapOf(clipHash to PostRepository.DecryptResult.AwaitingKey))
+        var broadcastCount = 0
+
+        val viewModel = FeedViewModel(
+            postRepository = stubRepository,
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            broadcastTierKeyRequest = { broadcastCount++ },
+            buildTierMembershipClaim = { tier ->
+                TierMembershipClaim(reachTier = tier, geohashPrefix = "9q8y", claimedAtMs = 1_000L)
+            },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.decrypt(post)
+        viewModel.decrypt(post)
+
+        assertEquals(1, broadcastCount, "the second decrypt() call inside the cooldown window must not re-trigger a broadcast")
+    }
+
+    @Test
+    fun `a Locality post or a genuinely-expired post never triggers a tier-key request broadcast`() = runTest(testDispatcher) {
+        val postDao = FakePostDao(emptyList())
+        val decayKeyStore = DecayKeyStore()
+        val realPostRepository = PostRepository(postDao, decayKeyStore)
+        var broadcastCount = 0
+
+        val viewModel = FeedViewModel(
+            postRepository = realPostRepository,
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            broadcastTierKeyRequest = { broadcastCount++ },
+            buildTierMembershipClaim = { tier ->
+                TierMembershipClaim(reachTier = tier, geohashPrefix = "9q8y", claimedAtMs = 1_000L)
+            },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        // Locality, no key ever stored -- must resolve to Decayed (Locality
+        // never yields AwaitingKey, ADR 0003), so no broadcast fires.
+        val localityPost = insertKeylessPost(
+            postDao,
+            reachTier = ReachTier.LOCALITY,
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+        )
+        assertEquals(PostRepository.DecryptResult.Decayed, viewModel.decrypt(localityPost))
+
+        // Town, no key ever stored, but genuinely past its own TTL (originated
+        // 2 hours ago with a 1-hour TTL) -- must resolve to Decayed, not
+        // AwaitingKey, so no broadcast fires for it either.
+        val expiredTownPost = insertKeylessPost(
+            postDao,
+            reachTier = ReachTier.TOWN,
+            originatedAtMs = System.currentTimeMillis() - Duration.ofHours(2).toMillis(),
+            ttlSeconds = 3600L,
+            originGeohashPrefix = "9q8yy",
+        )
+        assertEquals(PostRepository.DecryptResult.Decayed, viewModel.decrypt(expiredTownPost))
+
+        assertEquals(0, broadcastCount, "neither a Locality post nor a genuinely-expired post must ever trigger a tier-key request broadcast")
     }
 
     @Test
@@ -347,5 +525,22 @@ class FeedViewModelTest {
             decryptCallCount++
             return DecryptResult.Decrypted(post.clipHash.toByteArray())
         }
+    }
+
+    /**
+     * Returns a canned [DecryptResult] per `clipHash` (defaulting to
+     * [DecryptResult.Decayed] for anything not in [results]) -- used by the
+     * tier-key-request-broadcast tests above, which need to force a specific
+     * outcome (AwaitingKey) without depending on real [EncryptedFrameCodec]/
+     * [DecayKeyStore] expiry arithmetic. Same "subclass the real
+     * [PostRepository]" pattern as [CountingFakePostRepository].
+     */
+    private class StubPostRepository(private val results: Map<String, DecryptResult>) :
+        PostRepository(FakePostDao(emptyList()), DecayKeyStore()) {
+
+        override fun observeAllPosts(): Flow<List<PostEntity>> = MutableStateFlow(emptyList())
+
+        override suspend fun decrypt(post: PostEntity): DecryptResult =
+            results[post.clipHash] ?: DecryptResult.Decayed
     }
 }

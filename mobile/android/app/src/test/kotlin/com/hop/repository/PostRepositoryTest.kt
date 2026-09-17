@@ -16,6 +16,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.security.MessageDigest
+import java.time.Duration
 import kotlin.test.assertContentEquals
 import kotlin.test.assertIs
 
@@ -25,6 +26,11 @@ import kotlin.test.assertIs
  * hex-encoded clipHash for LOCALITY, [ReachTierKeyDistribution.decayKeyStorageKey]
  * for Town/City/Country) -- this must agree with however the key was stored
  * in the first place, or a legitimate re-decrypt silently misses.
+ *
+ * Also covers Phase 4 Slice 10's [PostRepository.DecryptResult.AwaitingKey]
+ * vs. [PostRepository.DecryptResult.Decayed] split for a `null`-key lookup:
+ * both start from "no stored key," and only the post's own
+ * `originatedAtMs`/`ttlSeconds` expiry decides which case it resolves to.
  */
 class PostRepositoryTest {
 
@@ -141,17 +147,17 @@ class PostRepositoryTest {
         assertContentEquals("post for TOWN".toByteArray(), decrypted.bytes)
     }
 
-    @Test
-    fun decryptReturnsDecayedWhenTheTieredKeyWasNeverStored() = runBlocking {
-        val postDao = FakePostDao()
-        val decayKeyStore = DecayKeyStore()
-        val repository = PostRepository(postDao, decayKeyStore)
-
-        // Build the post but only insert the row -- never store any key at
-        // all under any composition. Simulates a received Town/City/Country
-        // post whose key hasn't arrived yet (same shape as an
-        // already-decayed post from this repository's point of view).
-        val plaintext = "never got a key".toByteArray()
+    /**
+     * Builds (but never stores any key for) a Town/City/Country post,
+     * standing in for "a received post whose TIER_KEY_REQUEST was never
+     * sent/answered yet" -- the exact shape [PostRepository.DecryptResult.AwaitingKey]
+     * exists to distinguish from genuine decay (Phase 4 Slice 10). Not
+     * inserted into [postDao] here (callers do that themselves after tweaking
+     * `originatedAtMs`/`ttlSeconds` as needed) since the two tests below need
+     * two different expiry shapes for the exact same otherwise-identical post.
+     */
+    private fun buildKeylessCityPost(originatedAtMs: Long, ttlSeconds: Long): PostEntity {
+        val plaintext = "never got a key ($originatedAtMs,$ttlSeconds)".toByteArray()
         val clipHash = MessageDigest.getInstance("SHA-256").digest(plaintext)
         val clipHashHex = clipHash.joinToString("") { "%02x".format(it) }
         val result = EncryptedFrameCodec.encode(
@@ -160,32 +166,105 @@ class PostRepositoryTest {
             senderDeviceId = ByteArray(Frame.SENDER_DEVICE_ID_SIZE) { it.toByte() },
             contentType = ContentType.PHOTO,
             hopCount = 0,
-            originatedAtMs = System.currentTimeMillis(),
-            ttlSeconds = 3600L,
+            originatedAtMs = originatedAtMs,
+            ttlSeconds = ttlSeconds,
             reachTier = ReachTier.CITY,
             dontRelay = false,
             originGeohashPrefix = "9q8y",
         )
         val frame = Frame.decode(result.encoded)
-        val payloadFile = File(tempFolder.newFolder("posts-nokey"), "$clipHashHex.enc")
+        val payloadFile = File(tempFolder.newFolder("posts-nokey-${System.nanoTime()}"), "$clipHashHex.enc")
         payloadFile.writeBytes(frame.payload)
-        val entity = PostEntity(
+        return PostEntity(
             clipHash = clipHashHex,
             senderDeviceId = "sender",
             contentType = ContentType.PHOTO.name,
-            originatedAtMs = System.currentTimeMillis(),
-            ttlSeconds = 3600L,
+            originatedAtMs = originatedAtMs,
+            ttlSeconds = ttlSeconds,
             reachTier = ReachTier.CITY.name,
             originGeohashPrefix = "9q8y",
             dontRelay = false,
             receivedAtMs = System.currentTimeMillis(),
             encryptedPayloadFilePath = payloadFile.absolutePath,
         )
+    }
+
+    @Test
+    fun decryptReturnsAwaitingKeyWhenTheTieredKeyWasNeverStoredAndThePostHasNotExpired() = runBlocking {
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore()
+        val repository = PostRepository(postDao, decayKeyStore)
+
+        // Fresh post (originated "now", a full hour of TTL remaining) with no
+        // key ever stored under any composition -- this is the ordinary
+        // "no one has asked for (or been granted) this tier's key yet" case,
+        // NOT decay: the post itself is nowhere near its own TTL boundary.
+        val entity = buildKeylessCityPost(originatedAtMs = System.currentTimeMillis(), ttlSeconds = 3600L)
         postDao.upsert(entity)
 
-        val result2 = repository.decrypt(entity)
+        val result = repository.decrypt(entity)
 
-        assertIs<PostRepository.DecryptResult.Decayed>(result2, "expected Decayed when no key was ever stored under any composition")
+        assertIs<PostRepository.DecryptResult.AwaitingKey>(
+            result,
+            "a non-expired Town/City/Country post with no stored key must be AwaitingKey, not Decayed",
+        )
+        Unit
+    }
+
+    @Test
+    fun decryptReturnsDecayedWhenTheTieredKeyWasNeverStoredAndThePostHasExpired() = runBlocking {
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore()
+        val repository = PostRepository(postDao, decayKeyStore)
+
+        // Same shape as the AwaitingKey case above -- no key ever stored --
+        // but this post's own TTL has genuinely elapsed (originated 2 hours
+        // ago with a 1-hour TTL). Distinguishes real decay from "just hasn't
+        // been requested yet": both start from "no stored key," only the
+        // post's own origination/TTL differs.
+        val twoHoursAgo = System.currentTimeMillis() - Duration.ofHours(2).toMillis()
+        val entity = buildKeylessCityPost(originatedAtMs = twoHoursAgo, ttlSeconds = 3600L)
+        postDao.upsert(entity)
+
+        val result = repository.decrypt(entity)
+
+        assertIs<PostRepository.DecryptResult.Decayed>(
+            result,
+            "an already-expired Town/City/Country post with no stored key must be Decayed, not AwaitingKey",
+        )
+        Unit
+    }
+
+    @Test
+    fun decryptNeverReturnsAwaitingKeyForALocalityPost() = runBlocking {
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore()
+        val repository = PostRepository(postDao, decayKeyStore)
+
+        // A Locality post with no key ever stored, but NOT past its own TTL
+        // -- unlike the CITY case above, this must still resolve to Decayed:
+        // Locality never has a separate "key not yet requested" state (ADR
+        // 0003, that tier's key is always either inlined at receive time or
+        // genuinely gone).
+        val plaintext = "locality, never got a key".toByteArray()
+        val clipHash = MessageDigest.getInstance("SHA-256").digest(plaintext)
+        val clipHashHex = clipHash.joinToString("") { "%02x".format(it) }
+        val entity = PostEntity(
+            clipHash = clipHashHex,
+            senderDeviceId = "sender",
+            contentType = ContentType.PHOTO.name,
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+            reachTier = ReachTier.LOCALITY.name,
+            dontRelay = false,
+            receivedAtMs = System.currentTimeMillis(),
+            encryptedPayloadFilePath = tempFolder.newFile("locality-nokey.enc").absolutePath,
+        )
+        postDao.upsert(entity)
+
+        val result = repository.decrypt(entity)
+
+        assertIs<PostRepository.DecryptResult.Decayed>(result, "Locality never yields AwaitingKey")
         Unit
     }
 

@@ -1048,6 +1048,44 @@ class WifiDirectTransport(
     }
 
     /**
+     * Phase 4 Slice 10: fire-and-forget broadcast of [request] (a locally
+     * built [TierKeyRequestEnvelope] for a Town/City/Country post this device
+     * holds ciphertext for but has no live key for -- see
+     * [com.hop.app.feed.FeedViewModel.decrypt]'s own doc for the cache-miss
+     * trigger and cooldown that call this) to every currently-connected
+     * peer. Mirrors [broadcastPost]/[broadcastDontRelayFlag]'s exact
+     * iterate-[activeConnections]/`trySend`/prune-on-failure shape, but with
+     * none of their persisted-queue backing: a tier-key request has no
+     * backlog, no relay custody, and no retry of its own -- per
+     * [com.hop.protocol.ReachTierKeyDistribution]'s "Explicitly out of scope"
+     * note, the only retry mechanism for this request is the user's own next
+     * manual refresh re-driving a fresh [decrypt]-triggered attempt, not
+     * anything built in this transport layer. Never targeted at a specific
+     * peer (unlike [handleTierKeyRequestAnswered]'s same-connection reply) --
+     * broadcast to everyone connected right now, since this device has no way
+     * to know in advance which connected peer (if any) actually holds the
+     * key.
+     *
+     * Deliberately does **not** share [outboxLock] with [broadcastPost]/
+     * [broadcastDontRelayFlag]/[registerConnectionAndGetBacklog] -- those
+     * share it because they must stay consistent with a persisted-backlog
+     * read; this method touches no persisted queue at all, so reading
+     * [activeConnections] directly (already safe for concurrent iteration --
+     * [CopyOnWriteArrayList]) is enough, matching [sendToPeer]/
+     * [handleTierKeyRequestAnswered]'s own already-unlocked reads.
+     */
+    fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
+        val envelope = WireEnvelope.encode(WirePayloadType.TIER_KEY_REQUEST, request.encode())
+        onLog("Broadcasting a tier-key request to ${activeConnections.size} connected peer(s)")
+        for (connection in activeConnections) {
+            if (!connection.trySend(envelope)) {
+                onLog("Live tier-key request send failed to a connected peer; dropping that connection")
+                activeConnections.remove(connection)
+            }
+        }
+    }
+
+    /**
      * Phase 2 Slice 3's local delivery-confirmation stop signal (see this
      * class's own doc for why no wire-level delivery-ack primitive exists
      * instead): once [connection]'s remote peer id is positively identified

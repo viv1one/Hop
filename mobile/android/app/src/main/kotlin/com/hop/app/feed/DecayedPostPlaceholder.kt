@@ -12,19 +12,26 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 
 /**
- * Shown when [com.hop.repository.PostRepository.DecryptResult.Decayed] comes
- * back for a post -- this device's copy of the decay key has expired per
- * ADR 0003's key-expiry enforcement, so it can no longer decrypt this post's
- * ciphertext (which is still on disk, just permanently opaque now).
+ * Shown when [com.hop.repository.PostRepository.DecryptResult.Decayed] (this
+ * device's copy of the decay key has genuinely expired per ADR 0003's
+ * key-expiry enforcement -- the ciphertext is still on disk, just
+ * permanently opaque now) or [com.hop.repository.PostRepository.DecryptResult.AwaitingKey]
+ * (a Town/City/Country post this device hasn't obtained a key for *yet* --
+ * see that case's own doc, and [com.hop.app.feed.FeedViewModel.decrypt] for
+ * the best-effort request it fires on this outcome) comes back for a post.
+ * [message] defaults to the `Decayed` copy; [PostPagerItem] passes a
+ * different, non-overclaiming string for `AwaitingKey` -- "expired" would be
+ * simply wrong for a post that hasn't actually decayed, it's just missing a
+ * key this device hasn't asked for (or received) yet.
  *
  * Plain-language only, no mesh/crypto jargon exposed ("key expired"/"decay
- * window"/etc. never surface here -- PRD §5). Deliberately does not
+ * window"/"tier"/etc. never surface here -- PRD §5). Deliberately does not
  * auto-advance the pager on its own, unlike the photo/video pages: this is a
  * real, intentional page the user swipes past themselves, not a transient
  * loading/error state to rush past.
  */
 @Composable
-fun DecayedPostPlaceholder() {
+fun DecayedPostPlaceholder(message: String = "This post has expired") {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -32,7 +39,7 @@ fun DecayedPostPlaceholder() {
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "This post has expired",
+            text = message,
             style = MaterialTheme.typography.headlineSmall,
             textAlign = TextAlign.Center,
         )

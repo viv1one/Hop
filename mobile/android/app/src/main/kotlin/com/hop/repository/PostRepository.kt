@@ -5,6 +5,7 @@ import com.hop.data.PostDao
 import com.hop.data.PostEntity
 import com.hop.protocol.EncryptedFrameCodec
 import com.hop.protocol.ReachTier
+import com.hop.protocol.RelayPolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -28,13 +29,26 @@ import java.io.File
 open class PostRepository(
     private val postDao: PostDao,
     private val decayKeyStore: DecayKeyStore,
+    /**
+     * Shared expiry math (`isExpired`/`expiresAtMs` against
+     * [PostEntity.originatedAtMs]/[PostEntity.ttlSeconds]) used only to tell
+     * [DecryptResult.AwaitingKey] apart from [DecryptResult.Decayed] below --
+     * see that case's own doc. Defaulted (not required) so every existing
+     * two-arg construction of this class across the app/tests keeps compiling
+     * unchanged; [com.hop.app.AppContainer] doesn't thread in anything special
+     * here since there's no tuning input for this policy yet (same posture as
+     * [RelayRepository]/[DontRelayRepository]'s own default-shaped [RelayPolicy]s).
+     */
+    private val relayPolicy: RelayPolicy = RelayPolicy(),
 ) {
 
-    /** Result of [decrypt] -- deliberately only these two cases, both backed by
-     * real [EncryptedFrameCodec.decryptFromStore] outcomes. No `Error`/
-     * exception-wrapping case: that function already returns null cleanly for
-     * the one real failure mode it has (an expired/missing decay key), so
-     * there's no other failure mode to invent a case for here.
+    /**
+     * Result of [decrypt]. Three cases, per ADR 0003's own instruction to
+     * "state precisely what's happening, don't overclaim": a post can fail to
+     * decrypt for two meaningfully different reasons, and collapsing them
+     * into one case would hide the one actionable signal
+     * ([com.hop.app.feed.FeedViewModel.decrypt]'s cache-miss-triggers-a-request
+     * behavior) that depends on telling them apart.
      */
     sealed interface DecryptResult {
         data class Decrypted(val bytes: ByteArray) : DecryptResult {
@@ -48,14 +62,34 @@ open class PostRepository(
         }
 
         /**
-         * The decay key for this post has expired (or was never present) in
-         * [DecayKeyStore] -- ADR 0003's decay-by-key-expiry primitive actually
-         * biting. The ciphertext this post's [PostEntity.encryptedPayloadFilePath]
+         * The post's own TTL has genuinely elapsed (`relayPolicy.isExpired`
+         * against [PostEntity.originatedAtMs]/[PostEntity.ttlSeconds]), or (the
+         * pre-Phase-4-Slice-10 case, unchanged) this is a [ReachTier.LOCALITY]
+         * post whose plain-keyed [DecayKeyStore] lookup came back empty past
+         * expiry -- ADR 0003's decay-by-key-expiry primitive actually biting.
+         * The ciphertext this post's [PostEntity.encryptedPayloadFilePath]
          * points at is still on disk, untouched; it's just permanently opaque
          * to this store from this point on. See [DecayKeyStore]'s own "Limit"
          * doc: this binds the stock client, it doesn't erase the ciphertext.
          */
         data object Decayed : DecryptResult
+
+        /**
+         * A Town/City/Country post that has NOT decayed
+         * (`!relayPolicy.isExpired(...)`) but whose tiered key was never found
+         * in [DecayKeyStore] -- i.e. this device has simply never asked for
+         * (or been granted) the key yet, distinct from [Decayed]'s "the window
+         * closed." [com.hop.app.feed.FeedViewModel.decrypt] treats this as the
+         * signal to fire a best-effort [com.hop.protocol.TierKeyRequestEnvelope]
+         * broadcast; a future decrypt of the same post (after the user's next
+         * manual refresh) may resolve to [Decrypted] if a key arrived in the
+         * meantime, or may still be [AwaitingKey]/settle into [Decayed] once
+         * the post's own TTL elapses. Never returned for [ReachTier.LOCALITY]
+         * -- that tier's key is always either present (inlined at receive
+         * time) or genuinely decayed, never "not yet requested" (ADR 0003:
+         * Locality never touches the DHT/separate key-distribution path).
+         */
+        data object AwaitingKey : DecryptResult
     }
 
     open fun observeAllPosts(): Flow<List<PostEntity>> = postDao.getAllOrderedByReceivedDesc()
@@ -85,16 +119,29 @@ open class PostRepository(
      * [DecayKeyStore]'s synchronous (non-suspend, potentially Room-blocking)
      * `retrieve` call -- callers must not assume this is safe on the main
      * thread just because the signature is `suspend`.
+     *
+     * On a `null` [EncryptedFrameCodec.decryptFromStore] result, distinguishes
+     * [DecryptResult.AwaitingKey] from [DecryptResult.Decayed] using
+     * [relayPolicy]'s own expiry math against [post]'s
+     * [PostEntity.originatedAtMs]/[PostEntity.ttlSeconds] -- see
+     * [DecryptResult.AwaitingKey]'s own doc for exactly which combination of
+     * `reachTier`/expiry yields which case.
      */
     open suspend fun decrypt(post: PostEntity): DecryptResult = withContext(Dispatchers.IO) {
         val ciphertext = File(post.encryptedPayloadFilePath).readBytes()
+        val reachTier = ReachTier.valueOf(post.reachTier)
         val plaintext = EncryptedFrameCodec.decryptFromStore(
             clipHash = post.clipHash.hexToByteArray(),
             encryptedPayload = ciphertext,
             decayKeyStore = decayKeyStore,
-            reachTier = ReachTier.valueOf(post.reachTier),
+            reachTier = reachTier,
         )
-        if (plaintext == null) DecryptResult.Decayed else DecryptResult.Decrypted(plaintext)
+        when {
+            plaintext != null -> DecryptResult.Decrypted(plaintext)
+            reachTier != ReachTier.LOCALITY &&
+                !relayPolicy.isExpired(post.originatedAtMs, post.ttlSeconds) -> DecryptResult.AwaitingKey
+            else -> DecryptResult.Decayed
+        }
     }
 }
 

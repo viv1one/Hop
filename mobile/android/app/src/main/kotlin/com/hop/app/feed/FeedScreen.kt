@@ -28,7 +28,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
+import com.hop.protocol.Geohash
 import com.hop.protocol.ReachTier
+import com.hop.protocol.ReachTierGeohash
+import com.hop.protocol.TierMembershipClaim
 import kotlinx.coroutines.flow.first
 
 /**
@@ -103,6 +106,37 @@ fun FeedScreen(
                                 android.util.Log.d("FeedScreen", "DHT browse ($tier) found ${holders.size} remote holder(s)")
                                 holders
                             }
+                        }
+                    },
+                    // Phase 4 Slice 10: delegates to TransportManager.broadcastTierKeyRequest
+                    // (see FeedViewModel.decrypt/maybeRequestTierKey's own doc
+                    // for when this fires).
+                    broadcastTierKeyRequest = { request ->
+                        container.transportManager.broadcastTierKeyRequest(request)
+                    },
+                    // The other Phase 4 Slice 10 capability: composes
+                    // container.locationProvider into a fresh TierMembershipClaim
+                    // for whatever tier decrypt() is currently missing a key
+                    // for -- the exact same location-read-to-geohash-prefix
+                    // composition PostComposerScreen's own getOriginGeohashPrefix
+                    // lambda already uses, just wrapped in a TierMembershipClaim
+                    // instead of a bare String. Returns null (never throws)
+                    // exactly when no location fix is available right now --
+                    // FeedViewModel treats that as "skip this attempt," logged,
+                    // never surfaced to the user (mesh mechanics stay invisible,
+                    // PRD §5).
+                    buildTierMembershipClaim = { tier ->
+                        val location = container.locationProvider.currentLocation()
+                        location?.let {
+                            TierMembershipClaim(
+                                reachTier = tier,
+                                geohashPrefix = Geohash.encode(
+                                    it.latitude,
+                                    it.longitude,
+                                    ReachTierGeohash.precisionFor(tier),
+                                ),
+                                claimedAtMs = System.currentTimeMillis(),
+                            )
                         }
                     },
                 )
