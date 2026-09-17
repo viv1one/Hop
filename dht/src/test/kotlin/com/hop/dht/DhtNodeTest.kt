@@ -42,9 +42,16 @@ class DhtNodeTest {
             lastSeenAtMs = 0L,
         )
 
-    /** Every DhtNode in these tests binds to loopback -- this is its ownAddress, Slice 5's new required constructor param. */
-    private fun ownAddressFor(socket: DatagramSocket): PeerAddress =
-        PeerAddress.from(InetAddress.getLoopbackAddress(), socket.localPort)
+    /**
+     * Every DhtNode in these tests binds to loopback -- this is its
+     * ownAddresses (a single-entry list; DhtNode's constructor param is a
+     * `List<PeerAddress>` as of Phase 4's IPv6-first/dual-stack slice, to let
+     * a dual-stack device announce more than one address -- see
+     * `dual-stack self-registration round-trips both addresses through a real
+     * FIND_VALUE wire exchange` below for a test that actually exercises two).
+     */
+    private fun ownAddressFor(socket: DatagramSocket): List<PeerAddress> =
+        listOf(PeerAddress.from(InetAddress.getLoopbackAddress(), socket.localPort))
 
     /**
      * [DhtNode.observe] launches the ping-then-evict outcome as a fire-and-
@@ -369,7 +376,7 @@ class DhtNodeTest {
             RoutingTable(aId),
             aTransport,
             scope = CoroutineScope(Job() + Dispatchers.Default),
-            ownAddress = ownAddressFor(aSocket),
+            ownAddresses = ownAddressFor(aSocket),
         )
         aTransport.start()
         try {
@@ -515,6 +522,97 @@ class DhtNodeTest {
 
             assertTrue(result is FindValueResult.NotFound, "no holder anywhere must yield NotFound, not hang, throw, or fabricate a holder")
             assertEquals(listOf(bId), result.closestKnown.map { it.id })
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    // ---- IPv6-first/dual-stack self-registration slice additions ----
+
+    /**
+     * Proves the actual end-to-end path this slice is about -- self-
+     * registration -> real wire gossip -> a receiving peer's decode -- not
+     * just [PeerAddress.encodeList]/[PeerAddress.decodeList] in isolation.
+     *
+     * A is dual-stack: [DhtNode.store]'s self-registration is given both a
+     * real `::1` IPv6 [PeerAddress] and a real loopback IPv4 [PeerAddress].
+     * A genuine dual-stack NIC isn't guaranteed in a CI/test environment, but
+     * a real `::1` loopback address costs nothing to construct and proves
+     * the mechanism more faithfully than a v4/v4-with-a-different-family-byte
+     * fake pair -- neither address needs to be bound or actually dialed here,
+     * since nothing in this test ever connects to them; only
+     * [PeerAddress.decodeList]'s fidelity through the real wire path is under
+     * test.
+     *
+     * B seeds its routing table with A's real, dialable address (the same
+     * [socketContact] helper every other test in this file uses) so that
+     * [DhtNode.findValue] on B -- finding nothing in its own local store --
+     * queries A directly over a real FIND_VALUE_REQUEST/FIND_VALUE_RESPONSE
+     * round trip. This is deliberately a FIND_VALUE round trip, not a
+     * FIND_NODE one: [StoreRequestMessage] carries no address field of its
+     * own (see that message's own doc, and
+     * [DhtUdpTransport.handlePacket]'s STORE_REQUEST case, which always
+     * rebuilds a fresh single-address announcer [Contact] from the packet's
+     * *observed* source instead), so a self-registered multi-address
+     * [Contact] only ever reaches the wire when the self-registering node
+     * answers a FIND_VALUE_REQUEST for a key it holds directly -- never via
+     * STORE_REQUEST propagation to a third node. B's decoded holder
+     * [Contact.address] must round-trip both of A's original addresses, in
+     * the order A registered them.
+     */
+    @Test
+    fun `dual-stack self-registration round-trips both addresses through a real FIND_VALUE wire exchange`() = runBlocking {
+        val aId = chainNodeId(61)
+        val bId = chainNodeId(62)
+        val key = chainNodeId(102)
+
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val ipv6Address = PeerAddress(
+            family = PeerAddress.FAMILY_IPV6,
+            ip = InetAddress.getByName("::1").address,
+            port = 4242,
+        )
+        val ipv4Address = PeerAddress.from(InetAddress.getLoopbackAddress(), 4243)
+        val aOwnAddresses = listOf(ipv6Address, ipv4Address)
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val aNode = DhtNode(RoutingTable(aId), aTransport, scope, aOwnAddresses)
+
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        val bNode = DhtNode(RoutingTable(bId), bTransport, scope, ownAddressFor(bSocket))
+
+        val transports = listOf(aTransport, bTransport)
+        transports.forEach { it.start() }
+        try {
+            // B must know A's real, dialable address up front. A's own
+            // routing table stays empty (it never observes B), so store(key)
+            // below only self-registers locally and never attempts a
+            // STORE_REQUEST to anyone -- findNode(key) against an empty
+            // routing table finds nobody to announce to (same setup already
+            // proven safe by "findValue discovers a holder through the
+            // network..." above, where C's empty routing table plays the
+            // same role).
+            bNode.observe(socketContact(aId, aSocket))
+
+            aNode.store(key)
+
+            val result = bNode.findValue(key)
+
+            assertTrue(
+                result is FindValueResult.Found,
+                "B must discover A directly as the holder via a real FIND_VALUE_REQUEST/RESPONSE round trip",
+            )
+            assertEquals(listOf(aId), result.holders.map { it.id })
+
+            val decodedAddresses = PeerAddress.decodeList(result.holders[0].address)
+            assertEquals(
+                aOwnAddresses,
+                decodedAddresses,
+                "the holder Contact's address, decoded via decodeList, must round-trip both of A's original self-registered addresses in order",
+            )
         } finally {
             transports.forEach { it.stop() }
         }

@@ -146,7 +146,12 @@ class DhtNodeManager(
                 val boundAddress = PeerAddress.from(localBindAddress(), boundSocket.localPort)
                 val routingTable = RoutingTable(ownId = ownId)
                 val dhtTransport = DhtUdpTransport(boundSocket, ownId)
-                val dhtNode = DhtNode(routingTable, dhtTransport, scope, boundAddress)
+                // DhtNode's ownAddresses is a List<PeerAddress> (Phase 4's IPv6-first/
+                // dual-stack slice) -- this device only has one bound address today
+                // (see localBindAddress's own doc: no IPv6/dual-stack address selection
+                // here yet), so wrap it as a single-entry list rather than inventing a
+                // parallel single-address convenience constructor.
+                val dhtNode = DhtNode(routingTable, dhtTransport, scope, listOf(boundAddress))
                 dhtTransport.start()
 
                 socket = boundSocket

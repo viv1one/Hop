@@ -139,7 +139,7 @@ class DhtUdpTransport(
     suspend fun ping(contact: Contact): Boolean {
         val transactionId = TransactionId.random()
         val message = DhtMessage(type = DhtMessageType.PING, transactionId = transactionId, senderId = ownId)
-        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val destination = firstDialableAddress(contact)
         val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return false
         return try {
             DhtMessage.decode(responseBytes).type == DhtMessageType.PONG
@@ -159,7 +159,7 @@ class DhtUdpTransport(
     suspend fun findNode(contact: Contact, targetId: NodeId): List<Contact>? {
         val transactionId = TransactionId.random()
         val message = FindNodeRequestMessage(transactionId = transactionId, senderId = ownId, targetId = targetId)
-        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val destination = firstDialableAddress(contact)
         val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
         return try {
             FindNodeResponseMessage.decode(responseBytes).contacts
@@ -177,7 +177,7 @@ class DhtUdpTransport(
     suspend fun store(contact: Contact, key: NodeId): Boolean {
         val transactionId = TransactionId.random()
         val message = StoreRequestMessage(transactionId = transactionId, senderId = ownId, key = key)
-        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val destination = firstDialableAddress(contact)
         val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return false
         return try {
             DhtMessage.decode(responseBytes).type == DhtMessageType.STORE_RESPONSE
@@ -198,7 +198,7 @@ class DhtUdpTransport(
     suspend fun findValue(contact: Contact, key: NodeId): FindValueOutcome? {
         val transactionId = TransactionId.random()
         val message = FindValueRequestMessage(transactionId = transactionId, senderId = ownId, key = key)
-        val destination = PeerAddress.decode(contact.address).toInetSocketAddress()
+        val destination = firstDialableAddress(contact)
         val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
         return try {
             val response = FindValueResponseMessage.decode(responseBytes)
@@ -210,6 +210,29 @@ class DhtUdpTransport(
         } catch (e: DhtMessageDecodeException) {
             null
         }
+    }
+
+    /**
+     * Resolves the single [InetSocketAddress] [ping]/[findNode]/[store]/
+     * [findValue] each dial [contact] at. `contact.address` may now hold more
+     * than one [PeerAddress] (Phase 4's dual-stack self-registration, see
+     * [Contact]'s own class doc) -- this UDP RPC layer has no per-request
+     * IPv6-first/IPv4-fallback race the way `p2p/`'s `PeerDialer` does for TCP
+     * content connections, so it deliberately just dials the *first* entry
+     * [PeerAddress.decodeList] recovers, rather than throwing the way an
+     * unconditional [PeerAddress.decode] call would on a multi-entry blob.
+     * [PeerAddress.decodeList] still throws [PeerAddressDecodeException] for
+     * genuinely malformed bytes (truncated entry, unknown family byte) or a
+     * zero-address contact -- that's still a genuine local error and still
+     * propagates, matching every one of the four callers' own "only a
+     * genuine local error propagates" doc.
+     */
+    private fun firstDialableAddress(contact: Contact): InetSocketAddress {
+        val addresses = PeerAddress.decodeList(contact.address)
+        if (addresses.isEmpty()) {
+            throw PeerAddressDecodeException("Contact ${contact.id} has no addresses to dial")
+        }
+        return addresses.first().toInetSocketAddress()
     }
 
     /**

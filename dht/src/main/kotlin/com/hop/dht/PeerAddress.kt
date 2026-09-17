@@ -102,5 +102,67 @@ class PeerAddress(val family: Int, val ip: ByteArray, val port: Int) {
             val port = buffer.short.toInt() and 0xFFFF
             return PeerAddress(family, ip, port)
         }
+
+        /**
+         * Concatenates each address's own [encode] output back-to-back, with
+         * no extra per-entry length prefix -- unnecessary since every
+         * [PeerAddress] entry is already self-delimiting: its own leading
+         * family byte determines whether that entry is [MIN_WIRE_SIZE] (7,
+         * IPv4) or `1 + IPV6_SIZE + 2` (19, IPv6) bytes long, so [decodeList]
+         * can always tell where one entry ends and the next begins.
+         *
+         * This is what lets a dual-stack device announce both an IPv6 and an
+         * IPv4 address inside [Contact.address]'s existing opaque,
+         * length-prefixed blob (capped at 255 bytes by [ContactListCodec])
+         * with zero changes to any wire-framing class -- see this module's
+         * Phase 4 IPv6-first slice notes.
+         */
+        fun encodeList(addresses: List<PeerAddress>): ByteArray {
+            if (addresses.isEmpty()) return ByteArray(0)
+            val buffer = ByteBuffer.allocate(addresses.sumOf { 1 + it.ip.size + 2 })
+            for (address in addresses) {
+                buffer.put(address.encode())
+            }
+            return buffer.array()
+        }
+
+        /**
+         * Inverse of [encodeList]: repeatedly peeks the family byte at the
+         * current cursor position to determine that entry's total length
+         * ([MIN_WIRE_SIZE] for IPv4, `1 + IPV6_SIZE + 2` for IPv6), decodes
+         * exactly that many bytes via [decode], and advances the cursor --
+         * until the input is exhausted.
+         *
+         * An empty [bytes] decodes to an empty list -- whether a zero-address
+         * [Contact] is meaningful is a caller policy question, not this
+         * function's. Throws [PeerAddressDecodeException] on an unknown
+         * family byte encountered mid-list, or a final entry that's
+         * truncated (declares a family whose full entry doesn't fit in the
+         * bytes remaining) -- the same rejection posture as [decode] itself,
+         * just applied once per entry instead of once for the whole input.
+         */
+        fun decodeList(bytes: ByteArray): List<PeerAddress> {
+            val addresses = ArrayList<PeerAddress>()
+            var cursor = 0
+            while (cursor < bytes.size) {
+                val family = bytes[cursor].toInt() and 0xFF
+                val ipSize = when (family) {
+                    FAMILY_IPV4 -> IPV4_SIZE
+                    FAMILY_IPV6 -> IPV6_SIZE
+                    else -> throw PeerAddressDecodeException(
+                        "Unknown PeerAddress family in list at offset $cursor: $family"
+                    )
+                }
+                val entrySize = 1 + ipSize + 2
+                if (cursor + entrySize > bytes.size) {
+                    throw PeerAddressDecodeException(
+                        "Truncated PeerAddress list entry at offset $cursor: family $family needs $entrySize bytes, only ${bytes.size - cursor} remain"
+                    )
+                }
+                addresses.add(decode(bytes.copyOfRange(cursor, cursor + entrySize)))
+                cursor += entrySize
+            }
+            return addresses
+        }
     }
 }

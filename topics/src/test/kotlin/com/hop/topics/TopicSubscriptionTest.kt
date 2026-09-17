@@ -43,6 +43,15 @@ class TopicSubscriptionTest {
     private fun ownAddressFor(socket: DatagramSocket): PeerAddress =
         PeerAddress.from(InetAddress.getLoopbackAddress(), socket.localPort)
 
+    /**
+     * DhtNode's `ownAddresses` constructor param is a `List<PeerAddress>` as
+     * of Phase 4's IPv6-first/dual-stack slice -- every DhtNode built in this
+     * file has exactly one bound address, so this just wraps [ownAddressFor]
+     * rather than inventing a parallel single-address convenience
+     * constructor on DhtNode itself.
+     */
+    private fun ownAddressesFor(socket: DatagramSocket): List<PeerAddress> = listOf(ownAddressFor(socket))
+
     private fun contactFor(id: NodeId, socket: DatagramSocket): Contact =
         Contact(id = id, address = ownAddressFor(socket).encode(), lastSeenAtMs = 0L)
 
@@ -91,13 +100,13 @@ class TopicSubscriptionTest {
         val scope = CoroutineScope(Job() + Dispatchers.Default)
 
         val publisherTransport = DhtUdpTransport(publisherSocket, publisherId, onMessageObserved = {})
-        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressFor(publisherSocket))
+        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressesFor(publisherSocket))
 
         val relayTransport = DhtUdpTransport(relaySocket, relayId, onMessageObserved = {})
-        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressFor(relaySocket)) // init block wires relay's callbacks
+        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressesFor(relaySocket)) // init block wires relay's callbacks
 
         val browserTransport = DhtUdpTransport(browserSocket, browserId, onMessageObserved = {})
-        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressFor(browserSocket))
+        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressesFor(browserSocket))
 
         val transports = listOf(publisherTransport, relayTransport, browserTransport)
         transports.forEach { it.start() }
@@ -145,13 +154,13 @@ class TopicSubscriptionTest {
         val scope = CoroutineScope(Job() + Dispatchers.Default)
 
         val publisherTransport = DhtUdpTransport(publisherSocket, publisherId, onMessageObserved = {})
-        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressFor(publisherSocket))
+        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressesFor(publisherSocket))
 
         val relayTransport = DhtUdpTransport(relaySocket, relayId, onMessageObserved = {})
-        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressFor(relaySocket))
+        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressesFor(relaySocket))
 
         val browserTransport = DhtUdpTransport(browserSocket, browserId, onMessageObserved = {})
-        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressFor(browserSocket))
+        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressesFor(browserSocket))
 
         val transports = listOf(publisherTransport, relayTransport, browserTransport)
         transports.forEach { it.start() }
@@ -191,13 +200,13 @@ class TopicSubscriptionTest {
         val scope = CoroutineScope(Job() + Dispatchers.Default)
 
         val publisherTransport = DhtUdpTransport(publisherSocket, publisherId, onMessageObserved = {})
-        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressFor(publisherSocket))
+        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressesFor(publisherSocket))
 
         val relayTransport = DhtUdpTransport(relaySocket, relayId, onMessageObserved = {})
-        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressFor(relaySocket))
+        DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressesFor(relaySocket))
 
         val browserTransport = DhtUdpTransport(browserSocket, browserId, onMessageObserved = {})
-        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressFor(browserSocket))
+        val browserNode = DhtNode(RoutingTable(browserId), browserTransport, scope, ownAddressesFor(browserSocket))
 
         val transports = listOf(publisherTransport, relayTransport, browserTransport)
         transports.forEach { it.start() }
@@ -232,10 +241,10 @@ class TopicSubscriptionTest {
         val scope = CoroutineScope(Job() + Dispatchers.Default)
 
         val publisherTransport = DhtUdpTransport(publisherSocket, publisherId, onMessageObserved = {})
-        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressFor(publisherSocket))
+        val publisherNode = DhtNode(RoutingTable(publisherId), publisherTransport, scope, ownAddressesFor(publisherSocket))
 
         val relayTransport = DhtUdpTransport(relaySocket, relayId, onMessageObserved = {})
-        val relayNode = DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressFor(relaySocket))
+        val relayNode = DhtNode(RoutingTable(relayId), relayTransport, scope, ownAddressesFor(relaySocket))
 
         val transports = listOf(publisherTransport, relayTransport)
         transports.forEach { it.start() }

@@ -72,6 +72,50 @@ class DhtUdpTransportTest {
         }
     }
 
+    /**
+     * Regression test for the multi-address dial crash flagged when
+     * [Contact.address] widened to potentially hold more than one
+     * [PeerAddress] (Phase 4's dual-stack self-registration, see [Contact]'s
+     * own class doc): before this class's dial functions switched to
+     * [firstDialableAddress]/[PeerAddress.decodeList], an unconditional
+     * [PeerAddress.decode] call on a multi-entry `address` blob would throw
+     * [PeerAddressDecodeException] uncaught, contradicting every one of
+     * [ping]/[findNode]/[store]/[findValue]'s own "never throws except on a
+     * genuine local error" doc for what is, in fact, a perfectly legitimate
+     * [Contact] this same codebase now constructs.
+     */
+    @Test
+    fun `ping to a Contact whose address carries two PeerAddress entries dials the first one without throwing`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId)
+        val bTransport = DhtUdpTransport(bSocket, bId)
+        aTransport.start()
+        bTransport.start()
+        try {
+            // b's real dialable loopback address first, then a second,
+            // deliberately unreachable one -- proving the first entry is what
+            // actually gets dialed, not that any decode failure was merely
+            // swallowed into a false/timeout result.
+            val unreachablePort = bSocket.localPort.let { if (it == 1) 2 else it - 1 }
+            val multiAddress = PeerAddress.encodeList(
+                listOf(
+                    PeerAddress.from(InetAddress.getLoopbackAddress(), bSocket.localPort),
+                    PeerAddress.from(InetAddress.getLoopbackAddress(), unreachablePort),
+                ),
+            )
+            val dualStackContact = Contact(id = bId, address = multiAddress, lastSeenAtMs = 0L)
+
+            val result = aTransport.ping(dualStackContact)
+            assertTrue(result, "ping must dial the first (real) address in a multi-address Contact and succeed")
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
     @Test
     fun `ping to a closed, non-listening port times out within the injected requestTimeoutMs`() = runBlocking {
         val aId = nodeId(1)

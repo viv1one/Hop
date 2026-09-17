@@ -30,27 +30,34 @@ import kotlinx.coroutines.selects.select
  * completed by the injected `queryFn`, then explicitly cancelling the
  * lookup's own coroutine) rather than by changing [IterativeLookup] itself --
  * see that class's own doc and [findValue]'s doc below for why. This slice
- * also introduces [ownAddress]: nothing before it needed to describe this
+ * also introduces [ownAddresses]: nothing before it needed to describe this
  * device's own reachable address, since [observe] always derives a contact's
  * address from the *observed* UDP source, never self-reported -- [store]'s
  * unconditional self-registration (see [DhtStore.registerSelf]) is the first
  * thing that needs to build a [Contact] bearing this device's own id.
+ *
+ * Phase 4's IPv6-first/dual-stack slice widens this from a single [PeerAddress]
+ * to a list: a dual-stack device reachable at both an IPv6 and an IPv4 address
+ * now has a real way to announce both, via [PeerAddress.encodeList] --
+ * [PeerAddress.decodeList] recovers them on the receiving side. See [Contact]'s
+ * own class doc for why this needed zero changes to any wire-framing class.
  */
 class DhtNode(
     val routingTable: RoutingTable,
     private val transport: DhtUdpTransport,
     private val scope: CoroutineScope,
     /**
-     * This device's own reachable address, used only to build the
-     * self-holder [Contact] for [store]'s unconditional self-registration
-     * (Slice 5). Explicitly NOT a NAT/external-address-discovery solution --
-     * just wiring the field through so [store] has something to construct a
-     * self [Contact] from. Real internet-mode deployment (NAT traversal,
-     * IPv6-first connections) is later, unbuilt work; until then this is
-     * whatever address this device is actually reachable at on its local
-     * network (loopback + bound port in every test here).
+     * This device's own reachable address(es), used only to build the
+     * self-holder [Contact] for [store]'s unconditional self-registration.
+     * One entry for a single-stack device, two for a dual-stack device
+     * announcing both an IPv6 and an IPv4 address. Explicitly NOT a
+     * NAT/external-address-discovery solution -- just wiring the field
+     * through so [store] has something to construct a self [Contact] from.
+     * Real internet-mode NAT traversal is later, unbuilt work; until then
+     * these are whatever address(es) this device is actually reachable at on
+     * its local network (loopback + bound port in every test here).
      */
-    private val ownAddress: PeerAddress,
+    private val ownAddresses: List<PeerAddress>,
     private val store: DhtStore = DhtStore(),
 ) {
     init {
@@ -179,7 +186,7 @@ class DhtNode(
      *    peers, then a real [DhtUdpTransport.store] STORE_REQUEST to each.
      */
     suspend fun store(key: NodeId) {
-        val self = Contact(id = routingTable.ownId, address = ownAddress.encode(), lastSeenAtMs = System.currentTimeMillis())
+        val self = Contact(id = routingTable.ownId, address = PeerAddress.encodeList(ownAddresses), lastSeenAtMs = System.currentTimeMillis())
         store.registerSelf(key, self)
 
         val closestKnown = findNode(key)

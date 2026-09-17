@@ -3,11 +3,17 @@ package com.hop.dht
 /**
  * A known peer in the routing table.
  *
- * [address] follows the same convention as [BundleQueueEntity.encodedEnvelope] /
- * [PendingMessageEntity.encodedEnvelope]: an opaque [ByteArray] placeholder for a
- * concrete type this slice doesn't decide. This slice never inspects, parses, or
- * connects to [address] -- its structure (IP:port, or whatever the network-
- * transport slice settles on) is owned entirely by that future slice.
+ * [address] is a wire-opaque [ByteArray] as far as [Contact]/[RoutingTable]/
+ * [KBucket]/every wire-framing class in this module ([ContactListCodec],
+ * [FindNodeResponseMessage], [StoreRequestMessage]/[StoreResponseMessage],
+ * [FindValueResponseMessage]) is concerned -- none of them ever inspect what's
+ * *inside* it, they only carry it as a length-prefixed blob. Decoding it is
+ * entirely a consumer choice: [PeerAddress.decode] for exactly one address, or
+ * [PeerAddress.decodeList]/[PeerAddress.encodeList] for one or more -- e.g. a
+ * dual-stack device self-announcing both an IPv6 and an IPv4 [PeerAddress]
+ * (Phase 4's IPv6-first goal) inside this same opaque blob, no wire-format
+ * change required. See [DhtNode]'s `ownAddresses` constructor param for where
+ * that self-announcement is built.
  */
 data class Contact(
     val id: NodeId,
