@@ -55,6 +55,29 @@ class PeerChannel(private val socket: Socket) : Closeable {
     }
 
     /**
+     * Writes [bytes] as-is and flushes — a small additive sibling to
+     * [sendEnvelope] for a caller that already holds an already-
+     * [WireEnvelope.encode]d blob (e.g. one of `mobile/android/`'s
+     * `*Repository.buildOutgoingBacklog()`/`buildOutgoingFlagBacklog()`
+     * results) and would otherwise have to decode it back into a
+     * [WireEnvelope] purely to hand it to [sendEnvelope], which would
+     * immediately re-encode it right back into the same bytes. Matches
+     * `com.hop.transport.WifiDirectTransport.PeerConnection.trySend`'s own
+     * "already self-framing, no additional outer length prefix" posture —
+     * [bytes] is expected to already be one complete, self-framed
+     * [WireEnvelope.encode] output (or a concatenation of several), same as
+     * that method's own parameter.
+     *
+     * Does not change or duplicate [sendEnvelope]'s existing behavior or
+     * signature — purely additive, so every existing caller/test of
+     * [sendEnvelope] keeps working unchanged.
+     */
+    fun sendRawBytes(bytes: ByteArray) {
+        output.write(bytes)
+        output.flush()
+    }
+
+    /**
      * Blocks until one full [WireEnvelope] has arrived, then decodes it via
      * [WireEnvelope.decode] — reads exactly [WireEnvelope.HEADER_SIZE]
      * header bytes first (enough to know the declared payload length per

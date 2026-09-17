@@ -14,11 +14,20 @@ import com.hop.data.RelayQueueEntity
 import com.hop.dht.Contact
 import com.hop.dht.NodeId
 import com.hop.dht.PeerAddress
+import com.hop.p2p.PeerChannel
+import com.hop.protocol.ContentType
+import com.hop.protocol.EncryptedFrameCodec
+import com.hop.protocol.Frame
+import com.hop.protocol.MessageCiphertextEnvelope
+import com.hop.protocol.PreKeyBundleEnvelope
+import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
+import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -28,6 +37,7 @@ import org.junit.rules.TemporaryFolder
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -49,22 +59,108 @@ class InternetPeerConnectionManagerTest {
     @get:Rule
     val tempFolder = TemporaryFolder()
 
-    private fun newManager(): InternetPeerConnectionManager = InternetPeerConnectionManager(
+    /**
+     * [relayQueueDao] defaults to a fresh fake but can be shared with a
+     * caller-supplied [DontRelayRepository]-backing instance -- mirroring
+     * [com.hop.app.AppContainer]'s own production wiring, where
+     * `relayRepository`/`dontRelayRepository` share one real
+     * `RelayQueueDao` -- so a test seeding one repository's queue can assert
+     * against the manager's actual combined backlog output.
+     */
+    private fun newManager(
+        relayQueueDao: RelayQueueDao = FakeRelayQueueDao(),
+        dontRelayFlagDao: DontRelayFlagDao = FakeDontRelayFlagDao(),
+        pendingMessageDao: PendingMessageDao = FakePendingMessageDao(),
+        bundleQueueDao: BundleQueueDao = FakeBundleQueueDao(),
+        onLog: (String) -> Unit = {},
+    ): InternetPeerConnectionManager = InternetPeerConnectionManager(
         postRepository = PostRepository(FakePostDao(), DecayKeyStore()),
         decayKeyStore = DecayKeyStore(),
+        relayRepository = RelayRepository(relayQueueDao, RelayPolicy()),
         dontRelayRepository = DontRelayRepository(
-            flagDao = FakeDontRelayFlagDao(),
-            relayQueueDao = FakeRelayQueueDao(),
+            flagDao = dontRelayFlagDao,
+            relayQueueDao = relayQueueDao,
             relayPolicy = RelayPolicy(),
         ),
         pendingMessageRepository = PendingMessageRepository(
-            dao = FakePendingMessageDao(),
+            dao = pendingMessageDao,
             relayPolicy = RelayPolicy(),
         ),
-        bundleRepository = BundleRepository(dao = FakeBundleQueueDao(), relayPolicy = RelayPolicy()),
+        bundleRepository = BundleRepository(dao = bundleQueueDao, relayPolicy = RelayPolicy()),
         getOwnPeerId = { "me" },
         postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
+        onLog = onLog,
     )
+
+    /** One valid, relay-eligible [RelayQueueEntity] row -- same [Frame] shape [InternetPeerConnectionTest]'s own `encodedFrame` helper builds. */
+    private fun freshRelayQueueRow(tag: String): RelayQueueEntity {
+        val plaintext = "post bytes for $tag".toByteArray()
+        val clipHash = MessageDigest.getInstance("SHA-256").digest(plaintext)
+        val encoded = EncryptedFrameCodec.encode(
+            plaintext = plaintext,
+            clipHash = clipHash,
+            senderDeviceId = ByteArray(Frame.SENDER_DEVICE_ID_SIZE) { it.toByte() },
+            contentType = ContentType.PHOTO,
+            hopCount = 0,
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+            reachTier = ReachTier.LOCALITY,
+            dontRelay = false,
+            originGeohashPrefix = "",
+        ).encoded
+        val clipHashHex = clipHash.joinToString(separator = "") { "%02x".format(it) }
+        return RelayQueueEntity(
+            clipHash = clipHashHex,
+            encodedFrame = encoded,
+            hopCount = 0,
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+            dontRelay = false,
+            receivedAtMs = System.currentTimeMillis(),
+        )
+    }
+
+    private fun freshDontRelayFlagRow(tag: String): DontRelayFlagEntity = DontRelayFlagEntity(
+        clipHash = MessageDigest.getInstance("SHA-256").digest(tag.toByteArray()).joinToString(separator = "") { "%02x".format(it) },
+        attestedDeviceKey = MessageDigest.getInstance("SHA-256").digest("$tag-device".toByteArray()).joinToString(separator = "") { "%02x".format(it) },
+        flaggedAtMs = System.currentTimeMillis(),
+        originatedAtMs = System.currentTimeMillis(),
+        ttlSeconds = 3600L,
+    )
+
+    private fun freshPendingMessageRow(tag: String): PendingMessageEntity {
+        val envelope = MessageCiphertextEnvelope(
+            senderPeerId = "sender-$tag",
+            recipientPeerId = "recipient-$tag",
+            hopCount = 0,
+            originatedAtMs = System.currentTimeMillis(),
+            ciphertext = "ciphertext-$tag".toByteArray(),
+        )
+        return PendingMessageEntity(
+            ciphertextHash = MessageDigest.getInstance("SHA-256").digest(envelope.ciphertext).joinToString(separator = "") { "%02x".format(it) },
+            recipientPeerId = envelope.recipientPeerId,
+            encodedEnvelope = envelope.encode(),
+            hopCount = envelope.hopCount,
+            originatedAtMs = envelope.originatedAtMs,
+            receivedAtMs = System.currentTimeMillis(),
+        )
+    }
+
+    private fun freshBundleQueueRow(tag: String): BundleQueueEntity {
+        val envelope = PreKeyBundleEnvelope(
+            peerId = "peer-$tag",
+            hopCount = 0,
+            originatedAtMs = System.currentTimeMillis(),
+            bundleBytes = "bundle-$tag".toByteArray(),
+        )
+        return BundleQueueEntity(
+            peerId = envelope.peerId,
+            encodedEnvelope = envelope.encode(),
+            hopCount = envelope.hopCount,
+            originatedAtMs = envelope.originatedAtMs,
+            receivedAtMs = System.currentTimeMillis(),
+        )
+    }
 
     private fun nodeId(seed: Int): NodeId = NodeId(ByteArray(NodeId.SIZE_BYTES) { (it + seed).toByte() })
 
@@ -152,16 +248,7 @@ class InternetPeerConnectionManagerTest {
         val deadContact = loopbackContact(nodeId(0), deadPort)
         val liveContact = loopbackContact(nodeId(1), liveListener.port)
         val logs = mutableListOf<String>()
-        val manager = InternetPeerConnectionManager(
-            postRepository = PostRepository(FakePostDao(), DecayKeyStore()),
-            decayKeyStore = DecayKeyStore(),
-            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
-            pendingMessageRepository = PendingMessageRepository(FakePendingMessageDao(), RelayPolicy()),
-            bundleRepository = BundleRepository(FakeBundleQueueDao(), RelayPolicy()),
-            getOwnPeerId = { "me" },
-            postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
-            onLog = { message -> logs.add(message) },
-        )
+        val manager = newManager(onLog = { message -> synchronized(logs) { logs.add(message) } })
 
         // Must not throw -- a failed dial is caught internally.
         manager.connectToDiscoveredHolders(listOf(deadContact, liveContact))
@@ -199,6 +286,141 @@ class InternetPeerConnectionManagerTest {
             }
         }
         assertTrue(reconnected, "once the registry entry for a closed connection is removed, a later call must be able to dial that contact again")
+    }
+
+    @Test
+    fun `a newly-connected internet peer receives the full backlog, one entry from each of the four repositories`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val dontRelayFlagDao = FakeDontRelayFlagDao()
+        val pendingMessageDao = FakePendingMessageDao()
+        val bundleQueueDao = FakeBundleQueueDao()
+        relayQueueDao.insert(freshRelayQueueRow("post"))
+        dontRelayFlagDao.insert(freshDontRelayFlagRow("flag"))
+        pendingMessageDao.insert(freshPendingMessageRow("message"))
+        bundleQueueDao.insertOrReplace(freshBundleQueueRow("bundle"))
+
+        val manager = newManager(
+            relayQueueDao = relayQueueDao,
+            dontRelayFlagDao = dontRelayFlagDao,
+            pendingMessageDao = pendingMessageDao,
+            bundleQueueDao = bundleQueueDao,
+        )
+        val listener = LoopbackListener()
+        val contact = loopbackContact(nodeId(0), listener.port)
+
+        manager.connectToDiscoveredHolders(listOf(contact))
+        val serverSideSocket = listener.accepted.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(serverSideSocket != null, "dial must succeed")
+        serverSideSocket!!.soTimeout = 3_000
+
+        val serverChannel = PeerChannel(serverSideSocket)
+        val receivedTypes = mutableSetOf<WirePayloadType>()
+        repeat(4) {
+            receivedTypes.add(serverChannel.receiveEnvelope().type)
+        }
+
+        assertEquals(
+            setOf(
+                WirePayloadType.POST_FRAME,
+                WirePayloadType.DONT_RELAY_FLAG,
+                WirePayloadType.MESSAGE_CIPHERTEXT,
+                WirePayloadType.PREKEY_BUNDLE,
+            ),
+            receivedTypes,
+            "the backlog must carry one entry from each of the four repositories, correctly decodable by type",
+        )
+    }
+
+    @Test
+    fun `an empty backlog sends nothing and does not error`() = runBlocking {
+        val manager = newManager()
+        val listener = LoopbackListener()
+        val contact = loopbackContact(nodeId(0), listener.port)
+
+        manager.connectToDiscoveredHolders(listOf(contact))
+        val serverSideSocket = listener.accepted.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(serverSideSocket != null, "dial must succeed")
+
+        // Nothing was queued in any of the four repositories, so nothing
+        // should ever arrive on this connection -- a short bounded wait for
+        // any byte is enough to distinguish "sent nothing" from "sent
+        // something," without hanging the test indefinitely.
+        serverSideSocket!!.soTimeout = 500
+        val threw = try {
+            serverSideSocket.getInputStream().read()
+            false
+        } catch (e: java.net.SocketTimeoutException) {
+            true
+        }
+        assertTrue(threw, "an empty backlog must send nothing at all -- no bytes should ever arrive")
+    }
+
+    @Test
+    fun `a send failure partway through one contact's backlog is logged, not thrown, and does not crash the connect loop for a different contact`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        // Multiple queued posts so the backlog send loop has more than one
+        // write to attempt -- increases the odds an abortive remote close is
+        // actually observed mid-stream rather than only on the very first
+        // (possibly kernel-buffered) write.
+        relayQueueDao.insert(freshRelayQueueRow("post-1"))
+        relayQueueDao.insert(freshRelayQueueRow("post-2"))
+        relayQueueDao.insert(freshRelayQueueRow("post-3"))
+
+        val logs = mutableListOf<String>()
+        val manager = newManager(relayQueueDao = relayQueueDao, onLog = { message -> synchronized(logs) { logs.add(message) } })
+
+        val abortiveListener = AbortiveCloseListener()
+        val liveListener = LoopbackListener()
+        val abortiveContact = loopbackContact(nodeId(0), abortiveListener.port)
+        val liveContact = loopbackContact(nodeId(1), liveListener.port)
+
+        // Must not throw, and must not prevent the second (live) contact in
+        // the same call from being dialed and receiving its own backlog.
+        manager.connectToDiscoveredHolders(listOf(abortiveContact, liveContact))
+
+        val liveServerSideSocket = liveListener.accepted.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(liveServerSideSocket != null, "the live contact must still have been dialed and connected despite the other connection's backlog send failing")
+        liveServerSideSocket!!.soTimeout = 3_000
+        val liveServerChannel = PeerChannel(liveServerSideSocket)
+        // The live contact must receive its own full (unrelated, independently-registered) backlog --
+        // but this test only seeded relayQueueDao, shared across both manager instances' repositories,
+        // so the live contact's connection also offers the same 3 queued posts.
+        repeat(3) {
+            assertEquals(WirePayloadType.POST_FRAME, liveServerChannel.receiveEnvelope().type)
+        }
+
+        // Poll briefly for the send-error log line -- it's written from the
+        // abortive contact's own dedicated "hop-internet-send" thread,
+        // concurrently with everything above.
+        var sawSendErrorLog = false
+        repeat(20) {
+            if (synchronized(logs) { logs.any { it.contains("Send error", ignoreCase = true) } }) {
+                sawSendErrorLog = true
+                return@repeat
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(sawSendErrorLog, "a mid-backlog send failure must be logged, not thrown: $logs")
+    }
+
+    /** A real loopback [ServerSocket] that abortively closes (RST, via `SO_LINGER(true, 0)`) every connection it accepts, immediately, without reading anything -- deterministically forces a write failure on the other end. */
+    private class AbortiveCloseListener {
+        private val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        val port: Int get() = serverSocket.localPort
+        init {
+            Thread({
+                try {
+                    while (true) {
+                        val socket = serverSocket.accept()
+                        socket.setSoLinger(true, 0)
+                        socket.close()
+                    }
+                } catch (e: Exception) {
+                    // Expected once serverSocket.close() runs -- ends this loop.
+                }
+            }, "abortive-close-listener").apply { isDaemon = true; start() }
+        }
+        fun close() = serverSocket.close()
     }
 
     // -- Minimal hand-rolled fakes, matching InternetPeerConnectionTest's own established pattern. --

@@ -263,10 +263,16 @@ class AppContainer(applicationContext: Context) {
      * private `File(appContext.filesDir, "posts")` construction exactly --
      * both write into the same on-disk posts directory, since both are
      * ultimately writing through the same [postRepository]/[ReceivedFrameStore][com.hop.transport.ReceivedFrameStore].
+     * [relayRepository] is the same singleton instance
+     * [transportManager] above already uses for its own WiFi Direct
+     * connect-time backlog -- not a second instance -- so a post queued for
+     * relay is offered to a newly-dialed internet peer exactly once it's
+     * eligible, from the one persisted queue both transports share.
      */
     val internetPeerConnectionManager: InternetPeerConnectionManager = InternetPeerConnectionManager(
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
         dontRelayRepository = dontRelayRepository,
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,

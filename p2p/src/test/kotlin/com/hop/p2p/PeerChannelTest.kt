@@ -96,6 +96,60 @@ class PeerChannelTest {
     }
 
     @Test
+    fun `sendRawBytes round trips correctly against WireEnvelope decode on the receiving side`() {
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val server = ServerSocket(0, 50, loopback)
+        try {
+            val client = Socket()
+            client.connect(java.net.InetSocketAddress(loopback, server.localPort), 2_000)
+            val accepted = server.accept()
+
+            val clientChannel = PeerChannel(client)
+            val serverChannel = PeerChannel(accepted)
+
+            // Simulates a caller (e.g. mobile/android's *Repository.buildOutgoingBacklog())
+            // that already has a fully WireEnvelope.encode()'d blob in hand and
+            // just wants it written to the socket as-is, with no re-encode step.
+            val sent = WireEnvelope(WirePayloadType.POST_FRAME, byteArrayOf(10, 20, 30))
+            clientChannel.sendRawBytes(sent.encode())
+            val received = serverChannel.receiveEnvelope()
+
+            assertEquals(sent, received)
+
+            clientChannel.close()
+            serverChannel.close()
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `sendRawBytes can carry more than one concatenated envelope in a single call, same as sendEnvelope called twice`() {
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val server = ServerSocket(0, 50, loopback)
+        try {
+            val client = Socket()
+            client.connect(java.net.InetSocketAddress(loopback, server.localPort), 2_000)
+            val accepted = server.accept()
+
+            val clientChannel = PeerChannel(client)
+            val serverChannel = PeerChannel(accepted)
+
+            val first = WireEnvelope(WirePayloadType.DONT_RELAY_FLAG, byteArrayOf(1))
+            val second = WireEnvelope(WirePayloadType.PREKEY_BUNDLE, byteArrayOf(2, 3))
+            clientChannel.sendRawBytes(first.encode() + second.encode())
+
+            assertEquals(first, serverChannel.receiveEnvelope())
+            assertEquals(second, serverChannel.receiveEnvelope())
+
+            clientChannel.close()
+            serverChannel.close()
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
     fun `receiveEnvelope throws EOFException once the peer closes the connection`() {
         val loopback = InetAddress.getByName("127.0.0.1")
         val server = ServerSocket(0, 50, loopback)

@@ -10,8 +10,10 @@ import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -65,9 +67,24 @@ import java.util.concurrent.ConcurrentHashMap
  * reason -- a dead connection never permanently occupies a slot under the
  * cap.
  *
+ * **Connect-time backlog offer:** every newly-established connection gets
+ * this device's queued outgoing content offered to it once, unconditionally
+ * -- the same four backlogs [com.hop.transport.WifiDirectTransport
+ * .registerConnectionAndGetBacklog] already builds and offers a newly-
+ * connected WiFi Direct peer: [relayRepository]'s queued posts,
+ * [dontRelayRepository]'s "don't relay" flags, [pendingMessageRepository]'s
+ * pending 1:1 messages, and [bundleRepository]'s prekey bundles, in that
+ * order, each already [com.hop.protocol.WireEnvelope.encode]d and ready to
+ * write straight to the socket. See [sendBacklog]'s own doc for why this
+ * happens on its own dedicated thread rather than inline in
+ * [connectToDiscoveredHolders].
+ *
  * **Explicitly out of scope here (see [InternetPeerConnection]'s own doc for
- * the same boundary at its layer):** internet-mode relay-flood fanout,
- * retry/backoff for a failed dial, NAT hole-punching, volunteer relay-node
+ * the same boundary at its layer):** internet-mode relay-flood fanout (i.e.
+ * pushing a *freshly-received* post/message/bundle/flag onward to *other*
+ * already-open internet connections -- the connect-time backlog offer above
+ * is a one-shot catch-up on already-queued content, not live fanout), retry/
+ * backoff for a failed dial, NAT hole-punching, volunteer relay-node
  * fallback, and any UI surfacing of connection count
  * ([FeedViewModel.discoveredRemoteHolders] was deliberately left unrendered
  * for its own product/UX reason -- this class doesn't invent a new rendering
@@ -76,9 +93,10 @@ import java.util.concurrent.ConcurrentHashMap
 class InternetPeerConnectionManager(
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
-    dontRelayRepository: DontRelayRepository,
-    pendingMessageRepository: PendingMessageRepository,
-    bundleRepository: BundleRepository,
+    private val relayRepository: RelayRepository,
+    private val dontRelayRepository: DontRelayRepository,
+    private val pendingMessageRepository: PendingMessageRepository,
+    private val bundleRepository: BundleRepository,
     getOwnPeerId: suspend () -> String,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
@@ -143,10 +161,53 @@ class InternetPeerConnectionManager(
                     onLog("Internet connection closed; removed from the connection registry")
                 }
                 connections[contact.id] = channel
+                Thread({ sendBacklog(channel) }, "hop-internet-send").start()
             } catch (e: PeerDialException) {
                 onLog("Failed to dial a discovered internet peer: ${e.message}")
             } catch (e: PeerAddressDecodeException) {
                 onLog("Failed to decode a discovered internet peer's address: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Builds the same four backlogs
+     * [com.hop.transport.WifiDirectTransport.registerConnectionAndGetBacklog]
+     * builds for a newly-connected WiFi Direct peer --
+     * [relayRepository]'s queued posts, [dontRelayRepository]'s "don't
+     * relay" flags, [pendingMessageRepository]'s pending 1:1 messages, and
+     * [bundleRepository]'s prekey bundles, each already
+     * [com.hop.protocol.WireEnvelope.encode]d -- and streams each entry out
+     * over [channel] via [PeerChannel.sendRawBytes], in that order.
+     *
+     * Runs entirely on its own dedicated thread (`"hop-internet-send"`,
+     * started by the caller) so building/sending this backlog -- which does
+     * real Room I/O via `runBlocking` in each `buildOutgoing*Backlog()` call,
+     * then a blocking socket write per entry -- never blocks
+     * [connectToDiscoveredHolders]'s own dial loop for the *next* contact in
+     * the same call, mirroring
+     * [com.hop.transport.WifiDirectTransport.handleConnection]'s own
+     * dedicated-`"hop-send"`-thread posture exactly.
+     *
+     * A send failure partway through (e.g. the peer closes mid-stream) is
+     * logged and stops this backlog's own send loop -- it never throws out
+     * of this method, so it can never crash the thread it's running on, let
+     * alone the dial loop for a different contact.
+     */
+    private fun sendBacklog(channel: PeerChannel) {
+        val backlog = runBlocking(ioDispatcher) {
+            relayRepository.buildOutgoingBacklog() +
+                dontRelayRepository.buildOutgoingFlagBacklog() +
+                pendingMessageRepository.buildOutgoingBacklog() +
+                bundleRepository.buildOutgoingBacklog()
+        }
+        onLog("Sending ${backlog.size} queued item(s) to a newly connected internet peer")
+        for (entry in backlog) {
+            try {
+                channel.sendRawBytes(entry)
+            } catch (e: Exception) {
+                onLog("Send error while flushing the backlog to a connected internet peer: ${e.message}")
+                break
             }
         }
     }
