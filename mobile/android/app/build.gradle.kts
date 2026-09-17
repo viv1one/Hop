@@ -164,6 +164,13 @@ dependencies {
     // other project-to-project dependency in this build).
     implementation(project(":dht"))
     implementation(project(":topics"))
+    // Phase 4 internet-mode direct-peer-connection slice
+    // (com.hop.transport.InternetPeerConnection): PeerDialer (dial a
+    // dht.Contact's decoded PeerAddress candidates) and PeerChannel (send/
+    // receive WireEnvelope-framed bytes over the resulting socket). See
+    // p2p/build.gradle.kts for why this small bridge module exists instead
+    // of either endpoint depending on the other.
+    implementation(project(":p2p"))
     // Location read for Town/City/Country-tier DHT topic-subscription
     // (com.hop.app.location.FusedLocationProvider) -- gated on the same
     // ACCESS_FINE_LOCATION/ACCESS_COARSE_LOCATION grant already requested for
