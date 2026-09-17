@@ -385,4 +385,106 @@ class DhtUdpTransportTest {
             bTransport.stop()
         }
     }
+
+    // ---- Phase 4 additions: ADDRESS_REFLECTION (NAT hole-punching step 1) ----
+
+    @Test
+    fun `reflectOwnAddress returns the requester's own loopback address, as genuinely observed by the responder`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        aTransport.start()
+        bTransport.start()
+        try {
+            val reflected = aTransport.reflectOwnAddress(contactFor(bSocket, bId))
+            requireNotNull(reflected) { "a live responder must answer with a reflected address, not null" }
+
+            // The real assertion: this is genuinely the OBSERVED address b's own
+            // socket saw the request arrive from -- a's actual bound loopback
+            // port -- not a value a itself supplied anywhere (there is no such
+            // field in AddressReflectionRequestMessage for a to inject one).
+            assertEquals(
+                PeerAddress.from(InetAddress.getLoopbackAddress(), aSocket.localPort),
+                reflected,
+                "reflectOwnAddress must return exactly what the responder observed as the request's source address",
+            )
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `reflectOwnAddress to a closed, non-listening port times out cleanly, returning null`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 200)
+        aTransport.start()
+        try {
+            val deadSocket = loopbackSocket()
+            val deadPort = deadSocket.localPort
+            deadSocket.close()
+            val deadContact = Contact(
+                id = nodeId(99),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), deadPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+
+            val startedAtMs = System.currentTimeMillis()
+            val result = aTransport.reflectOwnAddress(deadContact)
+            val elapsedMs = System.currentTimeMillis() - startedAtMs
+
+            assertEquals(null, result, "reflectOwnAddress with no responder must time out to null, not hang or throw")
+            assertTrue(
+                elapsedMs < DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS,
+                "timeout must be bounded by the short injected requestTimeoutMs (200ms), not the production default (${DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS}ms); took ${elapsedMs}ms",
+            )
+        } finally {
+            aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `reflectOwnAddress returns null when the response's type byte doesn't match what was expected`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 1000)
+        aTransport.start()
+        try {
+            // An "attacker" socket that answers any inbound
+            // ADDRESS_REFLECTION_REQUEST with a bare PONG carrying the same
+            // transaction id -- reflectOwnAddress must not trust this as a
+            // real ADDRESS_REFLECTION_RESPONSE.
+            val attackerSocket = DatagramSocket(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            val attackerThread = Thread {
+                val buffer = ByteArray(2048)
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    attackerSocket.receive(packet)
+                    val request = AddressReflectionRequestMessage.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                    val bogusPong = DhtMessage(DhtMessageType.PONG, request.transactionId, nodeId(2)).encode()
+                    attackerSocket.send(DatagramPacket(bogusPong, bogusPong.size, packet.address, packet.port))
+                } catch (e: Exception) {
+                    // socket closed underneath us at test teardown -- fine.
+                }
+            }
+            attackerThread.start()
+
+            val attackerContact = Contact(
+                id = nodeId(2),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), attackerSocket.localPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+            val result = aTransport.reflectOwnAddress(attackerContact)
+            assertEquals(null, result, "a type-mismatched response must be treated as failure, never trusted")
+
+            attackerSocket.close()
+            attackerThread.join(1000)
+        } finally {
+            aTransport.stop()
+        }
+    }
 }

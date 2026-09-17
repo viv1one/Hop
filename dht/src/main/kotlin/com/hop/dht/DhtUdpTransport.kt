@@ -21,8 +21,14 @@ sealed class FindValueOutcome {
 
 /**
  * The Kademlia RPCs this slice speaks over UDP: liveness (PING/PONG, Slice 3),
- * FIND_NODE (Slice 4), and STORE/FIND_VALUE (Slice 5) -- the announce/
- * get-peers primitive [DhtStore] backs.
+ * FIND_NODE (Slice 4), STORE/FIND_VALUE (Slice 5) -- the announce/
+ * get-peers primitive [DhtStore] backs -- and, as of Phase 4's NAT
+ * hole-punching address-self-discovery slice, ADDRESS_REFLECTION (see
+ * [reflectOwnAddress] and the `ADDRESS_REFLECTION_REQUEST` case in
+ * [handlePacket]): a STUN-style "what address did you observe me at" RPC.
+ * That slice only builds step (1) of NAT hole-punching -- a device learning
+ * its own public-facing address -- never the harder peer-introduction/
+ * simultaneous-connect signaling step, which is separate, later work.
  *
  * **UDP, not TCP -- deliberately.** [RoutingTable] holds up to thousands of
  * *known-of* contacts, not *connected-to* peers: TCP would force either
@@ -55,7 +61,8 @@ class DhtUdpTransport(
     /**
      * Fires for EVERY valid inbound message (PING, PONG, FIND_NODE_REQUEST,
      * FIND_NODE_RESPONSE, STORE_REQUEST, STORE_RESPONSE, FIND_VALUE_REQUEST,
-     * or FIND_VALUE_RESPONSE), keyed to the packet's OBSERVED source address
+     * FIND_VALUE_RESPONSE, ADDRESS_REFLECTION_REQUEST, or
+     * ADDRESS_REFLECTION_RESPONSE), keyed to the packet's OBSERVED source address
      * -- never a self-reported field, per this class's hard rule. This is
      * the actual routing-table self-population mechanism.
      *
@@ -94,15 +101,16 @@ class DhtUdpTransport(
     private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
 ) {
     /**
-     * Pending outbound requests (PING, FIND_NODE_REQUEST, STORE_REQUEST, or
-     * FIND_VALUE_REQUEST) awaiting a matching response, keyed by
-     * [TransactionId] (content-based equality -- see that class's own doc
-     * for why a raw `ByteArray` key would silently break every correlation
-     * lookup). Deferred with the raw response bytes, not a shared typed
-     * message -- most response types here are not a [DhtMessage] (the
-     * STORE_RESPONSE ack is the one exception), so parsing is left to each
-     * caller ([ping]/[findNode]/[store]/[findValue]) rather than forced into
-     * one shared decode. [ConcurrentHashMap] since
+     * Pending outbound requests (PING, FIND_NODE_REQUEST, STORE_REQUEST,
+     * FIND_VALUE_REQUEST, or ADDRESS_REFLECTION_REQUEST) awaiting a matching
+     * response, keyed by [TransactionId] (content-based equality -- see that
+     * class's own doc for why a raw `ByteArray` key would silently break
+     * every correlation lookup). Deferred with the raw response bytes, not a
+     * shared typed message -- most response types here are not a
+     * [DhtMessage] (the STORE_RESPONSE ack is the one exception), so parsing
+     * is left to each caller ([ping]/[findNode]/[store]/[findValue]/
+     * [reflectOwnAddress]) rather than forced into one shared decode.
+     * [ConcurrentHashMap] since
      * the receive thread and any number of concurrent callers touch this map
      * independently.
      */
@@ -213,8 +221,47 @@ class DhtUdpTransport(
     }
 
     /**
+     * Sends an ADDRESS_REFLECTION_REQUEST to [contact] and suspends until
+     * either a matching ADDRESS_REFLECTION_RESPONSE arrives (its
+     * [AddressReflectionResponseMessage.reflectedAddress]) or
+     * [requestTimeoutMs] elapses. Returns `null` on timeout, a malformed
+     * response, or a response that doesn't decode as an
+     * ADDRESS_REFLECTION_RESPONSE -- never trusts payload shape from the
+     * transaction id match alone, and never throws for any of these cases.
+     * Same posture as [ping]/[findNode]/[store]/[findValue].
+     *
+     * This is Phase 4's NAT hole-punching step (1) only -- "a device learns
+     * its own public-facing address as observed from outside its NAT" -- and
+     * nothing more. The returned [PeerAddress] is genuinely the address
+     * [contact] observed this request arriving from, not anything this
+     * device asserts about itself: [AddressReflectionRequestMessage] carries
+     * no address field for a dishonest/buggy requester to inject, and
+     * [handlePacket]'s `ADDRESS_REFLECTION_REQUEST` case answers exclusively
+     * from its own packet-observed source, never from message content --
+     * see that case's own doc. Callers must still remember [contact] itself
+     * is an arbitrary, possibly-dishonest peer: this call trusts *that peer*
+     * to answer honestly about what it saw, the same trust level as every
+     * other RPC in this class extends to whichever contact it dials. A
+     * hostile [contact] could lie about the reflected address entirely (or
+     * simply not answer) -- nothing here authenticates the *responder's*
+     * honesty, only that its answer wasn't tampered with in transit or
+     * type-confused with a different RPC's response.
+     */
+    suspend fun reflectOwnAddress(contact: Contact): PeerAddress? {
+        val transactionId = TransactionId.random()
+        val message = AddressReflectionRequestMessage(transactionId = transactionId, senderId = ownId)
+        val destination = firstDialableAddress(contact)
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
+        return try {
+            AddressReflectionResponseMessage.decode(responseBytes).reflectedAddress
+        } catch (e: DhtMessageDecodeException) {
+            null
+        }
+    }
+
+    /**
      * Resolves the single [InetSocketAddress] [ping]/[findNode]/[store]/
-     * [findValue] each dial [contact] at. `contact.address` may now hold more
+     * [findValue]/[reflectOwnAddress] each dial [contact] at. `contact.address` may now hold more
      * than one [PeerAddress] (Phase 4's dual-stack self-registration, see
      * [Contact]'s own class doc) -- this UDP RPC layer has no per-request
      * IPv6-first/IPv4-fallback race the way `p2p/`'s `PeerDialer` does for TCP
@@ -236,8 +283,9 @@ class DhtUdpTransport(
     }
 
     /**
-     * Shared primitive [ping], [findNode], [store], and [findValue] all build
-     * on: registers a pending deferred for [transactionId], sends
+     * Shared primitive [ping], [findNode], [store], [findValue], and
+     * [reflectOwnAddress] all build on: registers a pending deferred for
+     * [transactionId], sends
      * [requestBytes] to [destination], and suspends up to [requestTimeoutMs]
      * for a matching response's raw bytes (or `null` on timeout). Always
      * cleans up the pending-request entry, success or not.
@@ -382,6 +430,39 @@ class DhtUdpTransport(
             }
             DhtMessageType.FIND_VALUE_RESPONSE -> {
                 val message = FindValueResponseMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.ADDRESS_REFLECTION_REQUEST -> {
+                val message = AddressReflectionRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                // Answered unconditionally, for free, on every node running
+                // this transport -- no app-level callback hook, unlike
+                // FIND_NODE/STORE/FIND_VALUE, which need RoutingTable/DhtStore
+                // data this transport class doesn't own itself. This is what
+                // makes both dht/'s DhtNode and rendezvous/'s RendezvousNode
+                // automatically gain this capability just by sitting on this
+                // same transport class -- nothing to wire in either of those
+                // classes specifically.
+                //
+                // `observedAddress` -- computed once above from THIS packet's
+                // own DatagramPacket source, never from anything inside
+                // `message` -- is echoed back verbatim as the answer. This is
+                // the entire mechanism: there is no self-reported address
+                // field anywhere in AddressReflectionRequestMessage for a
+                // requester to inject, so the reflected value in the response
+                // below is always genuinely observed, matching this class's
+                // hard rule stated in its own class doc.
+                val response = AddressReflectionResponseMessage(
+                    transactionId = message.transactionId,
+                    senderId = ownId,
+                    reflectedAddress = observedAddress,
+                )
+                val bytes = response.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+            }
+            DhtMessageType.ADDRESS_REFLECTION_RESPONSE -> {
+                val message = AddressReflectionResponseMessage.decode(payload)
                 observe(message.senderId, observedAddress)
                 pendingRequests[message.transactionId]?.complete(payload)
             }

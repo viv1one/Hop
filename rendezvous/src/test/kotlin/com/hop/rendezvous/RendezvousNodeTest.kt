@@ -103,6 +103,40 @@ class RendezvousNodeTest {
         }
     }
 
+    @Test
+    fun `ADDRESS_REFLECTION_REQUEST is answered with the requester's genuinely observed address, same as any DHT node`() = runBlocking {
+        // Not a new capability added to this module -- see this module's own
+        // class doc: RendezvousNode wires nothing beyond onMessageObserved
+        // and onFindNodeRequested, yet still answers this RPC correctly,
+        // because it shares DhtUdpTransport with dht/'s DhtNode and this RPC
+        // is answered unconditionally by that shared transport itself (see
+        // DhtUdpTransport.handlePacket's ADDRESS_REFLECTION_REQUEST case).
+        // This is exactly the ADR 0002 shape this RPC fits: reflecting back
+        // "here's the address I observed YOU at" is arguably narrower than
+        // the "here are some peers" carve-out ADR 0002 already permits --
+        // it's not even information about a third party.
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val peerSocket = loopbackSocket()
+        val peerTransport = DhtUdpTransport(peerSocket, nodeId(2))
+
+        rendezvous.start()
+        peerTransport.start()
+        try {
+            val reflected = peerTransport.reflectOwnAddress(contactFor(rendezvousSocket, rendezvousId))
+            assertEquals(
+                PeerAddress.from(InetAddress.getLoopbackAddress(), peerSocket.localPort),
+                reflected,
+                "a RendezvousNode must reflect back the peer's genuinely observed address, same mechanism as any DhtUdpTransport-backed node",
+            )
+        } finally {
+            rendezvous.stop()
+            peerTransport.stop()
+        }
+    }
+
     // ---- The critical negative test: the whole point of this module (ADR 0002) ----
 
     @Test

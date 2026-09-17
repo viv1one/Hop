@@ -16,24 +16,36 @@ class DhtMessageDecodeException(message: String) : Exception(message)
  * The RPC types across every message kind in this module -- shared because
  * every wire format here (this file's [DhtMessage] and, as of Slice 4,
  * `FindNodeMessage.kt`'s independent `FindNodeRequestMessage`/
- * `FindNodeResponseMessage`, and as of Slice 5, `StoreMessage.kt`'s
+ * `FindNodeResponseMessage`, as of Slice 5, `StoreMessage.kt`'s
  * `StoreRequestMessage` and `FindValueMessage.kt`'s independent
- * `FindValueRequestMessage`/`FindValueResponseMessage`) puts its type byte at
- * the same fixed offset 1 (`[1B version][1B type]...`), letting a receiver
- * dispatch on this one byte before choosing which type's decoder to invoke.
+ * `FindValueRequestMessage`/`FindValueResponseMessage`, and as of Phase 4's
+ * NAT hole-punching address-self-discovery slice,
+ * `AddressReflectionMessage.kt`'s independent
+ * `AddressReflectionRequestMessage`/`AddressReflectionResponseMessage`) puts
+ * its type byte at the same fixed offset 1 (`[1B version][1B type]...`),
+ * letting a receiver dispatch on this one byte before choosing which type's
+ * decoder to invoke.
  *
  * FIND_NODE_REQUEST/FIND_NODE_RESPONSE/STORE_REQUEST/FIND_VALUE_REQUEST/
- * FIND_VALUE_RESPONSE are wire-value constants only -- [DhtMessage] itself
- * (this class's `encode`/`decode`, its fixed 42-byte [WIRE_SIZE]) is never
- * constructed with those five type values; their actual encode/decode logic
- * lives entirely in each request/response type's own file, deliberately not
- * a retrofit of [DhtMessage] into a sealed hierarchy.
+ * FIND_VALUE_RESPONSE/ADDRESS_REFLECTION_REQUEST/ADDRESS_REFLECTION_RESPONSE
+ * are wire-value constants only -- [DhtMessage] itself (this class's
+ * `encode`/`decode`, its fixed 42-byte [WIRE_SIZE]) is never constructed with
+ * those seven type values; their actual encode/decode logic lives entirely
+ * in each request/response type's own file, deliberately not a retrofit of
+ * [DhtMessage] into a sealed hierarchy.
  *
  * STORE_RESPONSE is the one exception: it *is* constructed as a plain
  * [DhtMessage] (the same bare-ack shape as PONG) -- a STORE ack carries
  * nothing beyond "acknowledged," unlike FIND_VALUE_RESPONSE, which must
  * distinguish holders-found from closer-routing-candidates and so needs its
  * own type. See `StoreRequestMessage`'s own doc for that contrast.
+ * ADDRESS_REFLECTION_REQUEST's payload shape is *also* bare (identical to
+ * PING's), but it still gets its own dedicated
+ * `AddressReflectionRequestMessage` type rather than reusing [DhtMessage]
+ * directly -- see that class's own doc for why a distinct type byte (and
+ * therefore a distinct class, per this enum's own convention) is still
+ * required even though the wire bytes carry nothing beyond
+ * transactionId/senderId.
  */
 enum class DhtMessageType(val wireValue: Int) {
     PING(0),
@@ -44,6 +56,8 @@ enum class DhtMessageType(val wireValue: Int) {
     STORE_RESPONSE(5),
     FIND_VALUE_REQUEST(6),
     FIND_VALUE_RESPONSE(7),
+    ADDRESS_REFLECTION_REQUEST(8),
+    ADDRESS_REFLECTION_RESPONSE(9),
     ;
 
     companion object {
