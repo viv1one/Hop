@@ -78,6 +78,34 @@ class WireEnvelopeTest {
     }
 
     @Test
+    fun `round trip preserves type and payload for TIER_KEY_REQUEST`() {
+        val precision = ReachTierGeohash.precisionFor(ReachTier.TOWN)
+        val claim = TierMembershipClaim(
+            reachTier = ReachTier.TOWN,
+            geohashPrefix = Geohash.encode(37.7749, -122.4194, precision),
+            claimedAtMs = 1_700_000_000_000L,
+        )
+        val payload = TierKeyRequestEnvelope(contentId = randomBytes(Frame.CLIP_HASH_SIZE), claim = claim).encode()
+        val encoded = WireEnvelope.encode(WirePayloadType.TIER_KEY_REQUEST, payload)
+
+        val decoded = WireEnvelope.decode(encoded)
+
+        assertEquals(WirePayloadType.TIER_KEY_REQUEST, decoded.type)
+        assertTrue(payload.contentEquals(decoded.payload))
+    }
+
+    @Test
+    fun `round trip preserves type and payload for TIER_KEY_RESPONSE`() {
+        val payload = TierKeyResponseEnvelope.granted(randomBytes(Frame.CLIP_HASH_SIZE), randomBytes(32)).encode()
+        val encoded = WireEnvelope.encode(WirePayloadType.TIER_KEY_RESPONSE, payload)
+
+        val decoded = WireEnvelope.decode(encoded)
+
+        assertEquals(WirePayloadType.TIER_KEY_RESPONSE, decoded.type)
+        assertTrue(payload.contentEquals(decoded.payload))
+    }
+
+    @Test
     fun `round trip works with empty payload`() {
         val encoded = WireEnvelope.encode(WirePayloadType.POST_FRAME, ByteArray(0))
         val decoded = WireEnvelope.decode(encoded)
@@ -219,5 +247,8 @@ class WireEnvelopeTest {
         assertEquals(0, WirePayloadType.POST_FRAME.wireValue)
         assertEquals(1, WirePayloadType.PREKEY_BUNDLE.wireValue)
         assertEquals(2, WirePayloadType.MESSAGE_CIPHERTEXT.wireValue)
+        assertEquals(3, WirePayloadType.DONT_RELAY_FLAG.wireValue)
+        assertEquals(4, WirePayloadType.TIER_KEY_REQUEST.wireValue)
+        assertEquals(5, WirePayloadType.TIER_KEY_RESPONSE.wireValue)
     }
 }

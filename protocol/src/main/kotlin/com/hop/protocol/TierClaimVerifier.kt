@@ -20,10 +20,11 @@ object TierClaimVerifier {
      *
      * Explicitly out of scope here: timestamp/staleness (decay-window)
      * enforcement. [TierMembershipClaim.claimedAtMs] is carried on the claim
-     * but not consulted by this function -- decay-window expiry is ADR
-     * 0003's separate job, belongs to a later slice that wires this to
-     * actual key distribution, and should reuse [RelayPolicy]-style expiry
-     * math once it exists rather than duplicating that logic here.
+     * but not consulted by this function -- decay-window/claim-staleness
+     * expiry is checked by [ReachTierKeyDistribution.releaseKeyFor], which
+     * calls this function for the geohash-cell check and separately reuses
+     * [RelayPolicy]'s expiry math for staleness, rather than duplicating
+     * either kind of check here.
      */
     fun isWithinTier(claim: TierMembershipClaim, targetLatitude: Double, targetLongitude: Double): Boolean =
         claim.geohashPrefix in ReachTierGeohash.targetCellPrefixes(targetLatitude, targetLongitude, claim.reachTier)

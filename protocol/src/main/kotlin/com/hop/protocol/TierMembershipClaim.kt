@@ -12,10 +12,10 @@ package com.hop.protocol
  * a claim never carries more location precision than the tier check it's
  * for actually needs.
  *
- * No wire encoding yet: a peer presenting this claim to another peer needs a
- * transport, which is a future (crypto-adjacent) slice's job, likely a new
- * `WirePayloadType`. Flagged here so it isn't rediscovered as a surprise
- * later -- data shape and construction-time validation only in this slice.
+ * Wire encoding lives in [TierKeyRequestEnvelope] (`WirePayloadType.TIER_KEY_REQUEST`)
+ * -- a peer presents this claim to another peer over that envelope shape, and
+ * the receiving peer decides whether to answer with the requested key via
+ * [ReachTierKeyDistribution].
  */
 data class TierMembershipClaim(
     val reachTier: ReachTier,

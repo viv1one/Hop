@@ -35,6 +35,26 @@ enum class WirePayloadType(val wireValue: Int) {
      * `dontRelay` bit -- see [DontRelayFlagEnvelope]'s own doc.
      */
     DONT_RELAY_FLAG(3),
+
+    /**
+     * Payload is a [TierKeyRequestEnvelope]-encoded request: a peer
+     * presenting a [TierMembershipClaim] to another peer, asking for the
+     * decay-key-store-wrapped content-encryption key for a Town/City/Country
+     * post (Phase 4 -- ADR 0003's key-distribution half; see
+     * [ReachTierKeyDistribution]). Never sent/expected for Locality content --
+     * see [TierMembershipClaim]'s own "Locality never needs a tier-membership
+     * claim" invariant.
+     */
+    TIER_KEY_REQUEST(4),
+
+    /**
+     * Payload is a [TierKeyResponseEnvelope]-encoded response to a
+     * [TIER_KEY_REQUEST]: either the wrapped content-encryption key (claim
+     * accepted) or an explicit denial (claim rejected -- wrong cell, stale
+     * claim, or the stored key itself has already decayed). See
+     * [ReachTierKeyDistribution] for the decision logic that produces this.
+     */
+    TIER_KEY_RESPONSE(5),
     ;
 
     companion object {

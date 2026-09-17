@@ -209,6 +209,12 @@ scope (do not implement these against this frame yet):
   itself isn't implemented yet.
 - Multi-frame chunking for large clips (today's implementation sends one
   frame with the whole clip as `payload`).
+- Actually wiring `TIER_KEY_REQUEST`/`TIER_KEY_RESPONSE` over a live socket in
+  `mobile/android/` (`TransportManager`/`EnvelopeDispatcher`), or changing
+  `EncryptedFrameCodec.decode()`'s current unconditional throw on
+  `keyIncluded = false` to call `ReachTierKeyDistribution` — both wire shape
+  and decision logic exist (see below and `ReachTierKeyDistribution.kt`); the
+  transport plumbing that calls them is separate, later work.
 - Messaging (1:1/group Double Ratchet) — that's a separate `crypto/`
   concern from post/clip content encryption; `Frame` itself carries post
   content only, never chat messages. (The socket-level wire envelope below
@@ -263,6 +269,8 @@ which of the three it's looking at before it can decode it.
 | 1     | `PREKEY_BUNDLE`      | A `PreKeyBundleEnvelope.encode()` output — see below.                       |
 | 2     | `MESSAGE_CIPHERTEXT` | A `MessageCiphertextEnvelope.encode()` output — see below.                  |
 | 3     | `DONT_RELAY_FLAG`    | A `DontRelayFlagEnvelope.encode()` output — see below.                      |
+| 4     | `TIER_KEY_REQUEST`   | A `TierKeyRequestEnvelope.encode()` output — see below.                     |
+| 5     | `TIER_KEY_RESPONSE`  | A `TierKeyResponseEnvelope.encode()` output — see below.                    |
 
 Any other value is invalid for envelope version 1 and decoders must reject it
 rather than guess, matching `Frame`'s own decode discipline.
@@ -356,6 +364,57 @@ bytes][8-byte flaggedAtMs][8-byte originatedAtMs][4-byte ttlSeconds]`.
   `com.hop.repository.DontRelayRepository`'s doc for the local,
   per-device-only state this actually mutates.
 
+`TierKeyRequestEnvelope`/`TierKeyResponseEnvelope` (Phase 4, ADR 0003's
+key-distribution half — see `ReachTierKeyDistribution.kt`) carry a
+tier-membership claim and its answer between two peers over the same WiFi
+Direct socket, so the requester never needs a DHT/topic query to learn
+whether it gets the unwrap key:
+
+`TierKeyRequestEnvelope`: `[32-byte contentId][1-byte reachTier][4-byte
+geohashPrefix UTF-8 byte length][geohashPrefix UTF-8 bytes][8-byte
+claimedAtMs]`.
+
+- `contentId` is the same 32-byte content-addressed hash as `Frame.clipHash`
+  — the post whose key is being requested.
+- `reachTier`/`geohashPrefix`/`claimedAtMs` are `TierMembershipClaim`'s three
+  fields, transported flat rather than as an opaque blob (every field is
+  meaningful to `protocol/` itself, same reasoning as `DontRelayFlagEnvelope`
+  above). `geohashPrefix` is length-prefixed rather than fixed-size even
+  though `ReachTierGeohash.precisionFor(reachTier)` determines its length —
+  this keeps the decoder from needing that mapping just to find the header
+  boundary.
+- A decoded claim that fails `TierMembershipClaim`'s own construction-time
+  validation (`reachTier == LOCALITY`, since Locality never needs a claim; or
+  a `geohashPrefix` length that doesn't match `reachTier`'s precision) is
+  rejected as a decode failure (`TierKeyRequestEnvelopeDecodeException`), not
+  silently coerced.
+
+`TierKeyResponseEnvelope`: `[32-byte contentId][1-byte granted][4-byte
+wrappedCek byte length][wrappedCek bytes]`.
+
+- `contentId` echoes the request's `contentId`.
+- `granted` is an explicit flag byte (`0`=denied, `1`=granted), not inferred
+  from `wrappedCek`'s length — matching `Frame.dontRelay`/`Frame.keyIncluded`'s
+  own explicit-flag-byte convention, and avoiding the ambiguity a zero-length
+  key would otherwise create.
+- `wrappedCek` must be empty when `granted` is `0` — a denial never carries
+  key bytes, even stale ones. It is length-prefixed rather than fixed-size
+  like `Frame.contentEncryptionKey`, since ADR 0003 describes the key as
+  "wrapped separately per reach tier," implying real wrap overhead beyond
+  today's raw 32-byte CEK is still to come; length-prefixing now avoids a
+  future wire-format bump once that lands.
+- The decision logic that produces a `granted`/`denied` answer —
+  `ReachTierKeyDistribution.releaseKeyFor` — checks
+  `TierClaimVerifier.isWithinTier`, the claim's own staleness (reusing
+  `RelayPolicy.isExpired`, a *separate* bound from the post's own decay
+  window), and whether the tier-specific `DecayKeyStore` entry (keyed by
+  `"$contentId:${reachTier.wireValue}"`, composed in `protocol/` rather than
+  teaching `crypto/`'s `DecayKeyStore` about `ReachTier` — see that class's
+  own doc for why) has itself decayed. See "Limits" reminders throughout this
+  document and ADR 0003: this is a deterrent against casual/stock-client
+  scraping, not server-side access control — a determined custom client can
+  fabricate a claim outright.
+
 `peerId`/`senderPeerId`/`recipientPeerId` are opaque identifying strings as
 far as `protocol/` is concerned (in practice, the hex-encoded
 `senderDeviceId` string already used elsewhere on the wire — see that
@@ -377,7 +436,7 @@ key material) by the time they reach this layer — this envelope only tags
 
 ## Reference implementation
 
-The reference implementation now spans five files, split per ADR 0001's
+The reference implementation now spans several files, split per ADR 0001's
 module boundary:
 
 - `protocol/src/main/kotlin/com/hop/protocol/Frame.kt` — the pure wire
@@ -407,3 +466,14 @@ module boundary:
   (Phase 2 Slice 2) — the "don't relay" flag payload shape described above.
   Has no dependency on `crypto/` and imports no libsignal type, same posture
   as `Frame.kt`/`WireEnvelope.kt`.
+- `protocol/src/main/kotlin/com/hop/protocol/TierKeyRequestEnvelope.kt` and
+  `protocol/src/main/kotlin/com/hop/protocol/TierKeyResponseEnvelope.kt`
+  (Phase 4) — the tier-membership-claim request/response payload shapes
+  described above. Neither has a `crypto/` dependency; they carry the claim
+  and the (possibly denied) key answer as plain fields/bytes.
+- `protocol/src/main/kotlin/com/hop/protocol/ReachTierKeyDistribution.kt`
+  (Phase 4) — the decision logic a `TierKeyRequestEnvelope` receiver runs to
+  decide what `TierKeyResponseEnvelope` to send back. This file *does* depend
+  on `crypto/` (`DecayKeyStore`), for the same ADR 0001 reason
+  `EncryptedFrameCodec.kt` already does — it is not a new dependency shape,
+  just a second file exercising the existing one-way rule.
