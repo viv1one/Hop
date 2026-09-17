@@ -97,6 +97,22 @@ class FeedViewModel(
      * separate key-distribution path this claim is for).
      */
     private val buildTierMembershipClaim: suspend (ReachTier) -> TierMembershipClaim? = { null },
+    /**
+     * Phase 4 Slice 11: delegates to
+     * `com.hop.transport.InternetPeerConnectionManager.connectToDiscoveredHolders`
+     * -- the same narrow suspend-capability pattern as [browseNearbyDht]/
+     * [broadcastTierKeyRequest]/[buildTierMembershipClaim] above, so this
+     * class stays unit-testable with a trivial fake lambda instead of a real
+     * `InternetPeerConnectionManager`. Fired best-effort from [launchDiscovery]
+     * right after [browseNearbyDht] returns its holder list -- this is the
+     * fix for the exact gap [discoveredRemoteHolders]'s own doc used to
+     * describe verbatim ("no transport here that fetches an actual clip FROM
+     * one of these contacts"): a real internet connection is now actually
+     * attempted for each newly-discovered holder, not just a [Contact] list
+     * sitting unused. Defaults to `{}` so every existing test that doesn't
+     * care about this doesn't need to fake it.
+     */
+    private val connectToDiscoveredHolders: suspend (List<Contact>) -> Unit = {},
 ) : ViewModel() {
 
     val posts: StateFlow<List<PostEntity>> = combine(
@@ -118,21 +134,23 @@ class FeedViewModel(
      * again on every user-triggered [refresh] -- see that function's own
      * doc for why a manual refresh only re-runs this, not [posts] itself.
      *
-     * **What this is NOT (yet):** [com.hop.topics.TopicSubscription.browse]
-     * returns [Contact]s only -- who claims to hold something -- never
-     * content itself (see that class's own doc: it is topic-routing
-     * plumbing, not a content-fetch mechanism). There is no transport here
-     * that fetches an actual clip FROM one of these contacts -- that needs
-     * an internet-mode content-transfer equivalent to
-     * `com.hop.transport.WifiDirectTransport`, which does not exist yet and
-     * is explicitly a separate future slice's job, not built here. This
-     * [StateFlow] exists so a real DHT discovery result is not silently
-     * thrown away, not because anything downstream can currently act on it.
-     * Deliberately not rendered by [FeedScreen] either: surfacing "N people
-     * are posting somewhere out of BLE/WiFi-Direct range" is a real
-     * product/UX decision (what copy, what affordance, whether it's wanted
-     * at all, given mesh mechanics are supposed to stay invisible to the
-     * user per PRD §5) that hasn't been made -- not an oversight.
+     * **What this is (as of Phase 4 Slice 11):** [com.hop.topics.TopicSubscription.browse]
+     * itself still only returns [Contact]s -- who claims to hold something --
+     * never content (see that class's own doc: it is topic-routing plumbing,
+     * not a content-fetch mechanism). But every holder returned here is now
+     * also handed to [connectToDiscoveredHolders]
+     * (`com.hop.transport.InternetPeerConnectionManager`), which actually
+     * dials each newly-discovered one over a real internet socket
+     * (`com.hop.transport.InternetPeerConnection`, the internet-mode
+     * content-transfer equivalent to `com.hop.transport.WifiDirectTransport`
+     * this doc used to say didn't exist yet -- it does now). This [StateFlow]
+     * still exists so a real DHT discovery result is never silently thrown
+     * away regardless, and remains deliberately not rendered by [FeedScreen]:
+     * surfacing "N people are posting somewhere out of BLE/WiFi-Direct range",
+     * or "N internet peers connected," is a real product/UX decision (what
+     * copy, what affordance, whether it's wanted at all, given mesh mechanics
+     * are supposed to stay invisible to the user per PRD §5) that hasn't been
+     * made -- not an oversight.
      */
     val discoveredRemoteHolders: StateFlow<List<Contact>> = _discoveredRemoteHolders.asStateFlow()
 
@@ -172,11 +190,28 @@ class FeedViewModel(
         launchDiscovery()
     }
 
+    /**
+     * Runs [browseNearbyDht], publishes its result to [discoveredRemoteHolders]
+     * immediately (never delayed by anything below), then best-effort awaits
+     * [connectToDiscoveredHolders] for that exact same holder list before
+     * clearing [_isRefreshing] -- awaited inline rather than fired on a
+     * separate coroutine, since [connectToDiscoveredHolders]'s own
+     * implementation (`InternetPeerConnectionManager.connectToDiscoveredHolders`)
+     * already bounds its own worst-case latency: a small fixed cap on new
+     * dial attempts per call, each individually bounded by
+     * `com.hop.p2p.PeerDialer`'s own connect timeouts. That keeps this
+     * spinner's worst case *bounded*, not indefinite, which is the actual
+     * property worth protecting here -- a genuinely unbounded/hanging call
+     * would need the fire-and-forget treatment instead, but this one doesn't
+     * qualify.
+     */
     private fun launchDiscovery() {
         _isRefreshing.value = true
         viewModelScope.launch {
             try {
-                _discoveredRemoteHolders.value = browseNearbyDht()
+                val holders = browseNearbyDht()
+                _discoveredRemoteHolders.value = holders
+                connectToDiscoveredHolders(holders)
             } finally {
                 _isRefreshing.value = false
             }

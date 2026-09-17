@@ -26,6 +26,7 @@ import com.hop.repository.PointsRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
 import com.hop.repository.ReportRepository
+import com.hop.transport.InternetPeerConnectionManager
 import com.hop.transport.TransportManager
 
 /**
@@ -247,5 +248,31 @@ class AppContainer(applicationContext: Context) {
         getOwnPeerId = getOwnPeerId,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
+    )
+
+    /**
+     * Phase 4 Slice 11: this device's DHT-discovered-holder connection
+     * registry (see [InternetPeerConnectionManager]'s own doc). A singleton
+     * owned by this container -- same posture as [transportManager]/
+     * [dhtNodeManager] above -- rather than one instance per [FeedViewModel][com.hop.app.feed.FeedViewModel]:
+     * a `FeedViewModel` is recreated on configuration change/navigation, but
+     * an internet connection this device already dialed should survive
+     * that, not get silently abandoned (with its socket left open, unclosed)
+     * every time the feed screen is recreated. `postsDir` mirrors
+     * [WifiDirectTransport][com.hop.transport.WifiDirectTransport]'s own
+     * private `File(appContext.filesDir, "posts")` construction exactly --
+     * both write into the same on-disk posts directory, since both are
+     * ultimately writing through the same [postRepository]/[ReceivedFrameStore][com.hop.transport.ReceivedFrameStore].
+     */
+    val internetPeerConnectionManager: InternetPeerConnectionManager = InternetPeerConnectionManager(
+        postRepository = postRepository,
+        decayKeyStore = decayKeyStore,
+        dontRelayRepository = dontRelayRepository,
+        pendingMessageRepository = pendingMessageRepository,
+        bundleRepository = bundleRepository,
+        getOwnPeerId = getOwnPeerId,
+        onPreKeyBundleReceived = messageRepository::cachePeerBundle,
+        onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
+        postsDir = java.io.File(applicationContext.filesDir, "posts"),
     )
 }

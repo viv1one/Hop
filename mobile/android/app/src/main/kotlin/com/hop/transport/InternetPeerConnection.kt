@@ -151,18 +151,28 @@ class InternetPeerConnection(
      * connecting -- that push logic itself is a future slice's job, not
      * built here (see class doc's "Explicitly out of scope").
      *
+     * [onClosed] is invoked exactly once, from [receiveLoop]'s own thread,
+     * the moment the receive loop for this connection ends for any reason
+     * (orderly peer close or I/O error) -- see [receiveLoop]'s doc. Defaulted
+     * to a no-op so every existing caller/test that doesn't care about
+     * connection lifecycle keeps working unchanged; [InternetPeerConnectionManager]
+     * is the first real caller that supplies one, to know when to evict a
+     * dead connection from its registry.
+     *
      * Throws [com.hop.p2p.PeerDialException] if every candidate address
      * fails to connect, or [com.hop.dht.PeerAddressDecodeException] if
      * [contact]'s address bytes don't decode -- neither is caught here;
      * callers decide how to handle a failed connection attempt (this slice
-     * has no retry/backoff, per the class doc).
+     * has no retry/backoff, per the class doc). [onClosed] is never invoked
+     * for either of these -- the connection never started, so it never
+     * "closed."
      */
-    fun connectTo(contact: Contact): PeerChannel {
+    fun connectTo(contact: Contact, onClosed: () -> Unit = {}): PeerChannel {
         val candidates = PeerAddress.decodeList(contact.address)
         val socket = PeerDialer.dial(candidates)
         onLog("Dialed an internet peer connection (${candidates.size} candidate address(es))")
         val channel = PeerChannel(socket)
-        Thread({ receiveLoop(channel) }, "hop-internet-receive").start()
+        Thread({ receiveLoop(channel, onClosed) }, "hop-internet-receive").start()
         return channel
     }
 
@@ -184,51 +194,59 @@ class InternetPeerConnection(
      * test can call this directly, synchronously, against one side of a
      * real loopback [PeerChannel] pair -- no [PeerDialer]/real [Contact]
      * required to exercise this logic.
+     *
+     * [onClosed] runs in a `finally` wrapping the whole loop, so it fires
+     * exactly once no matter which exit path (EOF, other I/O error) ends
+     * this loop -- see [connectTo]'s doc for why this exists.
      */
-    fun receiveLoop(channel: PeerChannel) {
-        while (true) {
-            val envelope = try {
-                channel.receiveEnvelope()
-            } catch (e: EOFException) {
-                onLog("Internet peer connection closed by remote; ending receive loop")
-                return
-            } catch (e: Exception) {
-                onLog("Internet peer connection receive error: ${e.message}; ending receive loop")
-                return
-            }
-            try {
-                when (val result = runBlocking { envelopeDispatcher.dispatch(envelope) }) {
-                    is DispatchResult.TierKeyRequestAnswered -> handleTierKeyRequestAnswered(result.response, channel)
-                    is DispatchResult.PeerIdentified ->
-                        onLog("Internet peer identified as ${result.peerId}")
-                    is DispatchResult.DirectBundleAnnounce ->
-                        onLog("Received a direct prekey bundle announce over an internet connection from ${result.peerId}")
-                    is DispatchResult.NewPostFrame ->
-                        onLog(
-                            "Received a new post over an internet connection and took local custody of it -- " +
-                                "internet-mode relay-flood fanout to other internet-connected peers is separate " +
-                                "follow-up work (see this class's own doc), not done here"
-                        )
-                    is DispatchResult.NewRelayableMessage ->
-                        onLog(
-                            "Took relay custody of a message carried over an internet connection -- " +
-                                "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                        )
-                    is DispatchResult.NewRelayableBundle ->
-                        onLog(
-                            "Took relay custody of a prekey bundle carried over an internet connection -- " +
-                                "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                        )
-                    is DispatchResult.NewDontRelayFlag ->
-                        onLog(
-                            "Recorded a new \"don't relay\" flag received over an internet connection -- " +
-                                "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                        )
-                    DispatchResult.NoOp -> Unit
+    fun receiveLoop(channel: PeerChannel, onClosed: () -> Unit = {}) {
+        try {
+            while (true) {
+                val envelope = try {
+                    channel.receiveEnvelope()
+                } catch (e: EOFException) {
+                    onLog("Internet peer connection closed by remote; ending receive loop")
+                    return
+                } catch (e: Exception) {
+                    onLog("Internet peer connection receive error: ${e.message}; ending receive loop")
+                    return
                 }
-            } catch (e: Exception) {
-                onLog("Error handling a received internet-connection envelope: ${e.message}")
+                try {
+                    when (val result = runBlocking { envelopeDispatcher.dispatch(envelope) }) {
+                        is DispatchResult.TierKeyRequestAnswered -> handleTierKeyRequestAnswered(result.response, channel)
+                        is DispatchResult.PeerIdentified ->
+                            onLog("Internet peer identified as ${result.peerId}")
+                        is DispatchResult.DirectBundleAnnounce ->
+                            onLog("Received a direct prekey bundle announce over an internet connection from ${result.peerId}")
+                        is DispatchResult.NewPostFrame ->
+                            onLog(
+                                "Received a new post over an internet connection and took local custody of it -- " +
+                                    "internet-mode relay-flood fanout to other internet-connected peers is separate " +
+                                    "follow-up work (see this class's own doc), not done here"
+                            )
+                        is DispatchResult.NewRelayableMessage ->
+                            onLog(
+                                "Took relay custody of a message carried over an internet connection -- " +
+                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
+                            )
+                        is DispatchResult.NewRelayableBundle ->
+                            onLog(
+                                "Took relay custody of a prekey bundle carried over an internet connection -- " +
+                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
+                            )
+                        is DispatchResult.NewDontRelayFlag ->
+                            onLog(
+                                "Recorded a new \"don't relay\" flag received over an internet connection -- " +
+                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
+                            )
+                        DispatchResult.NoOp -> Unit
+                    }
+                } catch (e: Exception) {
+                    onLog("Error handling a received internet-connection envelope: ${e.message}")
+                }
             }
+        } finally {
+            onClosed()
         }
     }
 

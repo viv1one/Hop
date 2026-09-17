@@ -435,6 +435,61 @@ class FeedViewModelTest {
         assertEquals(2, callCount, "the overlapping second refresh() call must be dropped, not run a third time")
     }
 
+    @Test
+    fun `launchDiscovery calls connectToDiscoveredHolders with exactly the holders browseNearbyDht returned`() = runTest(testDispatcher) {
+        val fakeContact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { it.toByte() }),
+            address = ByteArray(7),
+            lastSeenAtMs = 0L,
+        )
+        val connectCalls = mutableListOf<List<Contact>>()
+
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            browseNearbyDht = { listOf(fakeContact) },
+            connectToDiscoveredHolders = { holders -> connectCalls.add(holders) },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf(listOf(fakeContact)), connectCalls, "construction's own launchDiscovery must call connectToDiscoveredHolders with exactly browseNearbyDht's result")
+
+        connectCalls.clear()
+        viewModel.refresh()
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf(listOf(fakeContact)), connectCalls, "refresh's own launchDiscovery must also call connectToDiscoveredHolders with exactly browseNearbyDht's result")
+    }
+
+    @Test
+    fun `the default no-op connectToDiscoveredHolders does not break discovery`() = runTest(testDispatcher) {
+        val fakeContact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { it.toByte() }),
+            address = ByteArray(7),
+            lastSeenAtMs = 0L,
+        )
+
+        // No connectToDiscoveredHolders argument supplied at all -- exercises
+        // the default `{}` no-op.
+        val viewModel = FeedViewModel(
+            postRepository = PostRepository(FakePostDao(emptyList()), DecayKeyStore()),
+            blockRepository = BlockRepository(FakeBlockedSenderDeviceDao(emptyList())),
+            reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
+            dontRelayRepository = DontRelayRepository(FakeDontRelayFlagDao(), FakeRelayQueueDao(), RelayPolicy()),
+            getAttestedDeviceKey = { "attested-key" },
+            broadcastDontRelayFlag = {},
+            browseNearbyDht = { listOf(fakeContact) },
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertEquals(listOf(fakeContact), viewModel.discoveredRemoteHolders.value)
+        assertEquals(false, viewModel.isRefreshing.value)
+    }
+
     private class FakePostDao(initial: List<PostEntity>) : PostDao {
         private val state = MutableStateFlow(initial)
 

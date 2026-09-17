@@ -139,6 +139,14 @@ fun FeedScreen(
                             )
                         }
                     },
+                    // Phase 4 Slice 11: delegates to container's singleton
+                    // InternetPeerConnectionManager (see its own doc for why
+                    // this is a container-owned singleton, not a per-screen
+                    // instance) -- dials a real internet connection for every
+                    // newly browseNearbyDht-discovered holder.
+                    connectToDiscoveredHolders = { holders ->
+                        container.internetPeerConnectionManager.connectToDiscoveredHolders(holders)
+                    },
                 )
             }
         },
