@@ -235,26 +235,11 @@ class AppContainer(applicationContext: Context) {
         sendMessage = { peerId, payload -> transportManager.sendMessage(peerId, payload) },
     )
 
-    val transportManager: TransportManager = TransportManager(
-        context = applicationContext,
-        postRepository = postRepository,
-        decayKeyStore = decayKeyStore,
-        relayRepository = relayRepository,
-        dontRelayRepository = dontRelayRepository,
-        pointsRepository = pointsRepository,
-        pendingMessageRepository = pendingMessageRepository,
-        bundleRepository = bundleRepository,
-        preKeyRotationManager = preKeyRotationManager,
-        getOwnPeerId = getOwnPeerId,
-        onPreKeyBundleReceived = messageRepository::cachePeerBundle,
-        onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
-    )
-
     /**
      * Phase 4 Slice 11: this device's DHT-discovered-holder connection
      * registry (see [InternetPeerConnectionManager]'s own doc). A singleton
      * owned by this container -- same posture as [transportManager]/
-     * [dhtNodeManager] above -- rather than one instance per [FeedViewModel][com.hop.app.feed.FeedViewModel]:
+     * [dhtNodeManager] below -- rather than one instance per [FeedViewModel][com.hop.app.feed.FeedViewModel]:
      * a `FeedViewModel` is recreated on configuration change/navigation, but
      * an internet connection this device already dialed should survive
      * that, not get silently abandoned (with its socket left open, unclosed)
@@ -263,11 +248,18 @@ class AppContainer(applicationContext: Context) {
      * private `File(appContext.filesDir, "posts")` construction exactly --
      * both write into the same on-disk posts directory, since both are
      * ultimately writing through the same [postRepository]/[ReceivedFrameStore][com.hop.transport.ReceivedFrameStore].
-     * [relayRepository] is the same singleton instance
-     * [transportManager] above already uses for its own WiFi Direct
-     * connect-time backlog -- not a second instance -- so a post queued for
-     * relay is offered to a newly-dialed internet peer exactly once it's
-     * eligible, from the one persisted queue both transports share.
+     * [relayRepository] is the same singleton instance [transportManager]
+     * below already uses for its own WiFi Direct connect-time backlog --
+     * not a second instance -- so a post queued for relay is offered to a
+     * newly-dialed internet peer exactly once it's eligible, from the one
+     * persisted queue both transports share.
+     *
+     * Constructed *before* [transportManager] below (previously the reverse
+     * order) -- [transportManager] now takes this instance as a constructor
+     * parameter (see [TransportManager]'s own doc) so its
+     * `broadcastPost`/`broadcastDontRelayFlag`/`broadcastTierKeyRequest`
+     * methods can fan a self-authored post/flag/tier-key-request out to open
+     * internet connections too, not only WiFi Direct peers.
      */
     val internetPeerConnectionManager: InternetPeerConnectionManager = InternetPeerConnectionManager(
         postRepository = postRepository,
@@ -280,5 +272,21 @@ class AppContainer(applicationContext: Context) {
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
         postsDir = java.io.File(applicationContext.filesDir, "posts"),
+    )
+
+    val transportManager: TransportManager = TransportManager(
+        context = applicationContext,
+        postRepository = postRepository,
+        decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
+        dontRelayRepository = dontRelayRepository,
+        pointsRepository = pointsRepository,
+        pendingMessageRepository = pendingMessageRepository,
+        bundleRepository = bundleRepository,
+        preKeyRotationManager = preKeyRotationManager,
+        getOwnPeerId = getOwnPeerId,
+        internetPeerConnectionManager = internetPeerConnectionManager,
+        onPreKeyBundleReceived = messageRepository::cachePeerBundle,
+        onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
     )
 }

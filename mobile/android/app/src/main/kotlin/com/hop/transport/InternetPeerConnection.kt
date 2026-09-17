@@ -399,13 +399,18 @@ class InternetPeerConnection(
 
 /**
  * Converts a persisted [DontRelayFlagEntity] back to its on-wire
- * [DontRelayFlagEnvelope] shape -- a small, deliberate duplicate of
- * [WifiDirectTransport]'s own private file-scoped `DontRelayFlagEntity.toEnvelope()`
- * (that one is private to its own file, not reachable from here, and this
- * slice does not touch [WifiDirectTransport.kt]). Same shape as
- * [DontRelayRepository.buildOutgoingFlagBacklog]'s own inline conversion.
+ * [DontRelayFlagEnvelope] shape. Originally a small, deliberate duplicate of
+ * [WifiDirectTransport]'s own private file-scoped `DontRelayFlagEntity.toEnvelope()`;
+ * that duplicate has since been removed from [WifiDirectTransport.kt] in
+ * favor of this single, `internal` (module-visible, not just file-visible)
+ * definition, which [WifiDirectTransport] itself and
+ * [InternetPeerConnectionManager.broadcastDontRelayFlag] (a locally-authored
+ * flag reaching open internet connections, not just one relayed from another
+ * internet peer) both now reuse -- one definition, not a third duplicate.
+ * Same shape as [DontRelayRepository.buildOutgoingFlagBacklog]'s own inline
+ * conversion.
  */
-private fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayFlagEnvelope(
+internal fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayFlagEnvelope(
     clipHash = clipHash.hexToByteArray(),
     attestedDeviceKey = attestedDeviceKey.hexToByteArray(),
     flaggedAtMs = flaggedAtMs,
@@ -413,5 +418,5 @@ private fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayF
     ttlSeconds = ttlSeconds,
 )
 
-private fun String.hexToByteArray(): ByteArray =
+internal fun String.hexToByteArray(): ByteArray =
     ByteArray(length / 2) { i -> ((Character.digit(this[i * 2], 16) shl 4) + Character.digit(this[i * 2 + 1], 16)).toByte() }

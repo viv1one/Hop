@@ -23,6 +23,8 @@ import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.PreKeyBundleEnvelope
 import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
+import com.hop.protocol.TierKeyRequestEnvelope
+import com.hop.protocol.TierMembershipClaim
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
@@ -663,6 +665,199 @@ class InternetPeerConnectionManagerTest {
             }, "abortive-close-listener").apply { isDaemon = true; start() }
         }
         fun close() = serverSocket.close()
+    }
+
+    // -- Locally-authored broadcast fanout: broadcastPost/broadcastDontRelayFlag/
+    // broadcastTierKeyRequest -- a post/flag/tier-key-request this device itself
+    // authors reaching every open internet connection, as opposed to the live
+    // relay-flood fanout tests above, which cover only content *relayed through*
+    // one internet connection. --
+
+    @Test
+    fun `broadcastPost sends to every open internet connection, decodable as POST_FRAME`() = runBlocking {
+        val manager = newManager()
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "both contacts must have been dialed")
+        serverSocketA!!.soTimeout = 3_000
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA)
+        val serverChannelB = PeerChannel(serverSocketB)
+
+        val frameBytes = encodedFrameBytes("self-authored-post")
+        manager.broadcastPost(frameBytes)
+
+        for (channel in listOf(serverChannelA, serverChannelB)) {
+            val received = channel.receiveEnvelope()
+            assertEquals(WirePayloadType.POST_FRAME, received.type)
+            assertContentEquals(frameBytes, received.payload)
+        }
+    }
+
+    @Test
+    fun `broadcastDontRelayFlag sends to every open internet connection, decodable as DONT_RELAY_FLAG`() = runBlocking {
+        val manager = newManager()
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "both contacts must have been dialed")
+        serverSocketA!!.soTimeout = 3_000
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA)
+        val serverChannelB = PeerChannel(serverSocketB)
+
+        val row = freshDontRelayFlagRow("self-authored-flag")
+        manager.broadcastDontRelayFlag(row)
+
+        for (channel in listOf(serverChannelA, serverChannelB)) {
+            val received = channel.receiveEnvelope()
+            assertEquals(WirePayloadType.DONT_RELAY_FLAG, received.type)
+            val decoded = DontRelayFlagEnvelope.decode(received.payload)
+            assertEquals(row.clipHash, decoded.clipHash.joinToString(separator = "") { "%02x".format(it) })
+            assertEquals(row.attestedDeviceKey, decoded.attestedDeviceKey.joinToString(separator = "") { "%02x".format(it) })
+        }
+    }
+
+    @Test
+    fun `broadcastDontRelayFlag does not itself take custody or dedup -- calling it twice for the same flag sends twice`() = runBlocking {
+        // InternetPeerConnectionManager.broadcastDontRelayFlag deliberately has
+        // no recordFlag/isNew check of its own -- TransportManager is
+        // responsible for that dedup, calling this method only once per
+        // genuinely-new flag (see WifiDirectTransport.broadcastDontRelayFlag's
+        // Boolean return and TransportManager.broadcastDontRelayFlag's own
+        // sequencing). This test locks in that this method itself is pure,
+        // unconditional fanout with no dedup baked in.
+        val manager = newManager()
+        val listener = LoopbackListener()
+        val contact = loopbackContact(nodeId(0), listener.port)
+
+        manager.connectToDiscoveredHolders(listOf(contact))
+        val serverSocket = listener.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocket != null, "dial must succeed")
+        serverSocket!!.soTimeout = 3_000
+        val serverChannel = PeerChannel(serverSocket)
+
+        val row = freshDontRelayFlagRow("repeat-flag")
+        manager.broadcastDontRelayFlag(row)
+        manager.broadcastDontRelayFlag(row)
+
+        assertEquals(WirePayloadType.DONT_RELAY_FLAG, serverChannel.receiveEnvelope().type)
+        assertEquals(WirePayloadType.DONT_RELAY_FLAG, serverChannel.receiveEnvelope().type)
+    }
+
+    @Test
+    fun `broadcastTierKeyRequest sends to every open internet connection, decodable as TIER_KEY_REQUEST`() = runBlocking {
+        val manager = newManager()
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "both contacts must have been dialed")
+        serverSocketA!!.soTimeout = 3_000
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA)
+        val serverChannelB = PeerChannel(serverSocketB)
+
+        val contentId = MessageDigest.getInstance("SHA-256").digest("tier-key-request".toByteArray())
+        val claim = TierMembershipClaim(
+            reachTier = ReachTier.TOWN,
+            geohashPrefix = "9q8yy",
+            claimedAtMs = System.currentTimeMillis(),
+        )
+        val request = TierKeyRequestEnvelope(contentId = contentId, claim = claim)
+        manager.broadcastTierKeyRequest(request)
+
+        for (channel in listOf(serverChannelA, serverChannelB)) {
+            val received = channel.receiveEnvelope()
+            assertEquals(WirePayloadType.TIER_KEY_REQUEST, received.type)
+            val decoded = TierKeyRequestEnvelope.decode(received.payload)
+            assertEquals(request, decoded)
+        }
+    }
+
+    @Test
+    fun `a sibling connection whose broadcastPost send fails is evicted, without preventing delivery to a healthy sibling`() = runBlocking {
+        val manager = newManager()
+        val listenerA = LoopbackListener()
+        val abortiveListenerB = AbortiveCloseListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), abortiveListenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null, "the healthy contact must have been dialed")
+        serverSocketA!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA)
+
+        // Give connection B's own dial/receive machinery a moment to have
+        // actually reached the abortive close before broadcastPost below --
+        // avoids a benign race where B hasn't even connected yet.
+        repeat(20) {
+            if (abortiveListenerB.acceptedCount.get() > 0) return@repeat
+            Thread.sleep(50)
+        }
+
+        val frameBytes = encodedFrameBytes("broadcast-post-with-dead-sibling")
+
+        // Must not throw -- a send failure to the dead sibling is caught internally.
+        manager.broadcastPost(frameBytes)
+
+        // The healthy connection must still receive the broadcast post.
+        val received = serverChannelA.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, received.type)
+        assertContentEquals(frameBytes, received.payload)
+
+        // The dead connection must have been evicted -- verified indirectly,
+        // same posture as the live-relay-fanout eviction test above: a later
+        // dial to the same contact must succeed again.
+        val acceptedBefore = abortiveListenerB.acceptedCount.get()
+        var reconnected = false
+        repeat(20) {
+            manager.connectToDiscoveredHolders(listOf(contactB))
+            if (abortiveListenerB.acceptedCount.get() > acceptedBefore) {
+                reconnected = true
+                return@repeat
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(reconnected, "once the dead connection is evicted, a later dial to the same contact must succeed again")
+    }
+
+    @Test
+    fun `broadcastPost with zero open internet connections sends nothing and does not throw`() = runBlocking {
+        val manager = newManager()
+
+        // No connectToDiscoveredHolders call at all -- the registry is empty.
+        manager.broadcastPost(encodedFrameBytes("no-connections"))
+        manager.broadcastDontRelayFlag(freshDontRelayFlagRow("no-connections"))
+        val claim = TierMembershipClaim(
+            reachTier = ReachTier.TOWN,
+            geohashPrefix = "9q8yy",
+            claimedAtMs = System.currentTimeMillis(),
+        )
+        manager.broadcastTierKeyRequest(
+            TierKeyRequestEnvelope(
+                contentId = MessageDigest.getInstance("SHA-256").digest("no-connections".toByteArray()),
+                claim = claim,
+            ),
+        )
+        // Reaching this line without an exception is the assertion -- there is
+        // nothing else observable with zero open connections.
     }
 
     // -- Minimal hand-rolled fakes, matching InternetPeerConnectionTest's own established pattern. --

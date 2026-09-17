@@ -1,11 +1,15 @@
 package com.hop.transport
 
 import com.hop.crypto.DecayKeyStore
+import com.hop.data.DontRelayFlagEntity
 import com.hop.dht.Contact
 import com.hop.dht.NodeId
 import com.hop.dht.PeerAddressDecodeException
 import com.hop.p2p.PeerChannel
 import com.hop.p2p.PeerDialException
+import com.hop.protocol.TierKeyRequestEnvelope
+import com.hop.protocol.WireEnvelope
+import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
@@ -94,15 +98,31 @@ import java.util.concurrent.ConcurrentHashMap
  * fails" shape, just split across two classes instead of one because of that
  * visibility difference.
  *
+ * **Locally-authored broadcast fanout ([broadcastPost]/[broadcastDontRelayFlag]/
+ * [broadcastTierKeyRequest]):** the piece the note directly above used to
+ * flag as "separate, later work" -- now built. [TransportManager] calls each
+ * of these *alongside* the matching [WifiDirectTransport] method, so a
+ * post/flag/tier-key-request this device itself just authored also reaches
+ * every open internet connection, not only WiFi Direct peers. Deliberately
+ * **pure fanout, no custody-taking of their own**: [WifiDirectTransport]'s
+ * own three methods already take whatever custody is needed (posts via
+ * [RelayRepository.considerForRelay], flags via [DontRelayRepository.recordFlag],
+ * none for a tier-key request) against the exact same shared repository
+ * instances [com.hop.app.AppContainer] wires into both this class and
+ * [WifiDirectTransport] -- a second custody call here would be redundant at
+ * best (posts: `insert`'s `putIfAbsent`-shaped no-op) and a double-write at
+ * worst (flags: [DontRelayRepository.recordFlag]'s distinct-attested-device
+ * counter incrementing twice for one flag). See each method's own doc for
+ * its exact mirror in [WifiDirectTransport].
+ *
  * **Explicitly out of scope here (see [InternetPeerConnection]'s own doc for
- * the same boundary at its layer):** unifying WiFi-Direct and internet
- * broadcast paths (a *locally-authored* post/flag from this device reaching
- * open internet connections too, the way [TransportManager.broadcastPost]
- * reaches WiFi Direct peers, is separate, later work -- this class's fanout
- * only ever re-relays something that arrived on one internet connection, never
- * something this device itself just authored), retry/backoff for a failed
- * dial, NAT hole-punching, volunteer relay-node fallback, and any UI surfacing
- * of connection count ([FeedViewModel.discoveredRemoteHolders] was
+ * the same boundary at its layer):** [TransportManager.sendToPeer]/
+ * [TransportManager.sendMessage] (peer-id-targeted unicast) stay WiFi-Direct-
+ * only -- this class has no peer-id-to-connection lookup, only the
+ * [NodeId]-keyed [connections] registry, and building a unicast path is real
+ * scope beyond unifying the three *broadcast* paths. Retry/backoff for a
+ * failed dial, NAT hole-punching, volunteer relay-node fallback, and any UI
+ * surfacing of connection count ([FeedViewModel.discoveredRemoteHolders] was
  * deliberately left unrendered for its own product/UX reason -- this class
  * doesn't invent a new rendering for connection count either).
  */
@@ -280,6 +300,91 @@ class InternetPeerConnectionManager(
                 channel.sendRawBytes(outgoingEnvelopeBytes)
             } catch (e: Exception) {
                 onLog("Live relay push failed to a connected internet peer; dropping that connection: ${e.message}")
+                connections.remove(nodeId, channel)
+            }
+        }
+    }
+
+    /**
+     * Broadcasts [encoded] (a caller-built [com.hop.protocol.Frame]'s already-
+     * encoded bytes, the same bytes [TransportManager.broadcastPost] also
+     * hands to [WifiDirectTransport.broadcastPost] unchanged) to every
+     * currently-open internet connection, wrapped exactly once here as a
+     * [WirePayloadType.POST_FRAME] [WireEnvelope]
+     * -- mirrors [WifiDirectTransport.broadcastPost]'s own wrap-and-fan-out
+     * shape, minus that method's [RelayRepository.considerForRelay] custody
+     * call (see this class's own doc for why that's deliberately not
+     * duplicated here: [WifiDirectTransport.broadcastPost] already takes that
+     * custody, against the same shared [relayRepository] instance, and
+     * [TransportManager] calls both methods for the same post).
+     *
+     * Unlike [fanOutLiveRelay], there is no `arrivedOn` connection to exclude
+     * -- this is this device's own outbound broadcast of its own content, so
+     * every open connection is a legitimate recipient, not just every
+     * *sibling*. A connection whose send fails is logged and evicted from
+     * [connections], exactly as [fanOutLiveRelay] already does; delivery to
+     * every other connection continues regardless.
+     */
+    fun broadcastPost(encoded: ByteArray) {
+        val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, encoded)
+        onLog("Broadcasting a self-authored post to ${connections.size} connected internet peer(s)")
+        for ((nodeId, channel) in connections) {
+            try {
+                channel.sendRawBytes(envelope)
+            } catch (e: Exception) {
+                onLog("Broadcast post send failed to a connected internet peer; dropping that connection: ${e.message}")
+                connections.remove(nodeId, channel)
+            }
+        }
+    }
+
+    /**
+     * Broadcasts [row] to every currently-open internet connection, wrapped
+     * as a [WirePayloadType.DONT_RELAY_FLAG] [WireEnvelope] via the same
+     * [DontRelayFlagEntity.toEnvelope] helper [InternetPeerConnection] already
+     * uses for the identical conversion on its own live-relay path (kept
+     * `internal`, not re-duplicated a third time -- see that function's own
+     * doc).
+     *
+     * Deliberately **no** [DontRelayRepository.recordFlag]/`isNew` check
+     * here -- [WifiDirectTransport.broadcastDontRelayFlag] already ran that
+     * check (against the same shared [dontRelayRepository] instance) by the
+     * time [TransportManager.broadcastDontRelayFlag] calls this method;
+     * calling it here too would increment the same distinct-attested-device
+     * counter a second time for one flag. [TransportManager] is responsible
+     * for only calling this method when the WiFi Direct side's own check
+     * found the flag genuinely new -- see [TransportManager
+     * .broadcastDontRelayFlag]'s own doc for exactly how that's sequenced.
+     */
+    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) {
+        val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
+        onLog("Broadcasting a \"don't relay\" flag to ${connections.size} connected internet peer(s)")
+        for ((nodeId, channel) in connections) {
+            try {
+                channel.sendRawBytes(envelope)
+            } catch (e: Exception) {
+                onLog("Broadcast \"don't relay\" flag send failed to a connected internet peer; dropping that connection: ${e.message}")
+                connections.remove(nodeId, channel)
+            }
+        }
+    }
+
+    /**
+     * Broadcasts [request] to every currently-open internet connection,
+     * wrapped as a [WirePayloadType.TIER_KEY_REQUEST] [WireEnvelope] --
+     * mirrors [WifiDirectTransport.broadcastTierKeyRequest] exactly: no
+     * custody concern at all (a tier-key request is never persisted, on
+     * either transport), just a fire-and-forget broadcast to whichever
+     * currently-connected peer, if any, happens to hold the key.
+     */
+    fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
+        val envelope = WireEnvelope.encode(WirePayloadType.TIER_KEY_REQUEST, request.encode())
+        onLog("Broadcasting a tier-key request to ${connections.size} connected internet peer(s)")
+        for ((nodeId, channel) in connections) {
+            try {
+                channel.sendRawBytes(envelope)
+            } catch (e: Exception) {
+                onLog("Broadcast tier-key request send failed to a connected internet peer; dropping that connection: ${e.message}")
                 connections.remove(nodeId, channel)
             }
         }

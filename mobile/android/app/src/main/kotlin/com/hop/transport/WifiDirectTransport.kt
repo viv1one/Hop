@@ -307,8 +307,20 @@ class WifiDirectTransport(
      * for the same reason [broadcastPost] does: without it, a flag recorded
      * exactly as a new connection is being registered could land in neither
      * that connection's backlog nor its live-push set, or in both.
+     *
+     * Returns whether [row] was genuinely new (i.e. whether this method
+     * actually broadcast anything just now) -- `false` for an already-
+     * recorded/expired duplicate. [TransportManager.broadcastDontRelayFlag]
+     * uses this to decide whether to also call
+     * [InternetPeerConnectionManager.broadcastDontRelayFlag]: that method has
+     * no dedup check of its own (see its own doc), so re-flooding open
+     * internet connections with something this WiFi Direct check already
+     * correctly suppressed would silently defeat the dedup this method just
+     * did. This is a backward-compatible change (`Unit` -> `Boolean`) -- its
+     * one prior call site discarded the return value already, which Kotlin
+     * permits unchanged.
      */
-    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) {
+    fun broadcastDontRelayFlag(row: DontRelayFlagEntity): Boolean {
         val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
         val connectionsSnapshot: List<PeerConnection>
         val isNew: Boolean
@@ -323,7 +335,7 @@ class WifiDirectTransport(
         }
         if (!isNew) {
             onLog("\"Don't relay\" flag was already recorded (or already expired); not re-broadcasting")
-            return
+            return false
         }
         onLog("Broadcasting a \"don't relay\" flag to ${connectionsSnapshot.size} connected peer(s)")
         for (connection in connectionsSnapshot) {
@@ -332,6 +344,7 @@ class WifiDirectTransport(
                 activeConnections.remove(connection)
             }
         }
+        return true
     }
 
     /**
@@ -1591,16 +1604,12 @@ private fun DontRelayFlagEnvelope.toEntity(): DontRelayFlagEntity = DontRelayFla
     ttlSeconds = ttlSeconds,
 )
 
-/** Converts a persisted [DontRelayFlagEntity] back to its on-wire [DontRelayFlagEnvelope] shape. */
-private fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayFlagEnvelope(
-    clipHash = clipHash.hexToByteArray(),
-    attestedDeviceKey = attestedDeviceKey.hexToByteArray(),
-    flaggedAtMs = flaggedAtMs,
-    originatedAtMs = originatedAtMs,
-    ttlSeconds = ttlSeconds,
-)
+// DontRelayFlagEntity.toEnvelope()/String.hexToByteArray() used to be duplicated
+// here -- they now live once, as `internal` (module-visible, not just
+// file-visible), in InternetPeerConnection.kt, so this file and
+// InternetPeerConnectionManager.kt (which also needs the exact same
+// conversion for its own broadcastDontRelayFlag) both reuse that single
+// definition instead of each carrying their own copy. See that file's own
+// doc for why `internal` rather than `public`.
 
 private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }
-
-private fun String.hexToByteArray(): ByteArray =
-    ByteArray(length / 2) { i -> ((Character.digit(this[i * 2], 16) shl 4) + Character.digit(this[i * 2 + 1], 16)).toByte() }

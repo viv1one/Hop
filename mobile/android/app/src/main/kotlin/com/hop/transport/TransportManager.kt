@@ -35,7 +35,12 @@ import java.util.concurrent.ConcurrentHashMap
  * WIFI_P2P_CONNECTION_CHANGED_ACTION [BroadcastReceiver] (ported from
  * `com.hop.spike.MainActivity`'s receiver logic -- that file is left
  * untouched, not imported from), [WifiDirectTransport], and [BleDiscovery].
- * Public surface is deliberately narrow: [start]/[stop] and [broadcastPost].
+ * Public surface is deliberately narrow: [start]/[stop] and
+ * [broadcastPost]/[broadcastDontRelayFlag]/[broadcastTierKeyRequest] --
+ * each of these three now fans out over both [wifiDirectTransport] and
+ * [internetPeerConnectionManager] (see that constructor parameter's own
+ * doc), so a caller never needs to know or care that two separate transports
+ * exist underneath.
  *
  * **Lifecycle (deliberate MVP posture, not an oversight):** registers itself
  * as a [DefaultLifecycleObserver] on [ProcessLifecycleOwner] at construction
@@ -73,6 +78,18 @@ class TransportManager(
     bundleRepository: BundleRepository,
     preKeyRotationManager: PreKeyRotationManager,
     getOwnPeerId: suspend () -> String,
+    /**
+     * Phase 4's internet-mode counterpart to [wifiDirectTransport] -- see its
+     * own doc. [broadcastPost]/[broadcastDontRelayFlag]/[broadcastTierKeyRequest]
+     * below each also call the matching method here, so a post/flag/tier-key
+     * request this device itself authors reaches every open internet
+     * connection in addition to every WiFi Direct peer, not just whichever
+     * connection happened to relay something *onto* this device first. A
+     * singleton owned by [com.hop.app.AppContainer], threaded through the
+     * same way [postRepository]/[decayKeyStore]/etc. already are -- not a
+     * second instance constructed here.
+     */
+    private val internetPeerConnectionManager: InternetPeerConnectionManager,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
 ) : DefaultLifecycleObserver {
@@ -210,14 +227,52 @@ class TransportManager(
         bleDiscovery.stopScan()
     }
 
-    /** Delegates to [WifiDirectTransport.broadcastPost] -- see its doc for the persisted relay queue's no-ack/retry semantics. */
-    fun broadcastPost(encoded: ByteArray) = wifiDirectTransport.broadcastPost(encoded)
+    /**
+     * Delegates to both [WifiDirectTransport.broadcastPost] (see its doc for
+     * the persisted relay queue's no-ack/retry semantics) and
+     * [InternetPeerConnectionManager.broadcastPost] -- a self-authored post
+     * now reaches every open internet connection, not just WiFi Direct peers.
+     * Unconditional (unlike [broadcastDontRelayFlag] below): a post has no
+     * dedup check to worry about double-triggering on this device's own
+     * outgoing call.
+     */
+    fun broadcastPost(encoded: ByteArray) {
+        wifiDirectTransport.broadcastPost(encoded)
+        internetPeerConnectionManager.broadcastPost(encoded)
+    }
 
-    /** Delegates to [WifiDirectTransport.broadcastDontRelayFlag] -- see its doc for the persisted flag queue's propagation semantics. */
-    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) = wifiDirectTransport.broadcastDontRelayFlag(row)
+    /**
+     * Delegates to [WifiDirectTransport.broadcastDontRelayFlag] first -- see
+     * its doc for the persisted flag queue's propagation semantics -- and
+     * only calls [InternetPeerConnectionManager.broadcastDontRelayFlag] if
+     * that call reports [row] was genuinely new. Without this ordering, a
+     * duplicate flag (already recorded/expired, which
+     * [WifiDirectTransport.broadcastDontRelayFlag] correctly declines to
+     * re-broadcast to WiFi Direct peers) would still get flooded to every
+     * open internet connection, since [InternetPeerConnectionManager
+     * .broadcastDontRelayFlag] has no dedup check of its own -- see that
+     * method's own doc for why it deliberately doesn't duplicate one.
+     */
+    fun broadcastDontRelayFlag(row: DontRelayFlagEntity) {
+        val isNew = wifiDirectTransport.broadcastDontRelayFlag(row)
+        if (isNew) {
+            internetPeerConnectionManager.broadcastDontRelayFlag(row)
+        }
+    }
 
-    /** Delegates to [WifiDirectTransport.broadcastTierKeyRequest] -- see its doc for the fire-and-forget, no-backlog/no-retry semantics. */
-    fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) = wifiDirectTransport.broadcastTierKeyRequest(request)
+    /**
+     * Delegates to both [WifiDirectTransport.broadcastTierKeyRequest] (see
+     * its doc for the fire-and-forget, no-backlog/no-retry semantics) and
+     * [InternetPeerConnectionManager.broadcastTierKeyRequest] -- a tier-key
+     * request now also reaches every open internet connection, on the
+     * chance a peer reached over the internet (not just local mesh) holds
+     * the key. No custody/dedup concern on either side, so this is
+     * unconditional, same as [broadcastPost].
+     */
+    fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
+        wifiDirectTransport.broadcastTierKeyRequest(request)
+        internetPeerConnectionManager.broadcastTierKeyRequest(request)
+    }
 
     /** Delegates to [WifiDirectTransport.sendToPeer] -- see its doc for the peer-specific (non-broadcast) send semantics. */
     fun sendToPeer(peerId: String, type: WirePayloadType, payload: ByteArray): Boolean =
