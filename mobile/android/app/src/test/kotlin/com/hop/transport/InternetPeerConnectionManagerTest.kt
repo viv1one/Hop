@@ -16,12 +16,14 @@ import com.hop.dht.NodeId
 import com.hop.dht.PeerAddress
 import com.hop.p2p.PeerChannel
 import com.hop.protocol.ContentType
+import com.hop.protocol.DontRelayFlagEnvelope
 import com.hop.protocol.EncryptedFrameCodec
 import com.hop.protocol.Frame
 import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.PreKeyBundleEnvelope
 import com.hop.protocol.ReachTier
 import com.hop.protocol.RelayPolicy
+import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
@@ -39,6 +41,9 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -91,6 +96,31 @@ class InternetPeerConnectionManagerTest {
         postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
         onLog = onLog,
     )
+
+    /**
+     * Raw [Frame.encode] bytes for a fresh, valid Locality post -- the same
+     * shape [freshRelayQueueRow] wraps into a [RelayQueueEntity], but as the
+     * bare bytes needed to build a `POST_FRAME` [WireEnvelope] a test can
+     * send directly over a socket, simulating a post genuinely arriving on
+     * one internet connection (as opposed to [freshRelayQueueRow]'s use --
+     * seeding this device's own *outgoing* backlog).
+     */
+    private fun encodedFrameBytes(tag: String, hopCount: Int = 0): ByteArray {
+        val plaintext = "post bytes for $tag".toByteArray()
+        val clipHash = MessageDigest.getInstance("SHA-256").digest(plaintext)
+        return EncryptedFrameCodec.encode(
+            plaintext = plaintext,
+            clipHash = clipHash,
+            senderDeviceId = ByteArray(Frame.SENDER_DEVICE_ID_SIZE) { it.toByte() },
+            contentType = ContentType.PHOTO,
+            hopCount = hopCount,
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+            reachTier = ReachTier.LOCALITY,
+            dontRelay = false,
+            originGeohashPrefix = "",
+        ).encoded
+    }
 
     /** One valid, relay-eligible [RelayQueueEntity] row -- same [Frame] shape [InternetPeerConnectionTest]'s own `encodedFrame` helper builds. */
     private fun freshRelayQueueRow(tag: String): RelayQueueEntity {
@@ -403,15 +433,227 @@ class InternetPeerConnectionManagerTest {
         assertTrue(sawSendErrorLog, "a mid-backlog send failure must be logged, not thrown: $logs")
     }
 
+    // -- Live relay-flood fanout: content arriving on one open internet
+    // connection propagating onward to *other* already-open internet
+    // connections, live -- as opposed to the connect-time backlog tests
+    // above, which cover only already-queued content offered once at connect
+    // time. --
+
+    @Test
+    fun `a POST_FRAME received on one internet connection propagates live to a second, with hopCount bumped, and is never echoed back`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val manager = newManager(relayQueueDao = relayQueueDao)
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "both contacts must have been dialed")
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA!!)
+        val serverChannelB = PeerChannel(serverSocketB)
+
+        val frameBytes = encodedFrameBytes("live-post")
+        val clipHashHex = Frame.decode(frameBytes).clipHash.joinToString(separator = "") { "%02x".format(it) }
+
+        // This test plays the role of the remote peer on connection A,
+        // sending a genuinely new post -- this is what "content arrives on
+        // one internet connection" means from the manager's own point of view.
+        serverChannelA.sendEnvelope(WireEnvelope(WirePayloadType.POST_FRAME, frameBytes))
+
+        // Must propagate live to connection B, hopCount bumped by exactly one.
+        val relayed = serverChannelB.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, relayed.type)
+        val relayedFrame = Frame.decode(relayed.payload)
+        assertEquals(1, relayedFrame.hopCount, "a live-relayed frame must be re-encoded at hopCount + 1")
+        assertEquals(clipHashHex, relayedFrame.clipHash.joinToString(separator = "") { "%02x".format(it) })
+
+        // Must never be echoed back to the connection it arrived on (A).
+        serverSocketA!!.soTimeout = 500
+        val echoedBack = try {
+            serverSocketA.getInputStream().read()
+            true
+        } catch (e: java.net.SocketTimeoutException) {
+            false
+        }
+        assertTrue(!echoedBack, "a live-relayed frame must never be echoed back to the connection it arrived on")
+
+        // relayRepository.considerForRelay must actually have been invoked --
+        // the shared relayQueueDao now holds a row for this clipHash, stored
+        // at the hop count it was *received* at (0), independent of the
+        // hopCount+1 bumped copy sent onward to B.
+        var tookCustody = false
+        repeat(20) {
+            if (relayQueueDao.getAll().any { it.clipHash == clipHashHex }) {
+                tookCustody = true
+                return@repeat
+            }
+            Thread.sleep(50)
+        }
+        assertTrue(tookCustody, "relayRepository.considerForRelay must have taken custody of the freshly-received frame")
+    }
+
+    @Test
+    fun `a DONT_RELAY_FLAG received on one internet connection propagates live to a second, unchanged, and is never echoed back`() = runBlocking {
+        val manager = newManager()
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "both contacts must have been dialed")
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA!!)
+        val serverChannelB = PeerChannel(serverSocketB)
+
+        val clipHashBytes = MessageDigest.getInstance("SHA-256").digest("live-flag".toByteArray())
+        val deviceKeyBytes = MessageDigest.getInstance("SHA-256").digest("live-flag-device".toByteArray())
+        val flagEnvelope = DontRelayFlagEnvelope(
+            clipHash = clipHashBytes,
+            attestedDeviceKey = deviceKeyBytes,
+            flaggedAtMs = System.currentTimeMillis(),
+            originatedAtMs = System.currentTimeMillis(),
+            ttlSeconds = 3600L,
+        )
+
+        serverChannelA.sendEnvelope(WireEnvelope(WirePayloadType.DONT_RELAY_FLAG, flagEnvelope.encode()))
+
+        val relayed = serverChannelB.receiveEnvelope()
+        assertEquals(WirePayloadType.DONT_RELAY_FLAG, relayed.type)
+        val relayedFlag = DontRelayFlagEnvelope.decode(relayed.payload)
+        assertContentEquals(clipHashBytes, relayedFlag.clipHash)
+        assertContentEquals(deviceKeyBytes, relayedFlag.attestedDeviceKey)
+
+        serverSocketA!!.soTimeout = 500
+        val echoedBack = try {
+            serverSocketA.getInputStream().read()
+            true
+        } catch (e: java.net.SocketTimeoutException) {
+            false
+        }
+        assertTrue(!echoedBack, "a live-relayed \"don't relay\" flag must never be echoed back to the connection it arrived on")
+    }
+
+    @Test
+    fun `with only one open internet connection, a live-relayed frame has nothing to fan out to, and nothing throws or is echoed back`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val manager = newManager(relayQueueDao = relayQueueDao)
+        val listenerA = LoopbackListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null, "the one contact must have been dialed")
+        val serverChannelA = PeerChannel(serverSocketA!!)
+
+        val frameBytes = encodedFrameBytes("live-post-lone-connection")
+        val clipHashHex = Frame.decode(frameBytes).clipHash.joinToString(separator = "") { "%02x".format(it) }
+
+        // Must not throw -- there is no sibling connection to fan out to.
+        serverChannelA.sendEnvelope(WireEnvelope(WirePayloadType.POST_FRAME, frameBytes))
+
+        // Custody must still be taken even though there is nothing to relay to.
+        var tookCustody = false
+        repeat(20) {
+            if (relayQueueDao.getAll().any { it.clipHash == clipHashHex }) {
+                tookCustody = true
+                return@repeat
+            }
+            Thread.sleep(50)
+        }
+        assertTrue(tookCustody, "custody must be taken regardless of fanout width")
+
+        // And nothing must ever be sent back on the one connection that exists.
+        serverSocketA!!.soTimeout = 500
+        val sentBack = try {
+            serverSocketA.getInputStream().read()
+            true
+        } catch (e: java.net.SocketTimeoutException) {
+            false
+        }
+        assertTrue(!sentBack, "with only one connection open, nothing should ever be sent back on it")
+    }
+
+    @Test
+    fun `a sibling connection whose live-relay send fails is evicted, without preventing delivery to a healthy sibling`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val manager = newManager(relayQueueDao = relayQueueDao)
+        val listenerA = LoopbackListener()
+        val listenerB = LoopbackListener()
+        val abortiveListenerC = AbortiveCloseListener()
+        val contactA = loopbackContact(nodeId(0), listenerA.port)
+        val contactB = loopbackContact(nodeId(1), listenerB.port)
+        val contactC = loopbackContact(nodeId(2), abortiveListenerC.port)
+
+        manager.connectToDiscoveredHolders(listOf(contactA, contactB, contactC))
+        val serverSocketA = listenerA.accepted.poll(2, TimeUnit.SECONDS)
+        val serverSocketB = listenerB.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(serverSocketA != null && serverSocketB != null, "the two healthy contacts must have been dialed")
+        serverSocketB!!.soTimeout = 3_000
+        val serverChannelA = PeerChannel(serverSocketA!!)
+        val serverChannelB = PeerChannel(serverSocketB)
+        val acceptedByAbortiveListenerBeforeEvent = abortiveListenerC.acceptedCount.get()
+
+        // Give connection C's own dial/receive machinery a moment to have
+        // actually reached the abortive close before the live-relay event
+        // below -- avoids a benign race where C hasn't even connected yet.
+        repeat(20) {
+            if (abortiveListenerC.acceptedCount.get() > 0) return@repeat
+            Thread.sleep(50)
+        }
+
+        val frameBytes = encodedFrameBytes("live-post-with-dead-sibling")
+        serverChannelA.sendEnvelope(WireEnvelope(WirePayloadType.POST_FRAME, frameBytes))
+
+        // The healthy sibling (B) must still receive the live-relayed frame
+        // despite C being dead -- a slow/failing send to C must never block
+        // or drop delivery to a different, healthy connection.
+        val relayed = serverChannelB.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, relayed.type, "the healthy sibling must still receive the live-relayed frame despite the dead sibling")
+
+        // The dead connection (C) must have been evicted from the registry.
+        // This class's registry is deliberately private (see this test
+        // class's own doc), so eviction is verified indirectly: a later
+        // connectToDiscoveredHolders call for the same contact must be able
+        // to dial (and be accepted by) it again, which would be impossible
+        // if a stale entry still occupied that contact's registry slot.
+        // Eviction may happen via this connection's own receive loop noticing
+        // the abortive close (onClosed) or via the live-relay fanout's own
+        // failed-send cleanup -- both are correct, and TCP's coupled read/
+        // write failure semantics on an already-reset connection make it
+        // impossible to deterministically pin down which one fires first;
+        // either way, the dead entry must not wedge future dials to this
+        // contact.
+        var reconnected = false
+        repeat(20) {
+            manager.connectToDiscoveredHolders(listOf(contactC))
+            if (abortiveListenerC.acceptedCount.get() > acceptedByAbortiveListenerBeforeEvent) {
+                reconnected = true
+                return@repeat
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(reconnected, "once the dead connection is evicted, a later dial to the same contact must succeed again")
+    }
+
     /** A real loopback [ServerSocket] that abortively closes (RST, via `SO_LINGER(true, 0)`) every connection it accepts, immediately, without reading anything -- deterministically forces a write failure on the other end. */
     private class AbortiveCloseListener {
         private val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
         val port: Int get() = serverSocket.localPort
+        /** Counts every accepted (then immediately RST-closed) connection -- used by tests that need to confirm a *second*, later dial actually reached this listener again. */
+        val acceptedCount = AtomicInteger(0)
         init {
             Thread({
                 try {
                     while (true) {
                         val socket = serverSocket.accept()
+                        acceptedCount.incrementAndGet()
                         socket.setSoLinger(true, 0)
                         socket.close()
                     }

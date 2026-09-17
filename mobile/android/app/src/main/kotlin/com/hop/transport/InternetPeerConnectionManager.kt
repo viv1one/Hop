@@ -79,16 +79,32 @@ import java.util.concurrent.ConcurrentHashMap
  * happens on its own dedicated thread rather than inline in
  * [connectToDiscoveredHolders].
  *
+ * **Live relay-flood fanout:** the other half of internet-mode relay-flood
+ * fanout, alongside the connect-time backlog offer above -- a freshly-received
+ * post/message/bundle/"don't relay" flag on any one open connection ([internetPeerConnection]'s
+ * own [InternetPeerConnection.onLiveRelay] callback, invoked from that
+ * connection's own `hop-internet-receive` thread) gets pushed, live, to every
+ * *other* connection currently in [connections] via [PeerChannel.sendRawBytes] --
+ * see [onLiveRelay]'s own doc. This is the only place that can do this fanout:
+ * [InternetPeerConnection] itself has no visibility into any connection but
+ * its own (see that class's own doc), only this manager's [connections]
+ * registry sees every open connection at once. Mirrors
+ * [WifiDirectTransport.handleNewlyReceivedFrame] et al.'s own
+ * "push to every other currently-connected peer, drop a connection whose send
+ * fails" shape, just split across two classes instead of one because of that
+ * visibility difference.
+ *
  * **Explicitly out of scope here (see [InternetPeerConnection]'s own doc for
- * the same boundary at its layer):** internet-mode relay-flood fanout (i.e.
- * pushing a *freshly-received* post/message/bundle/flag onward to *other*
- * already-open internet connections -- the connect-time backlog offer above
- * is a one-shot catch-up on already-queued content, not live fanout), retry/
- * backoff for a failed dial, NAT hole-punching, volunteer relay-node
- * fallback, and any UI surfacing of connection count
- * ([FeedViewModel.discoveredRemoteHolders] was deliberately left unrendered
- * for its own product/UX reason -- this class doesn't invent a new rendering
- * for connection count either).
+ * the same boundary at its layer):** unifying WiFi-Direct and internet
+ * broadcast paths (a *locally-authored* post/flag from this device reaching
+ * open internet connections too, the way [TransportManager.broadcastPost]
+ * reaches WiFi Direct peers, is separate, later work -- this class's fanout
+ * only ever re-relays something that arrived on one internet connection, never
+ * something this device itself just authored), retry/backoff for a failed
+ * dial, NAT hole-punching, volunteer relay-node fallback, and any UI surfacing
+ * of connection count ([FeedViewModel.discoveredRemoteHolders] was
+ * deliberately left unrendered for its own product/UX reason -- this class
+ * doesn't invent a new rendering for connection count either).
  */
 class InternetPeerConnectionManager(
     postRepository: PostRepository,
@@ -108,6 +124,7 @@ class InternetPeerConnectionManager(
     private val internetPeerConnection = InternetPeerConnection(
         postRepository = postRepository,
         decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
         dontRelayRepository = dontRelayRepository,
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
@@ -156,10 +173,14 @@ class InternetPeerConnectionManager(
             }
             newAttempts++
             try {
-                val channel = internetPeerConnection.connectTo(contact) {
-                    connections.remove(contact.id)
-                    onLog("Internet connection closed; removed from the connection registry")
-                }
+                val channel = internetPeerConnection.connectTo(
+                    contact,
+                    onClosed = {
+                        connections.remove(contact.id)
+                        onLog("Internet connection closed; removed from the connection registry")
+                    },
+                    onLiveRelay = ::fanOutLiveRelay,
+                )
                 connections[contact.id] = channel
                 Thread({ sendBacklog(channel) }, "hop-internet-send").start()
             } catch (e: PeerDialException) {
@@ -208,6 +229,58 @@ class InternetPeerConnectionManager(
             } catch (e: Exception) {
                 onLog("Send error while flushing the backlog to a connected internet peer: ${e.message}")
                 break
+            }
+        }
+    }
+
+    /**
+     * [InternetPeerConnection.connectTo]'s `onLiveRelay` callback -- called
+     * from whichever internet connection's own `hop-internet-receive` thread
+     * just took custody of a freshly-received post/message/bundle/"don't
+     * relay" flag (see [InternetPeerConnection.receiveLoop]'s own doc).
+     * Writes [outgoingEnvelopeBytes] (already `hopCount + 1` re-encoded, or
+     * unchanged for a flag) to every [connections] entry except
+     * [arrivedOn] -- reference equality (`!==`), matching
+     * [WifiDirectTransport]'s own `connection === arrivedOn` check for the
+     * identical local-mesh fanout. A send failure is logged and that entry is
+     * removed from [connections] -- mirrors every one of
+     * [WifiDirectTransport]'s own four live-relay handlers' "drop the
+     * connection on failed send" posture exactly.
+     *
+     * Runs synchronously, inline, on the calling connection's own receive
+     * thread rather than being dispatched to a separate thread/coroutine:
+     * [connections] is small by construction ([MAX_NEW_CONNECTIONS_PER_CALL]
+     * bounds how many *new* dials happen per browse cycle, so the realistic
+     * fanout width here is at most a small handful of siblings, not a large
+     * fanout), and each [PeerChannel.sendRawBytes] call is a single already-
+     * buffered socket write -- not the same "real Room I/O plus a whole
+     * backlog of writes" cost [sendBacklog] has, which is why *that* method
+     * (not this one) gets a dedicated thread. A slow/failing write to one
+     * sibling here does briefly delay the write to the next sibling in the
+     * same call (a plain sequential loop), but never blocks a *different*
+     * connection's own receive thread/[receiveEnvelope] call, since each
+     * connection has always run on its own dedicated thread from the start
+     * (see [connectToDiscoveredHolders]'s own `Thread(...)` per dial). Note
+     * this accepts the exact same theoretical risk [WifiDirectTransport]'s
+     * own `PeerConnection.trySend` already accepts for the identical local-
+     * mesh problem -- a genuinely wedged (not merely disconnected) peer could
+     * still block a plain blocking socket `write()` indefinitely, with no
+     * per-write timeout on either path; this isn't a new risk introduced
+     * here, it's the same one this codebase already lives with for WiFi
+     * Direct fanout, now also accepted for the internet-mode case. If
+     * real fanout width or a slow/wedged peer's write-blocking ever proves
+     * this wrong, revisit with a per-sibling-send timeout or an async
+     * dispatch -- unmeasured placeholder reasoning, same posture as
+     * [MAX_NEW_CONNECTIONS_PER_CALL] itself.
+     */
+    private fun fanOutLiveRelay(outgoingEnvelopeBytes: ByteArray, arrivedOn: PeerChannel) {
+        for ((nodeId, channel) in connections) {
+            if (channel === arrivedOn) continue
+            try {
+                channel.sendRawBytes(outgoingEnvelopeBytes)
+            } catch (e: Exception) {
+                onLog("Live relay push failed to a connected internet peer; dropping that connection: ${e.message}")
+                connections.remove(nodeId, channel)
             }
         }
     }

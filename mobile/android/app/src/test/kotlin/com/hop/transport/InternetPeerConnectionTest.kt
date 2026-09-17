@@ -28,6 +28,7 @@ import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -67,9 +68,13 @@ class InternetPeerConnectionTest {
     private val postDao = FakePostDao()
     private val decayKeyStore = DecayKeyStore()
 
-    private fun newConnection(ownPeerId: String = "me"): InternetPeerConnection = InternetPeerConnection(
+    private fun newConnection(
+        ownPeerId: String = "me",
+        relayRepository: RelayRepository = RelayRepository(FakeRelayQueueDao(), RelayPolicy()),
+    ): InternetPeerConnection = InternetPeerConnection(
         postRepository = PostRepository(postDao, decayKeyStore),
         decayKeyStore = decayKeyStore,
+        relayRepository = relayRepository,
         dontRelayRepository = DontRelayRepository(
             flagDao = FakeDontRelayFlagDao(),
             relayQueueDao = FakeRelayQueueDao(),

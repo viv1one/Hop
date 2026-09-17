@@ -1,10 +1,17 @@
 package com.hop.transport
 
 import com.hop.crypto.DecayKeyStore
+import com.hop.data.BundleQueueEntity
+import com.hop.data.DontRelayFlagEntity
+import com.hop.data.PendingMessageEntity
 import com.hop.dht.Contact
 import com.hop.dht.PeerAddress
 import com.hop.p2p.PeerChannel
 import com.hop.p2p.PeerDialer
+import com.hop.protocol.DontRelayFlagEnvelope
+import com.hop.protocol.Frame
+import com.hop.protocol.MessageCiphertextEnvelope
+import com.hop.protocol.PreKeyBundleEnvelope
 import com.hop.protocol.TierKeyResponseEnvelope
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
@@ -12,6 +19,7 @@ import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
+import com.hop.repository.RelayRepository
 import kotlinx.coroutines.runBlocking
 import java.io.EOFException
 import java.io.File
@@ -67,20 +75,22 @@ import java.io.File
  *   time; see "Explicitly out of scope" below).
  * - [DispatchResult.NoOp] is a true no-op.
  * - [DispatchResult.NewPostFrame], [DispatchResult.NewRelayableMessage],
- *   [DispatchResult.NewRelayableBundle], [DispatchResult.DirectBundleAnnounce],
- *   [DispatchResult.NewDontRelayFlag]: custody-taking for every one of these
- *   already happened *inside* [EnvelopeDispatcher.dispatch] itself -- that's
- *   that class's own job, already correct, unchanged by this slice. What
- *   this class explicitly does NOT do is push any of these onward to *other*
- *   internet-connected peers: there is no internet-mode relay-flood/broadcast
- *   concept yet (no `broadcastPost`-equivalent for internet mode, no
- *   multi-connection registry the way [WifiDirectTransport.activeConnections]
- *   is for WiFi Direct). This mirrors how [WifiDirectTransport]'s own
- *   local-mesh relay-flood logic ([WifiDirectTransport.handleNewlyReceivedFrame]
- *   et al.) was itself built as a distinctly later slice, after its basic
- *   dispatch/custody logic already existed and worked. Each of these cases is
- *   logged, not silently swallowed, so the gap stays visible in the logs
- *   rather than looking like a bug.
+ *   [DispatchResult.NewRelayableBundle], [DispatchResult.NewDontRelayFlag]:
+ *   custody-taking for the latter three already happened *inside*
+ *   [EnvelopeDispatcher.dispatch] itself; [DispatchResult.NewPostFrame] is the
+ *   one exception -- this class calls [RelayRepository.considerForRelay]
+ *   itself (mirroring [WifiDirectTransport.handleNewlyReceivedFrame]'s own
+ *   extra step, since [EnvelopeDispatcher.dispatch]'s `POST_FRAME` branch only
+ *   ever calls `receivedFrameStore.handle(...)`). Each of these four then gets
+ *   a `hopCount + 1` re-encoded copy handed to [onLiveRelay] -- this class has
+ *   no visibility into any *other* internet connection ([InternetPeerConnectionManager]
+ *   is the only thing that does, see its own doc), so it never fans out
+ *   directly; it only ever hands the encoded bytes + this connection (to
+ *   exclude on fanout) to the caller-supplied callback. [DispatchResult.DirectBundleAnnounce]
+ *   is logged only, same as [DispatchResult.PeerIdentified] -- a genuine
+ *   direct announce is not itself something to live-relay onward (see
+ *   [WifiDirectTransport]'s own doc for why that case is handled separately
+ *   from [WifiDirectTransport.handleNewlyReceivedBundle]).
  *
  * **Explicitly out of scope for this class (separate, later slices):**
  * - Wiring into [TransportManager]'s `start()`/`stop()` lifecycle, or having
@@ -88,7 +98,10 @@ import java.io.File
  *   This class only needs to correctly connect-and-dispatch when handed a
  *   [Contact] directly, by a test today or a future slice's own trigger
  *   logic later.
- * - Internet-mode relay-flood fanout (see above).
+ * - Fanning a live-relayed item out to *other* internet connections -- that's
+ *   [InternetPeerConnectionManager]'s job (see [onLiveRelay]'s own doc); this
+ *   class only produces the re-encoded bytes and reports which connection to
+ *   exclude.
  * - Connection retry/backoff, managing multiple simultaneous internet
  *   connections, reconnection logic -- this class drives exactly one
  *   connection per instance, once.
@@ -108,6 +121,15 @@ import java.io.File
 class InternetPeerConnection(
     postRepository: PostRepository,
     decayKeyStore: DecayKeyStore,
+    /**
+     * Only used by [handleNewlyReceivedFrame] -- [EnvelopeDispatcher.dispatch]'s
+     * `POST_FRAME` branch does not itself call [RelayRepository.considerForRelay]
+     * (unlike its `PREKEY_BUNDLE`/`MESSAGE_CIPHERTEXT`/`DONT_RELAY_FLAG`
+     * branches, which already do their own custody-taking), mirroring
+     * [WifiDirectTransport]'s own split between [EnvelopeDispatcher.dispatch]
+     * and [WifiDirectTransport.handleNewlyReceivedFrame].
+     */
+    private val relayRepository: RelayRepository,
     dontRelayRepository: DontRelayRepository,
     pendingMessageRepository: PendingMessageRepository,
     bundleRepository: BundleRepository,
@@ -159,20 +181,33 @@ class InternetPeerConnection(
      * is the first real caller that supplies one, to know when to evict a
      * dead connection from its registry.
      *
+     * [onLiveRelay] is invoked, from [receiveLoop]'s own thread, once per
+     * freshly-received (not-a-duplicate) post/message/bundle/"don't relay"
+     * flag this connection takes custody of -- see [receiveLoop]'s doc for
+     * the full reasoning. Defaulted to a no-op for the same
+     * every-existing-caller-keeps-working reason as [onClosed];
+     * [InternetPeerConnectionManager] is the first real caller that supplies
+     * one, to fan a freshly-received item out to its *other* open internet
+     * connections.
+     *
      * Throws [com.hop.p2p.PeerDialException] if every candidate address
      * fails to connect, or [com.hop.dht.PeerAddressDecodeException] if
      * [contact]'s address bytes don't decode -- neither is caught here;
      * callers decide how to handle a failed connection attempt (this slice
-     * has no retry/backoff, per the class doc). [onClosed] is never invoked
-     * for either of these -- the connection never started, so it never
-     * "closed."
+     * has no retry/backoff, per the class doc). Neither [onClosed] nor
+     * [onLiveRelay] is ever invoked for either of these -- the connection
+     * never started, so it never "closed" and never received anything.
      */
-    fun connectTo(contact: Contact, onClosed: () -> Unit = {}): PeerChannel {
+    fun connectTo(
+        contact: Contact,
+        onClosed: () -> Unit = {},
+        onLiveRelay: (outgoingEnvelopeBytes: ByteArray, arrivedOn: PeerChannel) -> Unit = { _, _ -> },
+    ): PeerChannel {
         val candidates = PeerAddress.decodeList(contact.address)
         val socket = PeerDialer.dial(candidates)
         onLog("Dialed an internet peer connection (${candidates.size} candidate address(es))")
         val channel = PeerChannel(socket)
-        Thread({ receiveLoop(channel, onClosed) }, "hop-internet-receive").start()
+        Thread({ receiveLoop(channel, onClosed, onLiveRelay) }, "hop-internet-receive").start()
         return channel
     }
 
@@ -198,8 +233,28 @@ class InternetPeerConnection(
      * [onClosed] runs in a `finally` wrapping the whole loop, so it fires
      * exactly once no matter which exit path (EOF, other I/O error) ends
      * this loop -- see [connectTo]'s doc for why this exists.
+     *
+     * [onLiveRelay] is called once per genuinely-new (not-a-duplicate)
+     * [DispatchResult.NewPostFrame]/[DispatchResult.NewRelayableMessage]/
+     * [DispatchResult.NewRelayableBundle]/[DispatchResult.NewDontRelayFlag]
+     * this loop dispatches, with a `hopCount + 1` re-encoded (unchanged for
+     * a flag, which carries no hop count) [WireEnvelope]-wrapped copy of the
+     * item plus [channel] itself (so the caller knows which connection to
+     * exclude when it fans the item out to any *other* open internet
+     * connections -- this class has no visibility into siblings, only
+     * [InternetPeerConnectionManager] does; see that class's own doc). This
+     * is the live-push half of internet-mode relay-flood fanout -- the
+     * connect-time backlog offer ([InternetPeerConnectionManager.sendBacklog])
+     * is the other, already-built half; together they mirror
+     * [WifiDirectTransport.registerConnectionAndGetBacklog] (connect-time)
+     * plus [WifiDirectTransport.handleNewlyReceivedFrame] et al. (live-push)
+     * for local WiFi Direct peers.
      */
-    fun receiveLoop(channel: PeerChannel, onClosed: () -> Unit = {}) {
+    fun receiveLoop(
+        channel: PeerChannel,
+        onClosed: () -> Unit = {},
+        onLiveRelay: (outgoingEnvelopeBytes: ByteArray, arrivedOn: PeerChannel) -> Unit = { _, _ -> },
+    ) {
         try {
             while (true) {
                 val envelope = try {
@@ -218,27 +273,10 @@ class InternetPeerConnection(
                             onLog("Internet peer identified as ${result.peerId}")
                         is DispatchResult.DirectBundleAnnounce ->
                             onLog("Received a direct prekey bundle announce over an internet connection from ${result.peerId}")
-                        is DispatchResult.NewPostFrame ->
-                            onLog(
-                                "Received a new post over an internet connection and took local custody of it -- " +
-                                    "internet-mode relay-flood fanout to other internet-connected peers is separate " +
-                                    "follow-up work (see this class's own doc), not done here"
-                            )
-                        is DispatchResult.NewRelayableMessage ->
-                            onLog(
-                                "Took relay custody of a message carried over an internet connection -- " +
-                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                            )
-                        is DispatchResult.NewRelayableBundle ->
-                            onLog(
-                                "Took relay custody of a prekey bundle carried over an internet connection -- " +
-                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                            )
-                        is DispatchResult.NewDontRelayFlag ->
-                            onLog(
-                                "Recorded a new \"don't relay\" flag received over an internet connection -- " +
-                                    "internet-mode relay-flood fanout is separate follow-up work, not done here"
-                            )
+                        is DispatchResult.NewPostFrame -> handleNewlyReceivedFrame(result.frame, channel, onLiveRelay)
+                        is DispatchResult.NewRelayableMessage -> handleNewlyReceivedMessage(result.row, channel, onLiveRelay)
+                        is DispatchResult.NewRelayableBundle -> handleNewlyReceivedBundle(result.row, channel, onLiveRelay)
+                        is DispatchResult.NewDontRelayFlag -> handleNewlyReceivedDontRelayFlag(result.row, channel, onLiveRelay)
                         DispatchResult.NoOp -> Unit
                     }
                 } catch (e: Exception) {
@@ -248,6 +286,89 @@ class InternetPeerConnection(
         } finally {
             onClosed()
         }
+    }
+
+    /**
+     * Called once per genuinely-new [Frame] this connection receives (see
+     * [DispatchResult.NewPostFrame]) -- mirrors
+     * [WifiDirectTransport.handleNewlyReceivedFrame] exactly: takes relay
+     * custody via [relayRepository] (the one custody call
+     * [EnvelopeDispatcher.dispatch]'s `POST_FRAME` branch does NOT already do
+     * itself -- see this class's own constructor doc), then hands
+     * [onLiveRelay] a `hopCount + 1` re-encoded [WirePayloadType.POST_FRAME]
+     * copy plus [channel] (the connection to exclude on fanout). Does not
+     * itself iterate any other connection -- see [onLiveRelay]'s own doc for
+     * why.
+     */
+    private fun handleNewlyReceivedFrame(
+        frame: Frame,
+        channel: PeerChannel,
+        onLiveRelay: (ByteArray, PeerChannel) -> Unit,
+    ) {
+        runBlocking { relayRepository.considerForRelay(frame) }
+        val outgoingFrame = frame.copy(hopCount = frame.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, outgoingFrame.encode())
+        onLiveRelay(envelope, channel)
+    }
+
+    /**
+     * Called once per genuinely-new [DontRelayFlagEntity] this connection
+     * records (see [DispatchResult.NewDontRelayFlag]) -- mirrors
+     * [WifiDirectTransport.handleNewlyReceivedDontRelayFlag] exactly: no
+     * extra custody call needed ([DontRelayRepository.recordFlag] already ran
+     * inside [EnvelopeDispatcher.dispatch]), no hop-count bump (a flag never
+     * carries one -- see [DontRelayFlagEnvelope]'s own doc), just re-wraps
+     * [row] and hands it to [onLiveRelay] alongside [channel].
+     */
+    private fun handleNewlyReceivedDontRelayFlag(
+        row: DontRelayFlagEntity,
+        channel: PeerChannel,
+        onLiveRelay: (ByteArray, PeerChannel) -> Unit,
+    ) {
+        val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
+        onLiveRelay(envelope, channel)
+    }
+
+    /**
+     * Called once per genuinely-new [PendingMessageEntity] this connection
+     * takes custody of on behalf of someone else's conversation (see
+     * [DispatchResult.NewRelayableMessage]) -- mirrors
+     * [WifiDirectTransport.handleNewlyReceivedMessage] exactly: no extra
+     * custody call needed ([PendingMessageRepository.considerForRelay]
+     * already ran inside [EnvelopeDispatcher.dispatch]), decodes [row],
+     * bumps `hopCount + 1`, re-wraps, hands it to [onLiveRelay] alongside
+     * [channel].
+     */
+    private fun handleNewlyReceivedMessage(
+        row: PendingMessageEntity,
+        channel: PeerChannel,
+        onLiveRelay: (ByteArray, PeerChannel) -> Unit,
+    ) {
+        val storedEnvelope = MessageCiphertextEnvelope.decode(row.encodedEnvelope)
+        val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, outgoingEnvelope.encode())
+        onLiveRelay(envelope, channel)
+    }
+
+    /**
+     * Called once per genuinely-new [BundleQueueEntity] this connection takes
+     * relay custody of on behalf of a bundle it did not itself announce (see
+     * [DispatchResult.NewRelayableBundle]) -- mirrors
+     * [WifiDirectTransport.handleNewlyReceivedBundle] exactly: no extra
+     * custody call needed ([BundleRepository.considerForRelay] already ran
+     * inside [EnvelopeDispatcher.dispatch]), decodes [row], bumps
+     * `hopCount + 1`, re-wraps, hands it to [onLiveRelay] alongside
+     * [channel].
+     */
+    private fun handleNewlyReceivedBundle(
+        row: BundleQueueEntity,
+        channel: PeerChannel,
+        onLiveRelay: (ByteArray, PeerChannel) -> Unit,
+    ) {
+        val storedEnvelope = PreKeyBundleEnvelope.decode(row.encodedEnvelope)
+        val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
+        val envelope = WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, outgoingEnvelope.encode())
+        onLiveRelay(envelope, channel)
     }
 
     /**
@@ -275,3 +396,22 @@ class InternetPeerConnection(
         }
     }
 }
+
+/**
+ * Converts a persisted [DontRelayFlagEntity] back to its on-wire
+ * [DontRelayFlagEnvelope] shape -- a small, deliberate duplicate of
+ * [WifiDirectTransport]'s own private file-scoped `DontRelayFlagEntity.toEnvelope()`
+ * (that one is private to its own file, not reachable from here, and this
+ * slice does not touch [WifiDirectTransport.kt]). Same shape as
+ * [DontRelayRepository.buildOutgoingFlagBacklog]'s own inline conversion.
+ */
+private fun DontRelayFlagEntity.toEnvelope(): DontRelayFlagEnvelope = DontRelayFlagEnvelope(
+    clipHash = clipHash.hexToByteArray(),
+    attestedDeviceKey = attestedDeviceKey.hexToByteArray(),
+    flaggedAtMs = flaggedAtMs,
+    originatedAtMs = originatedAtMs,
+    ttlSeconds = ttlSeconds,
+)
+
+private fun String.hexToByteArray(): ByteArray =
+    ByteArray(length / 2) { i -> ((Character.digit(this[i * 2], 16) shl 4) + Character.digit(this[i * 2 + 1], 16)).toByte() }
