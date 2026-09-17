@@ -1,6 +1,6 @@
 # HOP Wire Format
 
-Status: **`Frame` version 2, current; socket wire envelope version 1,
+Status: **`Frame` version 3, current; socket wire envelope version 1,
 current.** This is BUILD_PLAN.md's "open decision #4" output for Phase 0,
 extended by Phase 1's encrypted-content-carrying work and, later in Phase 1,
 by the 1:1 encrypted-messaging slice's socket envelope — a versioned frame
@@ -21,8 +21,8 @@ set, or encoding rules MUST bump `version`. A decoder that receives a frame
 with a `version` it does not understand MUST reject it (throw / return an
 error), never guess at the layout. Backward-compatible parsing across
 versions is a later concern once more than one version exists in the field
-concurrently; for now, version 2 is the only defined version and there is no
-compatibility shim — versions 0 and 1 are superseded and are rejected on
+concurrently; for now, version 3 is the only defined version and there is no
+compatibility shim — versions 0, 1, and 2 are superseded and are rejected on
 decode, not silently upgraded.
 
 **Version 1 superseded version 0** to add a `contentType` field
@@ -38,6 +38,22 @@ it doesn't need a breaking wire-format change later." This added two new
 fields (`keyIncluded`, `contentEncryptionKey`) and changed `payload`'s
 semantics from plaintext to ciphertext — both a field-set change and a
 semantic change to an existing field, hence the version bump.
+
+**Version 3 supersedes version 2** to add `originGeohashPrefix` and to make
+`keyIncluded`/`contentEncryptionKey` do real work for the first time: Phase 4
+Slice 9 turns Town/City/Country's `keyIncluded = false` path (built as
+forward-compatible shape in version 2, but never actually exercised — Phase
+1-3 traffic was Locality-only) into the live path it was always meant to be.
+A non-Locality poster's device now needs a way to tell a later holder of the
+post *which cell* to check an inbound tier-membership claim against, without
+ever putting raw origin latitude/longitude on the wire (see
+`com.hop.app.location.LocationProvider`'s "raw lat/lon never hits the wire"
+invariant) — `originGeohashPrefix` (the origin cell's geohash prefix string,
+at the post's own `reachTier`'s precision) is that field. This is a new
+field with a variable-length encoding (see below), hence the version bump.
+Rejected outright, not silently supported alongside version 3, per this
+document's own "no compatibility shim" policy above — the same treatment
+version 2 gave versions 0 and 1.
 
 ## Scope: what this frame is (and isn't)
 
@@ -62,8 +78,11 @@ later phases, relay metadata for a clip neither peer originated).
 ## Design notes
 
 - All multi-byte integers are **big-endian** (network byte order).
-- The frame has a fixed-size header (102 bytes) followed by a variable-length
-  payload.
+- The frame has a header of at least 103 bytes (every fixed-size field plus
+  the empty-`originGeohashPrefix` case), up to 5 bytes larger for a
+  non-empty `originGeohashPrefix`, followed by a variable-length payload —
+  see "`originGeohashPrefix` (Phase 4 Slice 9)" below for why this field
+  specifically isn't fixed-size like the rest of the header.
 - `clipHash` is a content-addressed identifier (SHA-256 of the **plaintext**
   clip/photo payload — see the dedicated section below), not a server-issued
   ID — there is no server to issue one.
@@ -113,52 +132,76 @@ would break. Ciphertext tamper-detection is already covered by AES-GCM's own
 authentication tag (see `ContentEncryption`), so there's no integrity reason
 for `clipHash` to cover ciphertext.
 
-### `keyIncluded` and `contentEncryptionKey` (Phase-4-forward compatibility)
+### `keyIncluded` and `contentEncryptionKey`
 
 Per ADR 0003, reach-tier limits above Locality are enforced by per-tier
 key-wrapping, not by topic-key secrecy (geohash prefixes aren't secret). At
-Locality tier — the only tier Phase 1 has, since DHT/internet-mode doesn't
-exist until Phase 4 — "the ciphertext and key both stay on local mesh only,"
-so the content-encryption key (CEK) travels inline in the same frame as the
-ciphertext it unwraps. `keyIncluded` (a boolean flag) and
-`contentEncryptionKey` (32 fixed-size bytes, raw AES-256 key material) exist
-to carry that.
+Locality tier — the only tier that never touches the DHT — "the ciphertext
+and key both stay on local mesh only," so the content-encryption key (CEK)
+travels inline in the same frame as the ciphertext it unwraps. `keyIncluded`
+(a boolean flag) and `contentEncryptionKey` (32 fixed-size bytes, raw
+AES-256 key material) exist to carry that.
 
-Phase 1's only code path (`EncryptedFrameCodec.encode()`) always sets
-`keyIncluded = true` and inlines a freshly generated CEK. Town/City/Country
-tiers (Phase 4+) will instead set `keyIncluded = false` and distribute the
-unwrap key separately, gated by a tier-membership proof — a client without a
-valid tier claim must not receive that key. The entire point of adding this
-flag *now*, in a phase that only ever sets it to `true`, is so that Phase 4
-can turn it `false` on some frames **without another wire-format version
-bump**. This is a deliberate design bet against a specific future need, not
-speculative Phase 4 logic — no Phase 4 key-distribution mechanism is
-implemented in this repo yet.
+`EncryptedFrameCodec.encode()` sets `keyIncluded` from `reachTier` itself:
+`true` (CEK inlined) only for Locality; `false` for Town/City/Country, which
+instead distribute the unwrap key separately over the socket-level envelope
+(`TIER_KEY_REQUEST`/`TIER_KEY_RESPONSE`, see "Socket-level wire envelope"
+below), gated by a tier-membership proof — a client without a valid tier
+claim must not receive that key. Version 2 added this flag while only ever
+setting it `true` (a deliberate design bet against a specific future need,
+not speculative logic at the time); Phase 4 Slice 9 is what actually turns
+it `false` on real frames and wires the separate key-distribution path
+end-to-end.
 
 `contentEncryptionKey` is a fixed-size 32-byte field, always reserved in the
 header regardless of `keyIncluded` — even when unused (`keyIncluded=false`),
 the field's 32 bytes are still present, zero-filled on encode, and simply
 not read by consumers on decode. This is a deliberate simplicity tradeoff
 over variable-length encoding: 32 bytes of overhead per frame is negligible,
-and it keeps the header a fixed-size structure that's simple to reason about
-and simple to parse (no length-prefix branching for this field), consistent
-with the rest of this header's fixed-size design.
+and it keeps this particular field a fixed-size structure that's simple to
+reason about and simple to parse (no length-prefix branching for this
+field).
 
 Reminder of the actual guarantee here (state plainly, per ADR 0003, do not
 imply more): none of this makes reach-tier access control or decay
 cryptographically absolute against a determined custom client. It raises the
 cost of casual out-of-tier or post-decay access for the stock/reference
-client. A client that captured a live key (inline today, or via Phase 4's
-separate distribution later) can keep decrypting after the fact; this
+client. A client that captured a live key (inline, or via the separate
+tier-key-distribution path) can keep decrypting after the fact; this
 mechanism does not — and is not meant to — prevent that.
 
-## Byte layout (version 2)
+### `originGeohashPrefix` (Phase 4 Slice 9)
 
-Fixed header is 102 bytes, followed by `payloadLength` bytes of payload.
+Empty string for Locality — it never touches the DHT and never needs this
+field at all. For Town/City/Country, the post's own origin cell, encoded at
+that tier's own geohash precision (`ReachTierGeohash.precisionFor`, at most
+5 ASCII characters for TOWN) — computed once at post time by the poster's
+device, which is the only device that ever reads a real latitude/longitude
+for this post. This field is what lets any *other* device holding this post
+answer a `TIER_KEY_REQUEST` for it later: it can recompute the same
+target-cell-plus-neighbors set a poster's own device would
+(`ReachTierGeohash.targetCellPrefixes(originGeohashPrefix)`, or equivalently
+`Geohash.neighbors(originGeohashPrefix) + originGeohashPrefix`) and check an
+inbound `TierMembershipClaim` against it, without that responding device
+ever having (or needing) the post's raw origin coordinates — those never
+travel on the wire anywhere in this codebase.
+
+Unlike `contentEncryptionKey`, this field is length-prefixed (1 byte — the
+longest tier precision, TOWN, is only 5 characters, so a uint8 length is
+ample) rather than fixed-size: a fixed 5-byte reservation would cost every
+single Locality frame (the overwhelming majority of traffic historically)
+5 bytes for a field Locality never uses, whereas a length-prefixed empty
+string costs only the 1-byte length prefix itself.
+
+## Byte layout (version 3)
+
+Header is at least 103 bytes (empty `originGeohashPrefix`) and at most 108
+bytes (`originGeohashPrefix` at TOWN's 5-character precision), followed by
+`payloadLength` bytes of payload.
 
 | Offset | Length (bytes) | Field                   | Type            | Description                                                                 |
 |-------:|----------------:|--------------------------|-----------------|------------------------------------------------------------------------------|
-| 0      | 1               | `version`                | uint8           | Wire format version. `2` for this cut.                                      |
+| 0      | 1               | `version`                | uint8           | Wire format version. `3` for this cut.                                      |
 | 1      | 32              | `clipHash`               | bytes[32]       | SHA-256 hash of the **plaintext** clip/photo payload; content-addressed identifier. See "Encryption" above for why this hashes plaintext, not ciphertext. |
 | 33     | 16              | `senderDeviceId`         | bytes[16]       | Random ephemeral per-install device ID. Not a persistent account identity.  |
 | 49     | 1               | `contentType`            | uint8 (enum)    | `0`=PHOTO, `1`=VIDEO (BUILD_PLAN.md decision #4, PRD §4.1).                 |
@@ -167,12 +210,14 @@ Fixed header is 102 bytes, followed by `payloadLength` bytes of payload.
 | 59     | 4               | `ttlSeconds`             | uint32          | Time-to-live in seconds from `originatedAtMs`; also the decay-key window fed to `DecayKeyStore.store()`. |
 | 63     | 1               | `reachTier`              | uint8 (enum)    | `0`=LOCALITY, `1`=TOWN, `2`=CITY, `3`=COUNTRY (PRD §4.2).                    |
 | 64     | 1               | `dontRelay`               | uint8 (bool)    | Community propagation-control signal. `0`=false, `1`=true.                  |
-| 65     | 1               | `keyIncluded`             | uint8 (bool)    | Whether `contentEncryptionKey` below is populated. `0`=false, `1`=true. Always `1` in Phase 1 (Locality-only); Phase 4 introduces `0` for DHT-gated tiers. |
+| 65     | 1               | `keyIncluded`             | uint8 (bool)    | Whether `contentEncryptionKey` below is populated. `0`=false, `1`=true. `1` only for LOCALITY; `0` for TOWN/CITY/COUNTRY, which distribute the key separately (see "`keyIncluded` and `contentEncryptionKey`" above). |
 | 66     | 32              | `contentEncryptionKey`    | bytes[32]       | Raw AES-256 content-encryption key (CEK) if `keyIncluded`; zero-filled and ignored otherwise. Always reserved (fixed-size) even when unused — see "Encryption" above. |
-| 98     | 4               | `payloadLength`           | uint32          | Length in bytes of `payload`.                                               |
-| 102    | `payloadLength` | `payload`                 | bytes           | Ciphertext: `iv (12 bytes) || ciphertext-with-appended-GCM-tag`, the exact blob produced by `ContentEncryption.encrypt()`. |
+| 98     | 1               | `originGeohashPrefixLength` | uint8        | Byte length of `originGeohashPrefix` below. `0` for LOCALITY.               |
+| 99     | `originGeohashPrefixLength` | `originGeohashPrefix` | UTF-8 string | Post's origin cell at its own tier's geohash precision. Empty for LOCALITY. See "`originGeohashPrefix`" above. |
+| 99 + `originGeohashPrefixLength` | 4 | `payloadLength` | uint32 | Length in bytes of `payload`. |
+| 103 + `originGeohashPrefixLength` | `payloadLength` | `payload` | bytes | Ciphertext: `iv (12 bytes) || ciphertext-with-appended-GCM-tag`, the exact blob produced by `ContentEncryption.encrypt()`. |
 
-Total frame size = `102 + payloadLength` bytes.
+Total frame size = `103 + originGeohashPrefixLength + payloadLength` bytes.
 
 ### `contentType` enum values
 
@@ -203,18 +248,19 @@ scope (do not implement these against this frame yet):
   `dontRelay` (Phase 1/2).
 - Geohash-tier resolution logic (Phase 1+; `reachTier` here is just a
   transported value).
-- Town/City/Country DHT-gated key distribution (`keyIncluded = false` code
-  paths, tier-membership proofs) — Phase 4. This wire format is built to
-  carry that without another version bump, but the distribution mechanism
-  itself isn't implemented yet.
 - Multi-frame chunking for large clips (today's implementation sends one
   frame with the whole clip as `payload`).
-- Actually wiring `TIER_KEY_REQUEST`/`TIER_KEY_RESPONSE` over a live socket in
-  `mobile/android/` (`TransportManager`/`EnvelopeDispatcher`), or changing
-  `EncryptedFrameCodec.decode()`'s current unconditional throw on
-  `keyIncluded = false` to call `ReachTierKeyDistribution` — both wire shape
-  and decision logic exist (see below and `ReachTierKeyDistribution.kt`); the
-  transport plumbing that calls them is separate, later work.
+- **The requesting side** of `TIER_KEY_REQUEST`/`TIER_KEY_RESPONSE`: a device
+  proactively deciding to *send* a `TIER_KEY_REQUEST` when it's missing a key
+  for a post it's holding (who to ask, retry/timeout policy, which
+  connection to use) is still open design work for a follow-up slice.
+  `EncryptedFrameCodec.decryptFromStore` simply returns `null` for a tiered
+  post whose key hasn't arrived yet, same as an already-decayed post from
+  the caller's point of view — see `ReachTierKeyDistribution`'s own "Explicitly
+  out of scope" note. **The responding side** (answering an inbound
+  `TIER_KEY_REQUEST` for a post this device holds) is wired end-to-end as of
+  Phase 4 Slice 9 — see `com.hop.transport.EnvelopeDispatcher.dispatch`'s
+  `TIER_KEY_REQUEST` branch.
 - Messaging (1:1/group Double Ratchet) — that's a separate `crypto/`
   concern from post/clip content encryption; `Frame` itself carries post
   content only, never chat messages. (The socket-level wire envelope below

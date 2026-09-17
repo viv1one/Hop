@@ -68,4 +68,27 @@ object ReachTierGeohash {
         val target = Geohash.encode(latitude, longitude, precision)
         return (Geohash.neighbors(target) + target).toSet()
     }
+
+    /**
+     * Same target-cell-plus-neighbors set as the lat/lon overload above, but
+     * computed directly from an already-known geohash-prefix string --
+     * exactly the composition [targetCellPrefixes] itself already uses
+     * (`Geohash.neighbors(target) + target`), just without needing to encode
+     * from raw coordinates first.
+     *
+     * This is what lets a *responder* (e.g. [ReachTierKeyDistribution]'s
+     * transport-layer caller, answering a [TierKeyRequestEnvelope] for a post
+     * it's holding) run the same cell check a poster's own device would,
+     * using only [Frame.originGeohashPrefix] -- the responder never has, and
+     * never needs, the post's raw origin latitude/longitude (which never
+     * travels on the wire at all, see [Frame]'s own doc).
+     *
+     * [originGeohashPrefix] is trusted as already being at its tier's own
+     * precision (the caller's responsibility, exactly as [Frame.originGeohashPrefix]
+     * documents) -- this function does no precision validation of its own,
+     * since (unlike the lat/lon overload) it has no [ReachTier] to validate
+     * against.
+     */
+    fun targetCellPrefixes(originGeohashPrefix: String): Set<String> =
+        (Geohash.neighbors(originGeohashPrefix) + originGeohashPrefix).toSet()
 }

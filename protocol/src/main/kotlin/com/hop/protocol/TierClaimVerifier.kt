@@ -28,4 +28,20 @@ object TierClaimVerifier {
      */
     fun isWithinTier(claim: TierMembershipClaim, targetLatitude: Double, targetLongitude: Double): Boolean =
         claim.geohashPrefix in ReachTierGeohash.targetCellPrefixes(targetLatitude, targetLongitude, claim.reachTier)
+
+    /**
+     * Same check as the lat/lon overload above, but for a responder that only
+     * holds the post's own [Frame.originGeohashPrefix] (a peer relaying/
+     * storing someone else's post never has, and never needs, that post's
+     * raw origin coordinates -- see [ReachTierGeohash.targetCellPrefixes]'s
+     * String overload). [targetGeohashPrefix] is trusted as already being at
+     * [claim]'s tier's own precision, matching [Frame.originGeohashPrefix]'s
+     * own documented invariant; this function does not itself validate that
+     * the two precisions agree, so callers responsible for that (Frame
+     * carries `reachTier` alongside `originGeohashPrefix` for exactly this
+     * reason) should confirm `claim.reachTier` matches the post's own
+     * `reachTier` before calling this.
+     */
+    fun isWithinTier(claim: TierMembershipClaim, targetGeohashPrefix: String): Boolean =
+        claim.geohashPrefix in ReachTierGeohash.targetCellPrefixes(targetGeohashPrefix)
 }

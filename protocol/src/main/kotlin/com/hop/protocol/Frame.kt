@@ -48,11 +48,11 @@ enum class ContentType(val wireValue: Int) {
 }
 
 /**
- * Reference implementation of the HOP wire frame, version 2.
+ * Reference implementation of the HOP wire frame, version 3.
  *
  * See /protocol/WIRE_FORMAT.md for the authoritative spec: byte layout,
  * field semantics, and the BLE-is-discovery-only / this-frame-is-the-WiFi-
- * Direct-transfer-frame distinction. This class implements version 2 only —
+ * Direct-transfer-frame distinction. This class implements version 3 only —
  * a future version bump is a new format, not a silent field change here.
  *
  * [Frame] is a pure wire envelope: it encodes/decodes raw bytes and has no
@@ -62,6 +62,18 @@ enum class ContentType(val wireValue: Int) {
  * orchestration that produces those bytes lives in `EncryptedFrameCodec`
  * (which does depend on `crypto/`, per ADR 0001's one-way rule) — see
  * /protocol/WIRE_FORMAT.md.
+ *
+ * **Version 3 adds [originGeohashPrefix]** — the post's origin-cell geohash
+ * prefix at its own [reachTier]'s precision (see `ReachTierGeohash.precisionFor`),
+ * computed once at post time. Empty for [ReachTier.LOCALITY] — never used
+ * there, matching how [contentEncryptionKey] is "only meaningful when
+ * [keyIncluded]". For Town/City/Country, this is what lets a peer holding
+ * this post later answer a [TierKeyRequestEnvelope] (a [TierMembershipClaim]
+ * check against `Geohash.neighbors(originGeohashPrefix) + originGeohashPrefix`,
+ * via `ReachTierGeohash.targetCellPrefixes(String)`/`TierClaimVerifier`) without
+ * ever needing this device's raw origin latitude/longitude, which this frame
+ * never carries and never will (see `com.hop.app.location.LocationProvider`'s
+ * "raw lat/lon never hits the wire" invariant).
  *
  * Note: [clipHash], [senderDeviceId], [contentEncryptionKey], and [payload]
  * are [ByteArray]s, so this class overrides [equals]/[hashCode] to compare
@@ -80,6 +92,14 @@ class Frame(
     val dontRelay: Boolean,
     val keyIncluded: Boolean,
     val contentEncryptionKey: ByteArray,
+    /**
+     * Empty string for [ReachTier.LOCALITY] (never used there — it never
+     * touches the DHT, ADR 0003). For Town/City/Country, the post's origin
+     * cell at [reachTier]'s own geohash precision. Defaults to `""` so every
+     * pre-version-3 call site in this codebase (which only ever posted at
+     * Locality) keeps compiling unchanged.
+     */
+    val originGeohashPrefix: String = "",
     val payload: ByteArray,
 ) {
     init {
@@ -96,6 +116,11 @@ class Frame(
         require(contentEncryptionKey.size == CONTENT_ENCRYPTION_KEY_SIZE) {
             "contentEncryptionKey must be $CONTENT_ENCRYPTION_KEY_SIZE bytes, was ${contentEncryptionKey.size}"
         }
+        require(originGeohashPrefix.toByteArray(Charsets.UTF_8).size <= MAX_ORIGIN_GEOHASH_PREFIX_LENGTH) {
+            "originGeohashPrefix must be at most $MAX_ORIGIN_GEOHASH_PREFIX_LENGTH bytes " +
+                "(TOWN's own geohash precision, the longest tier prefix), was " +
+                "${originGeohashPrefix.toByteArray(Charsets.UTF_8).size}"
+        }
         require(payload.size.toLong() <= 0xFFFFFFFFL) {
             "payload length must fit in a uint32, was ${payload.size}"
         }
@@ -103,7 +128,8 @@ class Frame(
 
     /** Encodes this frame as a big-endian byte array per /protocol/WIRE_FORMAT.md. */
     fun encode(): ByteArray {
-        val buffer = ByteBuffer.allocate(HEADER_SIZE + payload.size)
+        val originGeohashPrefixBytes = originGeohashPrefix.toByteArray(Charsets.UTF_8)
+        val buffer = ByteBuffer.allocate(HEADER_SIZE + originGeohashPrefixBytes.size + payload.size)
         buffer.order(ByteOrder.BIG_ENDIAN)
         buffer.put(version.toByte())
         buffer.put(clipHash)
@@ -121,6 +147,16 @@ class Frame(
         // /protocol/WIRE_FORMAT.md; it's not an invitation to carry stale key
         // material in an unused field).
         buffer.put(if (keyIncluded) contentEncryptionKey else ByteArray(CONTENT_ENCRYPTION_KEY_SIZE))
+        // originGeohashPrefix is length-prefixed (1 byte -- the longest tier
+        // precision, TOWN, is only 5 ASCII characters, so a uint8 length is
+        // ample and cheaper per-frame than the 4-byte length prefixes used
+        // elsewhere on this wire for genuinely unbounded strings (e.g.
+        // PreKeyBundleEnvelope.peerId)) rather than fixed-size like
+        // contentEncryptionKey above -- a fixed reservation would mean paying
+        // 5 bytes on every single Locality frame (the overwhelming majority
+        // of traffic) for a field Locality never uses at all.
+        buffer.put(originGeohashPrefixBytes.size.toByte())
+        buffer.put(originGeohashPrefixBytes)
         buffer.putInt(payload.size)
         buffer.put(payload)
         return buffer.array()
@@ -140,6 +176,7 @@ class Frame(
             dontRelay == other.dontRelay &&
             keyIncluded == other.keyIncluded &&
             contentEncryptionKey.contentEquals(other.contentEncryptionKey) &&
+            originGeohashPrefix == other.originGeohashPrefix &&
             payload.contentEquals(other.payload)
     }
 
@@ -155,6 +192,7 @@ class Frame(
         result = 31 * result + dontRelay.hashCode()
         result = 31 * result + keyIncluded.hashCode()
         result = 31 * result + contentEncryptionKey.contentHashCode()
+        result = 31 * result + originGeohashPrefix.hashCode()
         result = 31 * result + payload.contentHashCode()
         return result
     }
@@ -183,6 +221,7 @@ class Frame(
         dontRelay = dontRelay,
         keyIncluded = keyIncluded,
         contentEncryptionKey = contentEncryptionKey,
+        originGeohashPrefix = originGeohashPrefix,
         payload = payload,
     )
 
@@ -190,30 +229,58 @@ class Frame(
         "Frame(version=$version, clipHash=${clipHash.size}b, senderDeviceId=${senderDeviceId.size}b, " +
             "contentType=$contentType, hopCount=$hopCount, originatedAtMs=$originatedAtMs, ttlSeconds=$ttlSeconds, " +
             "reachTier=$reachTier, dontRelay=$dontRelay, keyIncluded=$keyIncluded, " +
-            "contentEncryptionKey=${contentEncryptionKey.size}b, payload=${payload.size}b)"
+            "contentEncryptionKey=${contentEncryptionKey.size}b, originGeohashPrefix=$originGeohashPrefix, " +
+            "payload=${payload.size}b)"
 
     companion object {
         /** Current wire format version implemented by this reference implementation. */
-        const val CURRENT_VERSION: Int = 2
+        const val CURRENT_VERSION: Int = 3
 
         const val CLIP_HASH_SIZE: Int = 32
         const val SENDER_DEVICE_ID_SIZE: Int = 16
         const val CONTENT_ENCRYPTION_KEY_SIZE: Int = 32
 
-        /** Fixed header size in bytes: everything before the variable-length payload. */
-        const val HEADER_SIZE: Int =
-            1 + CLIP_HASH_SIZE + SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1 + 1 + CONTENT_ENCRYPTION_KEY_SIZE + 4 // = 102
+        /**
+         * The longest tier geohash precision any [originGeohashPrefix] can be --
+         * TOWN's `ReachTierGeohash.precisionFor` value (5). Kept as a literal
+         * here (not a direct reference to `ReachTierGeohash`) so `Frame`'s own
+         * wire-level validation doesn't need to import tier-precision policy;
+         * `ReachTierGeohash`'s own doc remains the one source of truth for
+         * *why* 5, this is just the wire-format bound derived from it.
+         */
+        const val MAX_ORIGIN_GEOHASH_PREFIX_LENGTH: Int = 5
 
         /**
-         * Decodes [bytes] into a [Frame] per /protocol/WIRE_FORMAT.md version 2.
+         * Minimum total header size in bytes: every fixed-size field
+         * (`version` through `contentEncryptionKey`) plus the 1-byte
+         * `originGeohashPrefix` length prefix plus the 4-byte `payloadLength`
+         * -- i.e. the header size when `originGeohashPrefix` is empty
+         * (always true for Locality, and the common case overall since
+         * Locality is the only tier Phase 1-3 traffic ever used). A
+         * non-Locality frame's actual header is up to
+         * [MAX_ORIGIN_GEOHASH_PREFIX_LENGTH] bytes larger than this.
+         */
+        const val HEADER_SIZE: Int =
+            1 + CLIP_HASH_SIZE + SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1 + 1 + CONTENT_ENCRYPTION_KEY_SIZE + 1 + 4 // = 103
+
+        /**
+         * Decodes [bytes] into a [Frame] per /protocol/WIRE_FORMAT.md version 3.
          *
          * Throws [FrameDecodeException] on:
-         * - fewer than [HEADER_SIZE] bytes (truncated header),
+         * - fewer than [HEADER_SIZE] bytes (truncated header, assuming the
+         *   smallest possible `originGeohashPrefix`),
          * - a `version` byte other than [CURRENT_VERSION] (unknown/future version —
          *   rejected rather than guessed at, since the byte layout for other
-         *   versions is not defined here; this includes versions 0 and 1, which
-         *   this version-2 decoder no longer understands),
+         *   versions is not defined here; this includes versions 0, 1, and 2,
+         *   which this version-3 decoder no longer understands — see
+         *   /protocol/WIRE_FORMAT.md for why version 2 is rejected outright
+         *   rather than silently supported alongside version 3),
          * - an invalid `contentType`, `reachTier`, `dontRelay`, or `keyIncluded` value,
+         * - a declared `originGeohashPrefix` byte length exceeding
+         *   [MAX_ORIGIN_GEOHASH_PREFIX_LENGTH],
+         * - a declared `originGeohashPrefix` byte length longer than the bytes
+         *   actually available (truncated `originGeohashPrefix`, or no room
+         *   left for the trailing `payloadLength` field),
          * - a declared `payloadLength` longer than the bytes actually available
          *   (truncated payload).
          */
@@ -261,6 +328,24 @@ class Frame(
 
             val contentEncryptionKey = ByteArray(CONTENT_ENCRYPTION_KEY_SIZE).also { buffer.get(it) }
 
+            val originGeohashPrefixLength = buffer.get().toInt() and 0xFF
+            if (originGeohashPrefixLength > MAX_ORIGIN_GEOHASH_PREFIX_LENGTH) {
+                throw FrameDecodeException(
+                    "Invalid originGeohashPrefix length=$originGeohashPrefixLength, exceeds the maximum " +
+                        "tier precision ($MAX_ORIGIN_GEOHASH_PREFIX_LENGTH, TOWN's geohash prefix length)"
+                )
+            }
+            // Need enough remaining bytes for the prefix itself PLUS the
+            // trailing 4-byte payloadLength field that always follows it.
+            if (originGeohashPrefixLength > buffer.remaining() - 4) {
+                throw FrameDecodeException(
+                    "Truncated frame: declared originGeohashPrefix length=$originGeohashPrefixLength but only " +
+                        "${buffer.remaining()} bytes remain (need that many plus 4 for payloadLength)"
+                )
+            }
+            val originGeohashPrefixBytes = ByteArray(originGeohashPrefixLength).also { buffer.get(it) }
+            val originGeohashPrefix = String(originGeohashPrefixBytes, Charsets.UTF_8)
+
             val payloadLength = buffer.int.toLong() and 0xFFFFFFFFL
             val remaining = buffer.remaining().toLong()
             if (payloadLength > remaining) {
@@ -283,6 +368,7 @@ class Frame(
                 dontRelay = dontRelay,
                 keyIncluded = keyIncluded,
                 contentEncryptionKey = contentEncryptionKey,
+                originGeohashPrefix = originGeohashPrefix,
                 payload = payload,
             )
         }

@@ -43,6 +43,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
 import com.hop.protocol.ContentType
 import com.hop.protocol.ReachTier
+import com.hop.protocol.Geohash
+import com.hop.protocol.ReachTierGeohash
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -102,6 +104,25 @@ fun PostComposerScreen(
                             } else {
                                 subscription.publish(location.latitude, location.longitude, tier)
                             }
+                        }
+                    },
+                    // Phase 4 Slice 9: the other narrow capability composed
+                    // from container.locationProvider, alongside publishToDht
+                    // above -- resolves this device's current location into
+                    // the geohash-prefix string PostComposerViewModel.post()
+                    // stamps onto Frame.originGeohashPrefix for a Town/City/
+                    // Country post, so a later peer can answer a
+                    // TIER_KEY_REQUEST for it without ever learning this
+                    // device's raw coordinates. Returns null (never throws)
+                    // exactly when publishToDht's own location read would
+                    // have skipped -- that view model already treats null
+                    // as "post with an empty originGeohashPrefix," logged,
+                    // never surfaced to the user (mesh mechanics stay
+                    // invisible, PRD §5).
+                    getOriginGeohashPrefix = { tier ->
+                        val location = container.locationProvider.currentLocation()
+                        location?.let {
+                            Geohash.encode(it.latitude, it.longitude, ReachTierGeohash.precisionFor(tier))
                         }
                     },
                 )

@@ -9,6 +9,7 @@ import com.hop.protocol.ContentType
 import com.hop.protocol.EncryptedFrameCodec
 import com.hop.protocol.Frame
 import com.hop.protocol.ReachTier
+import com.hop.protocol.ReachTierKeyDistribution
 import com.hop.repository.PostRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -82,6 +83,27 @@ import java.time.Duration
  * logged, never allowed to undo or fail the post itself -- by the time
  * [publishToDht] runs, the post already exists locally and has already been
  * handed to [broadcastPost].
+ *
+ * [getOriginGeohashPrefix] is Phase 4 Slice 9's other narrow location-reading
+ * capability, alongside [publishToDht]: resolves this device's current
+ * location into a geohash-prefix string at [reachTier]'s own precision
+ * (`ReachTierGeohash.precisionFor`), for tiers above Locality only. Same
+ * "narrow suspend function, not a whole `LocationProvider`" pattern as
+ * every other capability on this constructor -- [PostComposerScreen] composes
+ * it from `container.locationProvider` + `ReachTierGeohash`/`Geohash`,
+ * exactly where [publishToDht]'s own composition already has a
+ * `LocationProvider` in scope, rather than adding a second concrete Android
+ * dependency to this view model. Returns `null` when no location fix is
+ * available right now (mirrors `LocationProvider.currentLocation()`'s own
+ * "unavailable for any reason" contract) -- [post] below logs that and
+ * falls back to an empty `originGeohashPrefix` rather than failing the post
+ * itself, matching [publishToDht]'s "never undo an already-locally-saved
+ * post" posture. An empty `originGeohashPrefix` is a real limitation, not a
+ * silent no-op: per ADR 0003, no peer will ever be able to answer a future
+ * `TierKeyRequestEnvelope` for this post (a valid claim can never match an
+ * empty target-cell set), so this device's own non-Locality post becomes
+ * permanently key-less for everyone, itself included past whatever it
+ * already has locally in [decayKeyStore].
  */
 class PostComposerViewModel(
     private val defaultReachTier: Flow<ReachTier?>,
@@ -91,6 +113,7 @@ class PostComposerViewModel(
     private val postsDir: File,
     private val broadcastPost: (ByteArray) -> Unit,
     private val publishToDht: suspend (ReachTier) -> Unit = {},
+    private val getOriginGeohashPrefix: suspend (ReachTier) -> String? = { null },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
 
@@ -144,6 +167,28 @@ class PostComposerViewModel(
                 // below decides whether/what to publish to the DHT.
                 val reachTier = _uiState.value.selectedReachTier
 
+                // Resolved once, up front, same as reachTier above -- never
+                // for LOCALITY (it never touches the DHT, ADR 0003, and
+                // Frame.originGeohashPrefix is unused there). Calling this
+                // before the ioDispatcher switch below is fine even though
+                // it's a real suspend call: LocationProvider's own
+                // implementation is main-thread-safe (suspendCancellableCoroutine
+                // over a Play Services callback), same as publishToDht's own
+                // composition already assumes.
+                val originGeohashPrefix = if (reachTier == ReachTier.LOCALITY) {
+                    ""
+                } else {
+                    getOriginGeohashPrefix(reachTier) ?: run {
+                        android.util.Log.d(
+                            "PostComposerViewModel",
+                            "No location available for a $reachTier post -- posting with an empty " +
+                                "originGeohashPrefix (no peer will be able to answer a future tier-key " +
+                                "request for it)",
+                        )
+                        ""
+                    }
+                }
+
                 // viewModelScope.launch runs on Dispatchers.Main.immediate by
                 // default. decayKeyStore.store() (-> RoomDecayKeyStorage ->
                 // DecayKeyDao.insertOrReplace, deliberately non-suspend/blocking
@@ -162,7 +207,7 @@ class PostComposerViewModel(
                     val ttlSeconds = ttlSecondsFor(reachTier)
                     val originatedAtMs = System.currentTimeMillis()
 
-                    val encoded = EncryptedFrameCodec.encode(
+                    val encodeResult = EncryptedFrameCodec.encode(
                         plaintext = bytes,
                         clipHash = clipHash,
                         senderDeviceId = senderDeviceId,
@@ -172,19 +217,39 @@ class PostComposerViewModel(
                         ttlSeconds = ttlSeconds,
                         reachTier = reachTier,
                         dontRelay = false,
+                        originGeohashPrefix = originGeohashPrefix,
                     )
+                    val encoded = encodeResult.encoded
 
-                    // Extract the CEK actually embedded in the frame we just built --
-                    // never call ContentEncryption.generateKey() again here, that
-                    // would produce a key that doesn't match what's in `encoded`,
-                    // silently making this post undecryptable even by its own
-                    // sender.
+                    // Decoded back only to recover the ciphertext `payload`
+                    // for the disk write below -- the real content-encryption
+                    // key comes directly from `encodeResult.contentEncryptionKey`
+                    // now, never by decoding it back out of `encoded`. That
+                    // decode-it-back trick (this function's pre-Phase-4-Slice-9
+                    // shape) only worked because encode() used to always
+                    // inline the real key on the wire; for Town/City/Country,
+                    // `encoded`'s own copy is zero-filled (keyIncluded=false),
+                    // so decoding it back here would silently make this
+                    // device's own post undecryptable even by its own sender.
                     val frame = Frame.decode(encoded)
                     val clipHashHex = frame.clipHash.toHexString()
 
+                    // Storage key mirrors ReachTierKeyDistribution's own
+                    // per-tier composition -- LOCALITY keeps the plain
+                    // clipHashHex key (unchanged pre-Slice-9 behavior);
+                    // Town/City/Country store under the tiered key so this
+                    // device's own later re-view of its own post (via
+                    // PostRepository.decrypt) and any peer's later
+                    // TIER_KEY_REQUEST lookup (via
+                    // EnvelopeDispatcher.dispatch) both find the same entry.
+                    val decayKeyStorageKey = if (reachTier == ReachTier.LOCALITY) {
+                        clipHashHex
+                    } else {
+                        ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, reachTier)
+                    }
                     decayKeyStore.store(
-                        contentId = clipHashHex,
-                        wrappedCek = frame.contentEncryptionKey,
+                        contentId = decayKeyStorageKey,
+                        wrappedCek = encodeResult.contentEncryptionKey,
                         decayWindow = Duration.ofSeconds(ttlSeconds),
                     )
 
@@ -200,6 +265,7 @@ class PostComposerViewModel(
                             originatedAtMs = originatedAtMs,
                             ttlSeconds = ttlSeconds,
                             reachTier = reachTier.name,
+                            originGeohashPrefix = originGeohashPrefix,
                             dontRelay = false,
                             receivedAtMs = System.currentTimeMillis(),
                             encryptedPayloadFilePath = payloadFile.absolutePath,

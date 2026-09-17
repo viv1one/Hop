@@ -133,4 +133,38 @@ object ReachTierKeyDistribution {
 
         return decayKeyStore.retrieve(decayKeyStorageKey(contentId, claim.reachTier))
     }
+
+    /**
+     * Same decision as the lat/lon [releaseKeyFor] overload above, but for a
+     * responder that only holds the post's own [Frame.originGeohashPrefix] --
+     * the shape [mobile/android/]'s transport layer actually has on hand
+     * (see [PostEntity]'s own `originGeohashPrefix` column), since it never
+     * has and never needs the post's raw origin latitude/longitude (which
+     * never travels on the wire, see [Frame]'s own doc). Delegates to
+     * [TierClaimVerifier]'s matching String overload for the cell check;
+     * every other check (claim staleness, the tier-specific key's own decay)
+     * is identical to the lat/lon overload.
+     */
+    fun releaseKeyFor(
+        claim: TierMembershipClaim,
+        contentId: String,
+        originGeohashPrefix: String,
+        decayKeyStore: DecayKeyStore,
+        relayPolicy: RelayPolicy = RelayPolicy(),
+        claimMaxAgeSeconds: Long = DEFAULT_CLAIM_MAX_AGE_SECONDS,
+    ): ByteArray? {
+        if (!TierClaimVerifier.isWithinTier(claim, originGeohashPrefix)) {
+            return null
+        }
+
+        val claimIsStale = relayPolicy.isExpired(
+            originatedAtMs = claim.claimedAtMs,
+            ttlSeconds = claimMaxAgeSeconds,
+        )
+        if (claimIsStale) {
+            return null
+        }
+
+        return decayKeyStore.retrieve(decayKeyStorageKey(contentId, claim.reachTier))
+    }
 }

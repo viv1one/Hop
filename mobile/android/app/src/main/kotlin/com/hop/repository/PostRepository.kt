@@ -4,6 +4,7 @@ import com.hop.crypto.DecayKeyStore
 import com.hop.data.PostDao
 import com.hop.data.PostEntity
 import com.hop.protocol.EncryptedFrameCodec
+import com.hop.protocol.ReachTier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -71,8 +72,14 @@ open class PostRepository(
     /**
      * Reads the ciphertext blob at [PostEntity.encryptedPayloadFilePath] and
      * decrypts it via [EncryptedFrameCodec.decryptFromStore], which looks up
-     * the still-live content-encryption key from [decayKeyStore] keyed by
-     * [PostEntity.clipHash].
+     * the still-live content-encryption key from [decayKeyStore] under a key
+     * that depends on [PostEntity.reachTier]: the plain hex-encoded
+     * [PostEntity.clipHash] for LOCALITY, or
+     * [com.hop.protocol.ReachTierKeyDistribution.decayKeyStorageKey] for
+     * Town/City/Country -- must agree with however the key was stored for
+     * this post in the first place (see [PostComposerViewModel.post]'s own
+     * storage choice for a self-authored post, or
+     * [ReceivedFrameStore.handle]'s for a received one).
      *
      * Runs on [Dispatchers.IO]: this does blocking file I/O plus
      * [DecayKeyStore]'s synchronous (non-suspend, potentially Room-blocking)
@@ -85,6 +92,7 @@ open class PostRepository(
             clipHash = post.clipHash.hexToByteArray(),
             encryptedPayload = ciphertext,
             decayKeyStore = decayKeyStore,
+            reachTier = ReachTier.valueOf(post.reachTier),
         )
         if (plaintext == null) DecryptResult.Decayed else DecryptResult.Decrypted(plaintext)
     }

@@ -66,7 +66,14 @@ import androidx.room.RoomDatabase
  * is also what silently capped Phase 2 Slice 4's group messaging to
  * creator<->member reachability only (two members who'd each only met the
  * creator, never each other, could never actually message directly -- see
- * [GroupEntity]'s own doc for that named gap). No
+ * [GroupEntity]'s own doc for that named gap). Version bumped 10 -> 11 to add
+ * [PostEntity.originGeohashPrefix] (Phase 4 Slice 9: the DHT-gated
+ * key-distribution machinery `ReachTierKeyDistribution`/`TierKeyRequestEnvelope`/
+ * `TierKeyResponseEnvelope` actually taking effect end-to-end) -- see that
+ * column's own doc for why it's persisted rather than re-derived: a device
+ * holding a Town/City/Country post needs its origin cell on hand to answer
+ * a later `TIER_KEY_REQUEST` for it, and this device's own raw location at
+ * receipt time (if even available) is not the post's origin location. No
  * `Migration` is provided for any bump -- `Room.databaseBuilder(...).fallbackToDestructiveMigration()`
  * (see `AppContainer`) is the deliberate choice here, not an oversight: no
  * real users/on-device data exist yet for this database, so there's nothing
@@ -96,7 +103,7 @@ import androidx.room.RoomDatabase
         GroupMessageEntity::class,
         BundleQueueEntity::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = false,
 )
 abstract class HopDatabase : RoomDatabase() {

@@ -8,6 +8,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import javax.crypto.AEADBadTagException
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -45,8 +46,10 @@ class EncryptedFrameCodecTest {
         plaintext: ByteArray,
         clipHash: ByteArray = sampleClipHash(),
         ttlSeconds: Long = 3600L,
+        reachTier: ReachTier = ReachTier.LOCALITY,
+        originGeohashPrefix: String = "",
     ): Pair<ByteArray, ByteArray> {
-        val encoded = EncryptedFrameCodec.encode(
+        val result = EncryptedFrameCodec.encode(
             plaintext = plaintext,
             clipHash = clipHash,
             senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
@@ -54,10 +57,11 @@ class EncryptedFrameCodecTest {
             hopCount = 0,
             originatedAtMs = 1_700_000_000_000L,
             ttlSeconds = ttlSeconds,
-            reachTier = ReachTier.LOCALITY,
+            reachTier = reachTier,
             dontRelay = false,
+            originGeohashPrefix = originGeohashPrefix,
         )
-        return encoded to clipHash
+        return result.encoded to clipHash
     }
 
     // --- Round trip: encode -> decode returns the original plaintext ---
@@ -199,5 +203,108 @@ class EncryptedFrameCodecTest {
         assertFailsWith<AEADBadTagException> {
             EncryptedFrameCodec.decryptFromStore(clipHash, tamperedPayload, decayKeyStore)
         }
+    }
+
+    // --- Phase 4 Slice 9: keyIncluded is now per-tier, not always true ---
+
+    @Test
+    fun `encode sets keyIncluded true and inlines the real CEK only for LOCALITY`() {
+        val plaintext = randomBytes(64)
+        val clipHash = sampleClipHash()
+        val result = EncryptedFrameCodec.encode(
+            plaintext = plaintext,
+            clipHash = clipHash,
+            senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
+            contentType = ContentType.PHOTO,
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
+            ttlSeconds = 3600L,
+            reachTier = ReachTier.LOCALITY,
+            dontRelay = false,
+        )
+
+        val frame = Frame.decode(result.encoded)
+        assert(frame.keyIncluded)
+        assertContentEquals(result.contentEncryptionKey, frame.contentEncryptionKey)
+    }
+
+    @Test
+    fun `encode sets keyIncluded false and zero-fills the wire key for every tier above LOCALITY`() {
+        val plaintext = randomBytes(64)
+        for (tier in listOf(ReachTier.TOWN, ReachTier.CITY, ReachTier.COUNTRY)) {
+            val originGeohashPrefix = "abcde".take(ReachTierGeohash.precisionFor(tier))
+            val result = EncryptedFrameCodec.encode(
+                plaintext = plaintext,
+                clipHash = sampleClipHash(),
+                senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
+                contentType = ContentType.PHOTO,
+                hopCount = 0,
+                originatedAtMs = 1_700_000_000_000L,
+                ttlSeconds = 3600L,
+                reachTier = tier,
+                dontRelay = false,
+                originGeohashPrefix = originGeohashPrefix,
+            )
+
+            val frame = Frame.decode(result.encoded)
+            assert(!frame.keyIncluded) { "expected keyIncluded=false for $tier" }
+            assertContentEquals(
+                ByteArray(Frame.CONTENT_ENCRYPTION_KEY_SIZE),
+                frame.contentEncryptionKey,
+                "expected the wire copy to be zero-filled for $tier",
+            )
+            // The real key is still available directly from the EncodeResult,
+            // even though it never reached the wire -- this is the whole
+            // point of returning it separately (see EncodeResult's own doc).
+            assertEquals(Frame.CONTENT_ENCRYPTION_KEY_SIZE, result.contentEncryptionKey.size)
+            assertEquals(originGeohashPrefix, frame.originGeohashPrefix)
+        }
+    }
+
+    @Test
+    fun `decryptFromStore for a non-Locality tier looks up the tiered storage key`() {
+        val plaintext = "a town-tier post".toByteArray()
+        val clipHash = sampleClipHash()
+        val result = EncryptedFrameCodec.encode(
+            plaintext = plaintext,
+            clipHash = clipHash,
+            senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
+            contentType = ContentType.PHOTO,
+            hopCount = 0,
+            originatedAtMs = 1_700_000_000_000L,
+            ttlSeconds = 3600L,
+            reachTier = ReachTier.TOWN,
+            dontRelay = false,
+            originGeohashPrefix = "abcde",
+        )
+        val decayKeyStore = DecayKeyStore()
+        val contentId = clipHash.joinToString("") { "%02x".format(it) }
+
+        // Store it the way a poster's device / a tier-key-grant would --
+        // under the tiered composition, never the plain contentId.
+        decayKeyStore.store(
+            contentId = ReachTierKeyDistribution.decayKeyStorageKey(contentId, ReachTier.TOWN),
+            wrappedCek = result.contentEncryptionKey,
+            decayWindow = Duration.ofSeconds(3600L),
+        )
+
+        // A lookup under the plain (Locality) key must miss -- proves the
+        // tiered composition is actually load-bearing here, not incidental.
+        val plainKeyLookup = EncryptedFrameCodec.decryptFromStore(
+            clipHash = clipHash,
+            encryptedPayload = Frame.decode(result.encoded).payload,
+            decayKeyStore = decayKeyStore,
+            reachTier = ReachTier.LOCALITY,
+        )
+        assertNull(plainKeyLookup, "a LOCALITY-keyed lookup must not find a TOWN-tier post's key")
+
+        val tieredLookup = EncryptedFrameCodec.decryptFromStore(
+            clipHash = clipHash,
+            encryptedPayload = Frame.decode(result.encoded).payload,
+            decayKeyStore = decayKeyStore,
+            reachTier = ReachTier.TOWN,
+        )
+        assertNotNull(tieredLookup)
+        assertContentEquals(plaintext, tieredLookup)
     }
 }

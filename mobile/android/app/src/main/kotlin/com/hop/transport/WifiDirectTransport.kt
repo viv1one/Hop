@@ -17,7 +17,12 @@ import com.hop.protocol.DontRelayFlagEnvelope
 import com.hop.protocol.Frame
 import com.hop.protocol.MessageCiphertextEnvelope
 import com.hop.protocol.PreKeyBundleEnvelope
+import com.hop.protocol.ReachTier
+import com.hop.protocol.ReachTierKeyDistribution
 import com.hop.protocol.RelayPolicy
+import com.hop.protocol.TierKeyRequestEnvelope
+import com.hop.protocol.TierKeyResponseEnvelope
+import com.hop.protocol.TierMembershipClaim
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
 import com.hop.repository.BundleRepository
@@ -199,6 +204,8 @@ class WifiDirectTransport(
     /** Routes a decoded [WireEnvelope] to the right handler -- see [EnvelopeDispatcher]'s own doc. */
     private val envelopeDispatcher = EnvelopeDispatcher(
         receivedFrameStore = receivedFrameStore,
+        postRepository = postRepository,
+        decayKeyStore = decayKeyStore,
         dontRelayRepository = dontRelayRepository,
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
@@ -871,6 +878,8 @@ class WifiDirectTransport(
                             if (result.row != null) handleNewlyReceivedBundle(result.row, arrivedOn = connection)
                             deliverAnyPendingMessagesTo(result.peerId, connection)
                         }
+                        is DispatchResult.TierKeyRequestAnswered ->
+                            handleTierKeyRequestAnswered(result.response, arrivedOn = connection)
                         DispatchResult.NoOp -> Unit
                     }
                     onLog("Received and handled a ${envelope.type} envelope")
@@ -1003,6 +1012,42 @@ class WifiDirectTransport(
     }
 
     /**
+     * Called once per already-decided [DispatchResult.TierKeyRequestAnswered]
+     * (see [EnvelopeDispatcher.dispatch]'s `TIER_KEY_REQUEST` branch for the
+     * grant/deny decision itself) -- sends [response] directly back over
+     * [arrivedOn], the same connection the original `TIER_KEY_REQUEST`
+     * arrived on.
+     *
+     * Deliberately **not** [sendToPeer] (a lookup by `PeerConnection.remotePeerId`)
+     * even though that method exists for exactly this "answer, not broadcast"
+     * shape elsewhere ([WirePayloadType.PREKEY_BUNDLE]/[MESSAGE_CIPHERTEXT]):
+     * a [TierKeyRequestEnvelope] carries no requester peer id at all (only
+     * `contentId` and a [TierMembershipClaim]), so there is nothing to look
+     * up by, and [arrivedOn].`remotePeerId` might not even be set yet (that
+     * identification normally comes from a separate PREKEY_BUNDLE/
+     * MESSAGE_CIPHERTEXT exchange, which has no guaranteed ordering relative
+     * to an application-level TIER_KEY_REQUEST). Writing directly back on
+     * [arrivedOn] is strictly more robust: request and response are always a
+     * same-connection round trip here (no relay of this exchange in this
+     * slice's scope), so this is guaranteed to reach the actual requester
+     * regardless of whether this connection has been peer-identified yet.
+     *
+     * A `trySend` failure here is logged and otherwise ignored -- matching
+     * every other "best-effort send, never throw" path in this class
+     * ([handleNewlyReceivedFrame]/[handleNewlyReceivedDontRelayFlag]/
+     * [handleNewlyReceivedBundle]); the requester's own follow-up (retry,
+     * treat as a timeout) is exactly the requesting-side work this slice
+     * does not build (see [ReachTierKeyDistribution]'s "Explicitly out of
+     * scope" note).
+     */
+    private fun handleTierKeyRequestAnswered(response: TierKeyResponseEnvelope, arrivedOn: PeerConnection) {
+        val envelope = WireEnvelope.encode(WirePayloadType.TIER_KEY_RESPONSE, response.encode())
+        if (!arrivedOn.trySend(envelope)) {
+            onLog("Failed to send a tier-key response back to the requesting peer")
+        }
+    }
+
+    /**
      * Phase 2 Slice 3's local delivery-confirmation stop signal (see this
      * class's own doc for why no wire-level delivery-ack primitive exists
      * instead): once [connection]'s remote peer id is positively identified
@@ -1089,6 +1134,19 @@ internal class ReceivedFrameStore(
      * in the feed -- the same outcome as any other decayed post, not a
      * special case.
      *
+     * Phase 4 Slice 9: the [decayKeyStore] `store()` call is *also* skipped
+     * whenever `frame.keyIncluded` is false (Town/City/Country -- see
+     * `EncryptedFrameCodec.encode()`'s own doc), regardless of decay --
+     * `frame.contentEncryptionKey` is zero-filled on the wire for those
+     * tiers, so there is no real key to store yet. This is not an error
+     * state: it's the same "undecryptable until a key arrives" shape a
+     * post's own local storage already has for the decayed case, just with
+     * a different reason (never received a key at all, vs. received one
+     * that already expired) -- both render identically as
+     * [com.hop.repository.PostRepository.DecryptResult.Decayed] until (a
+     * follow-up slice's) requesting side fetches the real key via a
+     * `TIER_KEY_REQUEST`.
+     *
      * This never decrypts -- it stores ciphertext + key separately, matching
      * [PostRepository]'s on-demand-decrypt design (`PostRepository.decrypt`),
      * not a force-decrypt-on-receive design.
@@ -1112,9 +1170,19 @@ internal class ReceivedFrameStore(
                 return@runBlocking null
             }
 
-            if (!relayPolicy.isExpired(frame.originatedAtMs, frame.ttlSeconds)) {
+            // Only store a key when the frame actually carries a real one
+            // (LOCALITY -- see EncryptedFrameCodec.encode()'s own doc).
+            // Town/City/Country frames arrive with keyIncluded=false and a
+            // zero-filled contentEncryptionKey; there is nothing to store
+            // yet, the real key arrives later via a TIER_KEY_RESPONSE.
+            if (frame.keyIncluded && !relayPolicy.isExpired(frame.originatedAtMs, frame.ttlSeconds)) {
+                val decayKeyStorageKey = if (frame.reachTier == ReachTier.LOCALITY) {
+                    clipHashHex
+                } else {
+                    ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, frame.reachTier)
+                }
                 decayKeyStore.store(
-                    contentId = clipHashHex,
+                    contentId = decayKeyStorageKey,
                     wrappedCek = frame.contentEncryptionKey,
                     expiresAt = Instant.ofEpochMilli(
                         relayPolicy.expiresAtMs(frame.originatedAtMs, frame.ttlSeconds),
@@ -1134,6 +1202,7 @@ internal class ReceivedFrameStore(
                     originatedAtMs = frame.originatedAtMs,
                     ttlSeconds = frame.ttlSeconds,
                     reachTier = frame.reachTier.name,
+                    originGeohashPrefix = frame.originGeohashPrefix,
                     dontRelay = frame.dontRelay,
                     receivedAtMs = System.currentTimeMillis(),
                     encryptedPayloadFilePath = payloadFile.absolutePath,
@@ -1168,6 +1237,23 @@ internal class ReceivedFrameStore(
  */
 internal class EnvelopeDispatcher(
     private val receivedFrameStore: ReceivedFrameStore,
+    /**
+     * Phase 4 Slice 9: [dispatch]'s [WirePayloadType.TIER_KEY_REQUEST] branch
+     * looks up the requested post here (via [PostRepository.getByClipHash])
+     * to find its [PostEntity.reachTier]/[PostEntity.originGeohashPrefix] --
+     * the two pieces of the claim check [ReachTierKeyDistribution.releaseKeyFor]
+     * needs that a bare [TierKeyRequestEnvelope] doesn't itself carry.
+     */
+    private val postRepository: PostRepository,
+    /**
+     * Phase 4 Slice 9: [dispatch]'s [WirePayloadType.TIER_KEY_REQUEST] branch
+     * passes this straight to [ReachTierKeyDistribution.releaseKeyFor] --
+     * the same store [ReceivedFrameStore]/[PostComposerViewModel] write a
+     * Town/City/Country post's tier-keyed CEK into (see
+     * [ReachTierKeyDistribution.decayKeyStorageKey]'s own doc for the shared
+     * key composition all three call sites must agree on).
+     */
+    private val decayKeyStore: DecayKeyStore,
     /**
      * Phase 2 Slice 2's "don't relay" flag counter -- [dispatch] calls
      * [DontRelayRepository.recordFlag] directly for a
@@ -1220,7 +1306,7 @@ internal class EnvelopeDispatcher(
 ) {
     /**
      * Handles [envelope] and returns what the caller needs to act on next --
-     * see [DispatchResult]'s own doc for the seven cases.
+     * see [DispatchResult]'s own doc for the full set of cases.
      */
     suspend fun dispatch(envelope: WireEnvelope): DispatchResult = when (envelope.type) {
         WirePayloadType.POST_FRAME -> {
@@ -1284,6 +1370,86 @@ internal class EnvelopeDispatcher(
             val isNew = dontRelayRepository.recordFlag(row)
             if (isNew) DispatchResult.NewDontRelayFlag(row) else DispatchResult.NoOp
         }
+        WirePayloadType.TIER_KEY_REQUEST -> {
+            // Decode failures are deliberately left to propagate (mirroring
+            // every other branch above -- none of them try/catch their own
+            // decode() call either) -- WifiDirectTransport.receivePosts'
+            // outer try/catch handles a genuinely malformed envelope. What
+            // must never happen is a *decoded* request going unanswered:
+            // every path below produces a response, granted or denied, never
+            // a throw.
+            val requestEnvelope = TierKeyRequestEnvelope.decode(envelope.payload)
+            val contentIdHex = requestEnvelope.contentId.toHexString()
+            val post = postRepository.getByClipHash(contentIdHex)
+            val response = when {
+                // Not held at all -- nothing to grant.
+                post == null -> TierKeyResponseEnvelope.denied(requestEnvelope.contentId)
+                // A claim's own tier must match the post's actual tier --
+                // different tiers mean different geohash precisions, not
+                // directly comparable cells, so a Town claim can never
+                // legitimately unlock a City-tagged post's key.
+                ReachTier.valueOf(post.reachTier) != requestEnvelope.claim.reachTier ->
+                    TierKeyResponseEnvelope.denied(requestEnvelope.contentId)
+                // No origin cell recorded for this post (e.g. posted without
+                // a location fix -- see PostComposerViewModel's own
+                // documented "empty originGeohashPrefix" limitation). A
+                // claim can never match an empty target-cell set, so deny
+                // rather than run a check that could never pass.
+                post.originGeohashPrefix.isEmpty() -> TierKeyResponseEnvelope.denied(requestEnvelope.contentId)
+                else -> {
+                    val wrappedCek = ReachTierKeyDistribution.releaseKeyFor(
+                        claim = requestEnvelope.claim,
+                        contentId = contentIdHex,
+                        originGeohashPrefix = post.originGeohashPrefix,
+                        decayKeyStore = decayKeyStore,
+                    )
+                    if (wrappedCek != null) {
+                        TierKeyResponseEnvelope.granted(requestEnvelope.contentId, wrappedCek)
+                    } else {
+                        TierKeyResponseEnvelope.denied(requestEnvelope.contentId)
+                    }
+                }
+            }
+            DispatchResult.TierKeyRequestAnswered(response)
+        }
+        WirePayloadType.TIER_KEY_RESPONSE -> {
+            val responseEnvelope = TierKeyResponseEnvelope.decode(envelope.payload)
+            // Requesting-side correlation (who asked, retry/timeout policy,
+            // notifying whatever UI/flow triggered the original request) is
+            // explicitly out of scope for this slice -- see this class's own
+            // doc and ReachTierKeyDistribution's "Explicitly out of scope"
+            // note. As a cheap, correlation-free improvement over discarding
+            // a granted key outright: if this device already holds the post
+            // locally (regardless of whether *this* device is the one that
+            // sent the original request -- a response always arrives on the
+            // connection its matching request went out on, so a device only
+            // ever sees a response to its own request), it already knows the
+            // post's own reachTier and can opportunistically cache the
+            // granted key under the correct tiered DecayKeyStore entry right
+            // now, rather than losing it. A follow-up slice building the
+            // requesting side will likely extend this branch/[DispatchResult]
+            // with real request/response correlation and UI notification.
+            if (responseEnvelope.granted) {
+                val contentIdHex = responseEnvelope.contentId.toHexString()
+                val post = postRepository.getByClipHash(contentIdHex)
+                if (post != null) {
+                    val tier = ReachTier.valueOf(post.reachTier)
+                    // Origin-anchored expiry (Finding A's fix, mirrored here) --
+                    // not "now + ttlSeconds", which would silently re-extend
+                    // this post's decryption-key lifetime past its real decay
+                    // window if this grant arrives a while after the post
+                    // itself originated.
+                    decayKeyStore.store(
+                        contentId = ReachTierKeyDistribution.decayKeyStorageKey(contentIdHex, tier),
+                        wrappedCek = responseEnvelope.wrappedCek,
+                        expiresAt = Instant.ofEpochMilli(
+                            RelayPolicy().expiresAtMs(post.originatedAtMs, post.ttlSeconds),
+                        ),
+                    )
+                }
+            }
+            DispatchResult.NoOp
+        }
     }
 }
 
@@ -1342,10 +1508,17 @@ internal class EnvelopeDispatcher(
  *   tagging the connection -- these two actions are independent, not
  *   mutually exclusive, unlike the hop-gating check that decides between
  *   [DirectBundleAnnounce] and [NewRelayableBundle] in the first place.
+ * - [TierKeyRequestAnswered] (Phase 4 Slice 9): a [WirePayloadType.TIER_KEY_REQUEST]
+ *   envelope arrived and has already been decided -- callers must send the
+ *   carried [TierKeyResponseEnvelope] answer back to the requester (see
+ *   [WifiDirectTransport.handleTierKeyRequestAnswered]).
  * - [NoOp]: nothing further for the caller to do -- either an envelope that
  *   turned out to be an already-seen clipHash/already-recorded flag/
- *   already-held message custody/a stale-or-ineligible bundle, or bytes that
- *   didn't decode.
+ *   already-held message custody/a stale-or-ineligible bundle, bytes that
+ *   didn't decode, or a [WirePayloadType.TIER_KEY_RESPONSE] envelope (Phase 4
+ *   Slice 9's requesting-side correlation is a separate, later slice -- see
+ *   [EnvelopeDispatcher.dispatch]'s `TIER_KEY_RESPONSE` branch for the
+ *   opportunistic local-cache best-effort it does before returning this).
  */
 internal sealed interface DispatchResult {
     data class PeerIdentified(val peerId: String) : DispatchResult
@@ -1354,6 +1527,20 @@ internal sealed interface DispatchResult {
     data class NewRelayableMessage(val row: PendingMessageEntity, val senderPeerId: String) : DispatchResult
     data class NewRelayableBundle(val row: BundleQueueEntity, val peerId: String) : DispatchResult
     data class DirectBundleAnnounce(val row: BundleQueueEntity?, val peerId: String) : DispatchResult
+
+    /**
+     * Phase 4 Slice 9: a [WirePayloadType.TIER_KEY_REQUEST] envelope arrived
+     * and has already been fully decided (granted or denied -- see
+     * [EnvelopeDispatcher.dispatch]'s `TIER_KEY_REQUEST` branch for the
+     * decision itself). Callers must send [response] back to whichever peer
+     * this request arrived from -- see
+     * [WifiDirectTransport.handleTierKeyRequestAnswered]'s own doc for why
+     * that's done by replying directly on the connection the request
+     * arrived on, rather than a [WifiDirectTransport.sendToPeer] lookup by
+     * peer id (a [TierKeyRequestEnvelope] carries no requester peer id at
+     * all -- there is nothing to look up by).
+     */
+    data class TierKeyRequestAnswered(val response: TierKeyResponseEnvelope) : DispatchResult
     data object NoOp : DispatchResult
 }
 

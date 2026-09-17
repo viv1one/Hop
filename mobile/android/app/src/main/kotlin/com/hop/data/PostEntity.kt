@@ -31,6 +31,21 @@ data class PostEntity(
     val ttlSeconds: Long,
     /** [com.hop.protocol.ReachTier] enum name. */
     val reachTier: String,
+    /**
+     * Mirrors [com.hop.protocol.Frame.originGeohashPrefix]: empty for
+     * `LOCALITY` (never used there), otherwise this post's origin cell at
+     * its own [reachTier]'s geohash precision. Defaults to `""` so every
+     * pre-Phase-4-Slice-9 [PostEntity] construction in this codebase (which
+     * only ever posted at LOCALITY) keeps compiling unchanged.
+     *
+     * Persisted (not re-derived) specifically so a device holding this post
+     * can answer an inbound `TierKeyRequestEnvelope` for it later without
+     * ever needing this device's own raw location -- see
+     * `com.hop.transport.EnvelopeDispatcher.dispatch`'s `TIER_KEY_REQUEST`
+     * branch, which reads this column back via [reachTier] to reconstruct
+     * the same target-cell-plus-neighbors set the poster's own device used.
+     */
+    val originGeohashPrefix: String = "",
     val dontRelay: Boolean,
     /**
      * Local wall-clock time this device stored the post -- used for feed

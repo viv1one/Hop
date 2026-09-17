@@ -316,7 +316,7 @@ class RelayTest {
             ttlSeconds = ttlSeconds,
             reachTier = ReachTier.LOCALITY,
             dontRelay = dontRelay,
-        )
+        ).encoded
         return Frame.decode(encoded)
     }
 

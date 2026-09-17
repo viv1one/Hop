@@ -233,7 +233,7 @@ class DontRelayTest {
             ttlSeconds = ttlSeconds,
             reachTier = ReachTier.LOCALITY,
             dontRelay = false,
-        )
+        ).encoded
         return Frame.decode(encoded)
     }
 
@@ -353,7 +353,7 @@ class DontRelayTest {
             ttlSeconds = ttlSeconds,
             reachTier = ReachTier.LOCALITY,
             dontRelay = false,
-        )
+        ).encoded
         val frame = Frame.decode(encoded)
         runBlocking { receiver.relayRepository.considerForRelay(frame) }
 

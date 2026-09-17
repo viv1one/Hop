@@ -20,6 +20,7 @@ class FrameTest {
         dontRelay: Boolean = false,
         keyIncluded: Boolean = true,
         contentEncryptionKey: ByteArray = randomBytes(Frame.CONTENT_ENCRYPTION_KEY_SIZE),
+        originGeohashPrefix: String = "",
         payload: ByteArray = randomBytes(1024),
     ): Frame = Frame(
         clipHash = randomBytes(Frame.CLIP_HASH_SIZE),
@@ -32,6 +33,7 @@ class FrameTest {
         dontRelay = dontRelay,
         keyIncluded = keyIncluded,
         contentEncryptionKey = contentEncryptionKey,
+        originGeohashPrefix = originGeohashPrefix,
         payload = payload,
     )
 
@@ -126,13 +128,77 @@ class FrameTest {
     }
 
     @Test
-    fun `encoded size is header size plus payload size`() {
+    fun `encoded size is header size plus payload size when originGeohashPrefix is empty`() {
         val payload = randomBytes(4321)
         val frame = sampleFrame(payload = payload)
         assertEquals(Frame.HEADER_SIZE + payload.size, frame.encode().size)
     }
 
+    @Test
+    fun `encoded size includes the originGeohashPrefix length prefix and bytes`() {
+        val payload = randomBytes(4321)
+        val frame = sampleFrame(payload = payload, reachTier = ReachTier.TOWN, originGeohashPrefix = "abcde")
+        assertEquals(Frame.HEADER_SIZE + "abcde".length + payload.size, frame.encode().size)
+    }
+
+    // --- Version 3: originGeohashPrefix round trip (Phase 4 Slice 9) ---
+
+    @Test
+    fun `round trip preserves an empty originGeohashPrefix for LOCALITY`() {
+        val original = sampleFrame(reachTier = ReachTier.LOCALITY, originGeohashPrefix = "")
+        val decoded = Frame.decode(original.encode())
+        assertEquals("", decoded.originGeohashPrefix)
+    }
+
+    @Test
+    fun `round trip preserves a non-empty originGeohashPrefix for each non-Locality tier`() {
+        for (tier in listOf(ReachTier.TOWN, ReachTier.CITY, ReachTier.COUNTRY)) {
+            val prefix = "abcde".take(ReachTierGeohash.precisionFor(tier))
+            val original = sampleFrame(reachTier = tier, originGeohashPrefix = prefix)
+            val decoded = Frame.decode(original.encode())
+            assertEquals(prefix, decoded.originGeohashPrefix, "expected round trip to preserve the prefix for $tier")
+            assertEquals(tier, decoded.reachTier)
+        }
+    }
+
+    @Test
+    fun `constructing a frame with an originGeohashPrefix longer than the max tier precision throws`() {
+        assertFailsWith<IllegalArgumentException> {
+            sampleFrame(originGeohashPrefix = "abcdef") // 6 chars, MAX_ORIGIN_GEOHASH_PREFIX_LENGTH is 5
+        }
+    }
+
+    @Test
+    fun `decoding a declared originGeohashPrefix length exceeding the max tier precision throws`() {
+        val bytes = sampleFrame(reachTier = ReachTier.TOWN, originGeohashPrefix = "abcde").encode()
+        // The originGeohashPrefix length byte sits right after contentEncryptionKey.
+        val originGeohashPrefixLengthOffset =
+            1 + Frame.CLIP_HASH_SIZE + Frame.SENDER_DEVICE_ID_SIZE + 1 + 1 + 8 + 4 + 1 + 1 + 1 + Frame.CONTENT_ENCRYPTION_KEY_SIZE
+        bytes[originGeohashPrefixLengthOffset] = 6 // exceeds MAX_ORIGIN_GEOHASH_PREFIX_LENGTH (5)
+
+        assertFailsWith<FrameDecodeException> { Frame.decode(bytes) }
+    }
+
+    @Test
+    fun `copy preserves originGeohashPrefix unchanged`() {
+        val original = sampleFrame(reachTier = ReachTier.CITY, originGeohashPrefix = "wxyz")
+        val copied = original.copy(hopCount = original.hopCount + 1)
+        assertEquals("wxyz", copied.originGeohashPrefix)
+    }
+
     // --- Version handling: unknown/future version must be rejected, not misparsed ---
+
+    @Test
+    fun `decoding version 2 (superseded by originGeohashPrefix) throws instead of misparsing`() {
+        // Version 2's header has no originGeohashPrefix length prefix at all --
+        // this decoder must reject it outright by version byte, per this
+        // codebase's established "no compatibility shim" precedent (version 2
+        // gave the same treatment to versions 0 and 1).
+        val bytes = sampleFrame().encode()
+        bytes[0] = 2
+
+        assertFailsWith<FrameDecodeException> { Frame.decode(bytes) }
+    }
 
     @Test
     fun `decoding an unknown future version throws instead of misparsing`() {
@@ -147,10 +213,10 @@ class FrameTest {
     fun `constructing a frame with a non-current version and decoding it round trips within this version`() {
         // Frame's constructor allows specifying `version` (e.g. for a future encoder
         // that speaks multiple versions), but this decoder only understands
-        // CURRENT_VERSION — anything else must be rejected on decode. Uses version 3
-        // (a not-yet-defined future version) since 2 is CURRENT_VERSION now.
+        // CURRENT_VERSION — anything else must be rejected on decode. Uses version 4
+        // (a not-yet-defined future version) since 3 is CURRENT_VERSION now.
         val frame = Frame(
-            version = 3,
+            version = 4,
             clipHash = randomBytes(Frame.CLIP_HASH_SIZE),
             senderDeviceId = randomBytes(Frame.SENDER_DEVICE_ID_SIZE),
             contentType = ContentType.VIDEO,

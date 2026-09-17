@@ -30,7 +30,11 @@ class WifiDirectTransportTest {
     @get:Rule
     val tempFolder = TemporaryFolder()
 
-    private fun encodedFrame(payloadTag: String): ByteArray {
+    private fun encodedFrame(
+        payloadTag: String,
+        reachTier: ReachTier = ReachTier.LOCALITY,
+        originGeohashPrefix: String = "",
+    ): ByteArray {
         val plaintext = "post bytes for $payloadTag".toByteArray()
         val clipHash = java.security.MessageDigest.getInstance("SHA-256").digest(plaintext)
         return EncryptedFrameCodec.encode(
@@ -41,9 +45,10 @@ class WifiDirectTransportTest {
             hopCount = 0,
             originatedAtMs = 1_700_000_000_000L,
             ttlSeconds = 3600L,
-            reachTier = ReachTier.LOCALITY,
+            reachTier = reachTier,
             dontRelay = false,
-        )
+            originGeohashPrefix = originGeohashPrefix,
+        ).encoded
     }
 
     @Test
@@ -59,6 +64,39 @@ class WifiDirectTransportTest {
 
         assertNotNull(stored, "a newly received frame must be returned so callers can act on it (e.g. relay custody)")
         assertEquals(1, postDao.inserted.size)
+    }
+
+    @Test
+    fun handleDoesNotStoreAKeyForAKeyIncludedFalseFrame() {
+        // Town/City/Country frames arrive with keyIncluded=false (see
+        // EncryptedFrameCodec.encode()'s own doc) -- there is no real key on
+        // the wire to store yet, only a zero-filled placeholder. Storing
+        // that would be worse than a no-op: it would poison the tiered
+        // DecayKeyStore entry with garbage that looks like a real (if
+        // useless) key.
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore()
+        val store = ReceivedFrameStore(
+            postRepository = PostRepository(postDao, decayKeyStore),
+            decayKeyStore = decayKeyStore,
+            postsDir = tempFolder.newFolder("posts-keyless"),
+        )
+        val originGeohashPrefix = "9q8yy"
+        val frameBytes = encodedFrame("town-tier", reachTier = ReachTier.TOWN, originGeohashPrefix = originGeohashPrefix)
+        val clipHashHex = Frame.decode(frameBytes).clipHash.toHexString()
+
+        val stored = store.handle(frameBytes)
+
+        assertNotNull(stored, "the post must still be stored even without a key")
+        assertEquals(false, stored.keyIncluded)
+        assertEquals(originGeohashPrefix, stored.originGeohashPrefix)
+        assertEquals(1, postDao.inserted.size)
+        assertEquals(originGeohashPrefix, postDao.inserted.single().originGeohashPrefix)
+        assertNull(
+            decayKeyStore.retrieve(com.hop.protocol.ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, ReachTier.TOWN)),
+            "no key must be stored for a keyIncluded=false frame, under either the plain or tiered storage key",
+        )
+        assertNull(decayKeyStore.retrieve(clipHashHex))
     }
 
     @Test

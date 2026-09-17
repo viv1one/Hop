@@ -75,6 +75,8 @@ class EnvelopeDispatcherBundleRelayTest {
         val bundleRepository = BundleRepository(dao = bundleQueueDao, relayPolicy = RelayPolicy())
         val dispatcher = EnvelopeDispatcher(
             receivedFrameStore = receivedFrameStore,
+            postRepository = PostRepository(postDao, decayKeyStore),
+            decayKeyStore = decayKeyStore,
             dontRelayRepository = dontRelayRepository,
             pendingMessageRepository = pendingMessageRepository,
             bundleRepository = bundleRepository,

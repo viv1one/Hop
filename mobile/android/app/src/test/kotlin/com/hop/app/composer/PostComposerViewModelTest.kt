@@ -6,6 +6,7 @@ import com.hop.data.PostEntity
 import com.hop.protocol.ContentType
 import com.hop.protocol.EncryptedFrameCodec
 import com.hop.protocol.ReachTier
+import com.hop.protocol.ReachTierKeyDistribution
 import com.hop.repository.PostRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -230,6 +231,103 @@ class PostComposerViewModelTest {
         assertTrue(viewModel.uiState.value.postComplete, "a DHT publish failure must never undo/fail a post that already saved locally")
         assertEquals(null, viewModel.uiState.value.errorMessage)
         assertEquals(1, postDao.inserted.size)
+    }
+
+    @Test
+    fun postForANonLocalityTierStoresTheCekUnderTheTieredKeyAndPersistsTheOriginGeohashPrefix() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        val decayKeyStore = DecayKeyStore()
+        var requestedTier: ReachTier? = null
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.TOWN),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, decayKeyStore),
+            decayKeyStore = decayKeyStore,
+            postsDir = tempFolder.newFolder("posts-tiered"),
+            broadcastPost = {},
+            getOriginGeohashPrefix = { tier -> requestedTier = tier; "9q8yy" },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        val bytes = "a town-tier post".toByteArray()
+        viewModel.post(bytes = bytes, contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete)
+        assertEquals(ReachTier.TOWN, requestedTier, "getOriginGeohashPrefix must be called with the selected reach tier")
+
+        val inserted = postDao.inserted.single()
+        assertEquals("9q8yy", inserted.originGeohashPrefix)
+        assertEquals(ReachTier.TOWN.name, inserted.reachTier)
+
+        // The plain (Locality-shaped) key must NOT exist -- proves the CEK
+        // was actually stored under the tiered composition, not the old
+        // unconditional plain-clipHash key.
+        assertEquals(null, decayKeyStore.retrieve(inserted.clipHash))
+
+        val tieredKey = ReachTierKeyDistribution.decayKeyStorageKey(inserted.clipHash, ReachTier.TOWN)
+        val storedCek = decayKeyStore.retrieve(tieredKey)
+        assertNotNull(storedCek, "the CEK must be retrievable under the tiered storage key")
+
+        // And it must actually be the real key this device's own post was
+        // encrypted under -- decryptFromStore(reachTier = TOWN) must recover
+        // the original plaintext via that same tiered entry.
+        val ciphertext = java.io.File(inserted.encryptedPayloadFilePath).readBytes()
+        val decrypted = EncryptedFrameCodec.decryptFromStore(
+            clipHash = MessageDigest.getInstance("SHA-256").digest(bytes),
+            encryptedPayload = ciphertext,
+            decayKeyStore = decayKeyStore,
+            reachTier = ReachTier.TOWN,
+        )
+        assertNotNull(decrypted)
+        assertTrue(decrypted.contentEquals(bytes))
+    }
+
+    @Test
+    fun postForLocalityNeverCallsGetOriginGeohashPrefix() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        var called = false
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.LOCALITY),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, DecayKeyStore()),
+            decayKeyStore = DecayKeyStore(),
+            postsDir = tempFolder.newFolder("posts-locality-geohash"),
+            broadcastPost = {},
+            getOriginGeohashPrefix = { called = true; "9q8yy" },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.post(bytes = "x".toByteArray(), contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete)
+        assertTrue(!called, "getOriginGeohashPrefix must never be called for LOCALITY -- it never touches the DHT")
+        assertEquals("", postDao.inserted.single().originGeohashPrefix)
+    }
+
+    @Test
+    fun postFallsBackToAnEmptyOriginGeohashPrefixWhenNoLocationIsAvailable() = runTest(testDispatcher) {
+        val postDao = FakePostDao()
+        val viewModel = PostComposerViewModel(
+            defaultReachTier = flowOf(ReachTier.CITY),
+            getOrCreateSenderDeviceId = { fakeSenderDeviceId },
+            postRepository = PostRepository(postDao, DecayKeyStore()),
+            decayKeyStore = DecayKeyStore(),
+            postsDir = tempFolder.newFolder("posts-no-location"),
+            broadcastPost = {},
+            getOriginGeohashPrefix = { null },
+            ioDispatcher = testDispatcher,
+        )
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        viewModel.post(bytes = "x".toByteArray(), contentType = ContentType.PHOTO)
+        testDispatcher.scheduler.advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.postComplete, "a missing location must never fail the post itself")
+        assertEquals("", postDao.inserted.single().originGeohashPrefix)
     }
 
     /** Minimal fake [PostDao] -- only [upsert] is exercised by [PostRepository.insert]. */
