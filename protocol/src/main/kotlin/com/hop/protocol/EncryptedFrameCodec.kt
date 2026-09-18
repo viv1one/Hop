@@ -186,11 +186,9 @@ object EncryptedFrameCodec {
         reachTier: ReachTier = ReachTier.LOCALITY,
     ): ByteArray? {
         val contentId = clipHash.toHexString()
-        val storageKey = if (reachTier == ReachTier.LOCALITY) {
-            contentId
-        } else {
-            ReachTierKeyDistribution.decayKeyStorageKey(contentId, reachTier)
-        }
+        // decayKeyStoreKeyFor encapsulates the LOCALITY special-case itself
+        // -- see that function's own doc.
+        val storageKey = ReachTierKeyDistribution.decayKeyStoreKeyFor(contentId, reachTier)
         val wrappedCek = decayKeyStore.retrieve(storageKey) ?: return null
         val cek = ContentEncryption.keyFromBytes(wrappedCek)
         return ContentEncryption.decrypt(cek, encryptedPayload)

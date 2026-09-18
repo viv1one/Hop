@@ -7,6 +7,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import org.junit.jupiter.api.Test
@@ -272,5 +273,23 @@ class ReachTierKeyDistributionTest {
             "clip-1:3".toByteArray(),
             ReachTierKeyDistribution.decayKeyStorageKey("clip-1", ReachTier.COUNTRY).toByteArray(),
         )
+    }
+
+    // --- decayKeyStoreKeyFor: encapsulates the LOCALITY special-case ---
+
+    @Test
+    fun `decayKeyStoreKeyFor returns the plain contentId unchanged for LOCALITY`() {
+        assertEquals("clip-1", ReachTierKeyDistribution.decayKeyStoreKeyFor("clip-1", ReachTier.LOCALITY))
+    }
+
+    @Test
+    fun `decayKeyStoreKeyFor matches decayKeyStorageKey's own output exactly for every non-LOCALITY tier`() {
+        for (nonLocalityTier in listOf(ReachTier.TOWN, ReachTier.CITY, ReachTier.COUNTRY)) {
+            assertEquals(
+                ReachTierKeyDistribution.decayKeyStorageKey("clip-1", nonLocalityTier),
+                ReachTierKeyDistribution.decayKeyStoreKeyFor("clip-1", nonLocalityTier),
+                "decayKeyStoreKeyFor must match decayKeyStorageKey exactly for $nonLocalityTier",
+            )
+        }
     }
 }

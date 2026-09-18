@@ -46,17 +46,11 @@ data class FindNodeRequestMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported FindNodeRequestMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.FIND_NODE_REQUEST) {
-                throw DhtMessageDecodeException("Expected FIND_NODE_REQUEST type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "FindNodeRequestMessage",
+                expectedType = DhtMessageType.FIND_NODE_REQUEST,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
@@ -135,17 +129,11 @@ data class FindNodeResponseMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported FindNodeResponseMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.FIND_NODE_RESPONSE) {
-                throw DhtMessageDecodeException("Expected FIND_NODE_RESPONSE type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "FindNodeResponseMessage",
+                expectedType = DhtMessageType.FIND_NODE_RESPONSE,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })

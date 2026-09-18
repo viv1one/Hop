@@ -124,18 +124,86 @@ data class DhtMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported DhtMessage version: $version (this decoder only understands version $CURRENT_VERSION)"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
+            val type = DhtMessageHeader.readVersionAndType(buffer, messageTypeName = "DhtMessage")
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
 
             return DhtMessage(type = type, transactionId = transactionId, senderId = senderId)
         }
     }
+}
+
+/**
+ * Shared wire-format helpers every message kind in this module's own
+ * `decode()` otherwise hand-rolled an independent copy of -- factored out
+ * here (`DhtMessage.kt`, the canonical home for the shared
+ * `[1B version][1B type]` header convention every message in this module
+ * agrees on, per [DhtMessageType]'s own doc) so a future message kind can't
+ * silently drift out of sync with how every existing one validates its
+ * header or rewraps a malformed trailing [PeerAddress].
+ *
+ * Additive-only refactor: no caller's accepted/rejected input, wire byte
+ * layout, or error message text changes -- only where the logic that
+ * produces that text lives. Each message kind's own *length* invariant
+ * (fixed [WIRE_SIZE] vs. "at least `HEADER_SIZE`") is still that class's own
+ * responsibility, checked before either helper below is ever called; only
+ * the version/type-byte parsing that follows, and the address-decode rewrap
+ * that some message kinds need afterward, is now shared.
+ */
+internal object DhtMessageHeader {
+    /**
+     * Reads the leading `[1B version][1B type]` fields from [buffer]
+     * (already positioned at offset 0) and returns the decoded
+     * [DhtMessageType] -- rejecting an unsupported version exactly as every
+     * caller's own prior inline check did: `"Unsupported $messageTypeName
+     * version: $version (this decoder only understands version
+     * ${DhtMessage.CURRENT_VERSION})"`.
+     *
+     * Performs no type-match check of its own -- [DhtMessage.decode] is the
+     * one caller that genuinely needs the decoded type back without
+     * asserting it's any one specific value (a [DhtMessage] can legitimately
+     * be PING, PONG, or STORE_RESPONSE). Every other message kind in this
+     * module calls [requireVersionAndType] instead, which adds that
+     * additional check.
+     */
+    fun readVersionAndType(buffer: ByteBuffer, messageTypeName: String): DhtMessageType {
+        val version = buffer.get().toInt() and 0xFF
+        if (version != DhtMessage.CURRENT_VERSION) {
+            throw DhtMessageDecodeException(
+                "Unsupported $messageTypeName version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
+            )
+        }
+        return DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
+    }
+
+    /**
+     * [readVersionAndType] plus the "the type byte must be exactly this one"
+     * check every message kind besides [DhtMessage] itself also performs --
+     * rejecting a mismatch exactly as each caller's own prior inline check
+     * did: `"Expected $expectedType type byte, got $type"`.
+     */
+    fun requireVersionAndType(buffer: ByteBuffer, messageTypeName: String, expectedType: DhtMessageType) {
+        val type = readVersionAndType(buffer, messageTypeName)
+        if (type != expectedType) {
+            throw DhtMessageDecodeException("Expected $expectedType type byte, got $type")
+        }
+    }
+
+    /**
+     * Decodes [addressBytes] as a [PeerAddress], rewrapping a
+     * [PeerAddressDecodeException] into a [DhtMessageDecodeException] -- the
+     * same "malformed trailing address" idiom
+     * [AddressReflectionResponseMessage], [IntroduceRequestMessage],
+     * [IntroduceResponseMessage], and [IntroductionMessage] each otherwise
+     * hand-rolled independently. [fieldName] and [messageTypeName] are folded
+     * into the rewrapped exception's message exactly as each caller's own
+     * prior inline text: `"Malformed $fieldName in $messageTypeName:
+     * ${e.message}"`.
+     */
+    fun decodePeerAddress(addressBytes: ByteArray, fieldName: String, messageTypeName: String): PeerAddress =
+        try {
+            PeerAddress.decode(addressBytes)
+        } catch (e: PeerAddressDecodeException) {
+            throw DhtMessageDecodeException("Malformed $fieldName in $messageTypeName: ${e.message}")
+        }
 }

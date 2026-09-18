@@ -242,11 +242,9 @@ class PostComposerViewModel(
                     // PostRepository.decrypt) and any peer's later
                     // TIER_KEY_REQUEST lookup (via
                     // EnvelopeDispatcher.dispatch) both find the same entry.
-                    val decayKeyStorageKey = if (reachTier == ReachTier.LOCALITY) {
-                        clipHashHex
-                    } else {
-                        ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, reachTier)
-                    }
+                    // decayKeyStoreKeyFor encapsulates the LOCALITY special-case
+                    // itself -- see that function's own doc.
+                    val decayKeyStorageKey = ReachTierKeyDistribution.decayKeyStoreKeyFor(clipHashHex, reachTier)
                     decayKeyStore.store(
                         contentId = decayKeyStorageKey,
                         wrappedCek = encodeResult.contentEncryptionKey,

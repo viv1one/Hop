@@ -45,6 +45,7 @@ import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.system.measureTimeMillis
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -684,6 +685,97 @@ class InternetPeerConnectionManagerTest {
             Thread.sleep(100)
         }
         assertTrue(reconnected, "once the dead connection is evicted, a later dial to the same contact must succeed again")
+    }
+
+    /**
+     * A [Contact] pointing at an RFC 5737 TEST-NET-1 address (192.0.2.0/24)
+     * -- reserved for documentation/example use, so this looks like a
+     * perfectly ordinary routable IPv4 address but is guaranteed to never be
+     * assigned to a real host. In *this* codebase's own sandboxed test
+     * environment, a dial attempt against it was empirically observed to
+     * neither be refused nor "no route"-failed quickly -- it genuinely hangs
+     * until [com.hop.p2p.PeerDialer]'s own `FALLBACK_CONNECT_TIMEOUT_MS`
+     * (2000ms) elapses, faithfully simulating an unreachable/firewalled real
+     * internet peer, the exact scenario this per-call cap's concurrency
+     * matters for.
+     *
+     * That behavior is *not* guaranteed across every environment this test
+     * might run in -- a different network/firewall/OS configuration could
+     * legitimately fail-fast against this address instead of hanging. Doing
+     * so wouldn't make this test *fail*, but it would make it silently stop
+     * testing anything real: 3 fast failures finish quickly whether or not
+     * the fix under test actually runs them concurrently, so the timing
+     * assertion below would pass for the wrong reason. [assumeBlackHoleHangs]
+     * guards against that, matching the same `Assume`-based "skip, don't
+     * silently-pass" posture `com.hop.p2p.PeerDialerTest`'s
+     * `assumeIpv6LoopbackAvailable` already established in this codebase for
+     * the identical class of environment-dependent-network-behavior problem.
+     */
+    private fun blackHoleContact(id: NodeId): Contact = Contact(
+        id = id,
+        address = PeerAddress.encodeList(listOf(PeerAddress.from(InetAddress.getByName("192.0.2.1"), 9))),
+        lastSeenAtMs = 0L,
+    )
+
+    /**
+     * Probes whether [blackHoleContact]'s address genuinely hangs in *this*
+     * environment by dialing it once and checking the single dial took
+     * meaningfully close to the full timeout, not a fast failure -- skips
+     * the calling test (reported as skipped, not failed) via [assumeTrue]
+     * if it doesn't, so the concurrency test below never asserts a timing
+     * claim it can't actually back up here.
+     */
+    private fun assumeBlackHoleHangs() {
+        val probeElapsedMs = measureTimeMillis {
+            try {
+                com.hop.p2p.PeerDialer.dial(
+                    listOf(PeerAddress.from(InetAddress.getByName("192.0.2.1"), 9)),
+                )
+            } catch (e: Exception) {
+                // Expected -- a black-hole dial never succeeds; only its
+                // *timing* is what this probe cares about.
+            }
+        }
+        org.junit.Assume.assumeTrue(
+            "192.0.2.1 did not hang for close to the full connect timeout in this environment " +
+                "(took ${probeElapsedMs}ms) -- skipping, since the concurrency assertion below can't " +
+                "be trusted without a genuinely slow dial to race against",
+            probeElapsedMs > 1_000,
+        )
+    }
+
+    @Test
+    fun `new candidates are dialed concurrently, not sequentially -- total time for 3 slow dials is close to one dial's duration, not three`() = runBlocking {
+        assumeBlackHoleHangs()
+
+        // Each of these 3 contacts is a "black hole" address (see
+        // blackHoleContact's own doc) -- a real dial attempt against any one
+        // of them genuinely blocks for close to
+        // PeerDialer.FALLBACK_CONNECT_TIMEOUT_MS (2000ms) before giving up,
+        // faithfully simulating an unreachable real internet peer. Before
+        // the fix, connectToDiscoveredHolders dialed its (up to 3) new
+        // candidates in a sequential for loop, so 3 slow candidates would
+        // take ~3 * 2000ms; the fix dials them concurrently, so 3 slow
+        // candidates should take ~1 * 2000ms.
+        val contacts = List(3) { index -> blackHoleContact(nodeId(index)) }
+        val logs = mutableListOf<String>()
+        val manager = newManager(onLog = { message -> synchronized(logs) { logs.add(message) } })
+
+        val elapsedMs = measureTimeMillis {
+            manager.connectToDiscoveredHolders(contacts)
+        }
+
+        // Generous tolerance for test-environment jitter: comfortably under
+        // what 3 *sequential* ~2s timeouts would take (~6000ms, the pre-fix
+        // behavior).
+        assertTrue(
+            elapsedMs < 4_500,
+            "3 concurrently-dialed slow candidates should take close to one dial's ~2s timeout, not three sequential ~2s timeouts; took ${elapsedMs}ms",
+        )
+        // Also confirms every one of the 3 slow dials was genuinely
+        // attempted (not silently skipped) -- each logs its own
+        // "Failed to dial" line once its individual timeout elapses.
+        assertEquals(3, logs.count { it.contains("Failed to dial", ignoreCase = true) }, "all 3 slow candidates must still have been attempted: $logs")
     }
 
     /** A real loopback [ServerSocket] that abortively closes (RST, via `SO_LINGER(true, 0)`) every connection it accepts, immediately, without reading anything -- deterministically forces a write failure on the other end. */

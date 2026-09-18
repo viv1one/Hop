@@ -17,6 +17,9 @@ import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -213,36 +216,54 @@ class InternetPeerConnectionManager(
      * `onConnected` instead guarantees registration always happens-before
      * `onClosed` can possibly run, for any connection, regardless of how
      * quickly the remote peer closes it.
+     *
+     * **Dials the (up to [MAX_NEW_CONNECTIONS_PER_CALL]) new candidates
+     * concurrently, not sequentially.** The candidate list -- everything in
+     * [holders] not already in [connections], capped at
+     * [MAX_NEW_CONNECTIONS_PER_CALL] -- is computed once, up front, exactly
+     * mirroring the old sequential loop's own "check dedup, then check cap"
+     * order per contact; only *which contacts get attempted* is decided up
+     * front, not how many run at once. Each candidate's dial then runs as its
+     * own [kotlinx.coroutines.async] child inside a [coroutineScope], so a
+     * slow dial to one candidate (each can block for up to
+     * [com.hop.p2p.PeerDialer.FALLBACK_CONNECT_TIMEOUT_MS] under
+     * [ioDispatcher]) never delays starting the next candidate's own dial --
+     * this function still doesn't return until every one of them (success or
+     * failure) has settled, via [awaitAll]. Registration/cleanup and
+     * per-contact failure handling are unchanged, just running concurrently
+     * instead of one after another.
      */
     suspend fun connectToDiscoveredHolders(holders: List<Contact>) = withContext(ioDispatcher) {
-        var newAttempts = 0
-        for (contact in holders) {
-            if (connections.containsKey(contact.id)) continue
-            if (newAttempts >= MAX_NEW_CONNECTIONS_PER_CALL) {
-                onLog(
-                    "Reached the per-call cap of $MAX_NEW_CONNECTIONS_PER_CALL new internet connection " +
-                        "attempt(s); skipping the remaining discovered holder(s) this cycle -- the next " +
-                        "browse/refresh will try them again"
-                )
-                break
-            }
-            newAttempts++
-            try {
-                val channel = internetPeerConnection.connectTo(
-                    contact,
-                    onConnected = { connectedChannel -> connections[contact.id] = connectedChannel },
-                    onClosed = {
-                        connections.remove(contact.id)
-                        onLog("Internet connection closed; removed from the connection registry")
-                    },
-                    onLiveRelay = ::fanOutLiveRelay,
-                )
-                Thread({ sendBacklog(channel) }, "hop-internet-send").start()
-            } catch (e: PeerDialException) {
-                onLog("Failed to dial a discovered internet peer: ${e.message}")
-            } catch (e: PeerAddressDecodeException) {
-                onLog("Failed to decode a discovered internet peer's address: ${e.message}")
-            }
+        val candidates = holders.filterNot { connections.containsKey(it.id) }
+        val toDial = candidates.take(MAX_NEW_CONNECTIONS_PER_CALL)
+        if (candidates.size > toDial.size) {
+            onLog(
+                "Reached the per-call cap of $MAX_NEW_CONNECTIONS_PER_CALL new internet connection " +
+                    "attempt(s); skipping the remaining discovered holder(s) this cycle -- the next " +
+                    "browse/refresh will try them again"
+            )
+        }
+        coroutineScope {
+            toDial.map { contact ->
+                async {
+                    try {
+                        val channel = internetPeerConnection.connectTo(
+                            contact,
+                            onConnected = { connectedChannel -> connections[contact.id] = connectedChannel },
+                            onClosed = {
+                                connections.remove(contact.id)
+                                onLog("Internet connection closed; removed from the connection registry")
+                            },
+                            onLiveRelay = ::fanOutLiveRelay,
+                        )
+                        Thread({ sendBacklog(channel) }, "hop-internet-send").start()
+                    } catch (e: PeerDialException) {
+                        onLog("Failed to dial a discovered internet peer: ${e.message}")
+                    } catch (e: PeerAddressDecodeException) {
+                        onLog("Failed to decode a discovered internet peer's address: ${e.message}")
+                    }
+                }
+            }.awaitAll()
         }
     }
 
@@ -329,12 +350,32 @@ class InternetPeerConnectionManager(
      * [MAX_NEW_CONNECTIONS_PER_CALL] itself.
      */
     private fun fanOutLiveRelay(outgoingEnvelopeBytes: ByteArray, arrivedOn: PeerChannel) {
+        broadcastToConnections(outgoingEnvelopeBytes, excludeChannel = arrivedOn, failureDescription = "Live relay push")
+    }
+
+    /**
+     * Shared "iterate every open [connections] entry, send [bytes], drop the
+     * entry on a failed send" tail every broadcast/live-relay method in this
+     * class ([fanOutLiveRelay], [broadcastPost], [broadcastDontRelayFlag],
+     * [broadcastTierKeyRequest]) otherwise duplicated verbatim. [excludeChannel],
+     * when non-null, skips that one connection by reference equality (`===`)
+     * -- only [fanOutLiveRelay] ever passes this, to avoid echoing content
+     * back to the connection it just arrived on; the other three callers
+     * broadcast this device's own authored content/flag/request to *every*
+     * open connection, so they never exclude one.
+     *
+     * [failureDescription] is a short, call-site-specific phrase (e.g.
+     * `"Broadcast post send"`) that [onLog] gets folded into, preserving each
+     * call site's own previous log-message text exactly: `"$failureDescription
+     * failed to a connected internet peer; dropping that connection: ${e.message}"`.
+     */
+    private fun broadcastToConnections(bytes: ByteArray, excludeChannel: PeerChannel? = null, failureDescription: String) {
         for ((nodeId, channel) in connections) {
-            if (channel === arrivedOn) continue
+            if (channel === excludeChannel) continue
             try {
-                channel.sendRawBytes(outgoingEnvelopeBytes)
+                channel.sendRawBytes(bytes)
             } catch (e: Exception) {
-                onLog("Live relay push failed to a connected internet peer; dropping that connection: ${e.message}")
+                onLog("$failureDescription failed to a connected internet peer; dropping that connection: ${e.message}")
                 connections.remove(nodeId, channel)
             }
         }
@@ -363,14 +404,7 @@ class InternetPeerConnectionManager(
     fun broadcastPost(encoded: ByteArray) {
         val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, encoded)
         onLog("Broadcasting a self-authored post to ${connections.size} connected internet peer(s)")
-        for ((nodeId, channel) in connections) {
-            try {
-                channel.sendRawBytes(envelope)
-            } catch (e: Exception) {
-                onLog("Broadcast post send failed to a connected internet peer; dropping that connection: ${e.message}")
-                connections.remove(nodeId, channel)
-            }
-        }
+        broadcastToConnections(envelope, failureDescription = "Broadcast post send")
     }
 
     /**
@@ -394,14 +428,7 @@ class InternetPeerConnectionManager(
     fun broadcastDontRelayFlag(row: DontRelayFlagEntity) {
         val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
         onLog("Broadcasting a \"don't relay\" flag to ${connections.size} connected internet peer(s)")
-        for ((nodeId, channel) in connections) {
-            try {
-                channel.sendRawBytes(envelope)
-            } catch (e: Exception) {
-                onLog("Broadcast \"don't relay\" flag send failed to a connected internet peer; dropping that connection: ${e.message}")
-                connections.remove(nodeId, channel)
-            }
-        }
+        broadcastToConnections(envelope, failureDescription = "Broadcast \"don't relay\" flag send")
     }
 
     /**
@@ -415,14 +442,7 @@ class InternetPeerConnectionManager(
     fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
         val envelope = WireEnvelope.encode(WirePayloadType.TIER_KEY_REQUEST, request.encode())
         onLog("Broadcasting a tier-key request to ${connections.size} connected internet peer(s)")
-        for ((nodeId, channel) in connections) {
-            try {
-                channel.sendRawBytes(envelope)
-            } catch (e: Exception) {
-                onLog("Broadcast tier-key request send failed to a connected internet peer; dropping that connection: ${e.message}")
-                connections.remove(nodeId, channel)
-            }
-        }
+        broadcastToConnections(envelope, failureDescription = "Broadcast tier-key request send")
     }
 
     private companion object {

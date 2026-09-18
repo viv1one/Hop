@@ -57,17 +57,11 @@ data class StoreRequestMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported StoreRequestMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.STORE_REQUEST) {
-                throw DhtMessageDecodeException("Expected STORE_REQUEST type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "StoreRequestMessage",
+                expectedType = DhtMessageType.STORE_REQUEST,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })

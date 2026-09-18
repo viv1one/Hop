@@ -65,17 +65,11 @@ data class AddressReflectionRequestMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported AddressReflectionRequestMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.ADDRESS_REFLECTION_REQUEST) {
-                throw DhtMessageDecodeException("Expected ADDRESS_REFLECTION_REQUEST type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "AddressReflectionRequestMessage",
+                expectedType = DhtMessageType.ADDRESS_REFLECTION_REQUEST,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
@@ -144,26 +138,20 @@ data class AddressReflectionResponseMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported AddressReflectionResponseMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.ADDRESS_REFLECTION_RESPONSE) {
-                throw DhtMessageDecodeException("Expected ADDRESS_REFLECTION_RESPONSE type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "AddressReflectionResponseMessage",
+                expectedType = DhtMessageType.ADDRESS_REFLECTION_RESPONSE,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val addressBytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
-            val reflectedAddress = try {
-                PeerAddress.decode(addressBytes)
-            } catch (e: PeerAddressDecodeException) {
-                throw DhtMessageDecodeException("Malformed reflectedAddress in AddressReflectionResponseMessage: ${e.message}")
-            }
+            val reflectedAddress = DhtMessageHeader.decodePeerAddress(
+                addressBytes,
+                fieldName = "reflectedAddress",
+                messageTypeName = "AddressReflectionResponseMessage",
+            )
 
             return AddressReflectionResponseMessage(
                 transactionId = transactionId,

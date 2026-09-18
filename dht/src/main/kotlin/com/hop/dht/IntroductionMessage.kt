@@ -112,27 +112,21 @@ data class IntroduceRequestMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported IntroduceRequestMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.INTRODUCE_REQUEST) {
-                throw DhtMessageDecodeException("Expected INTRODUCE_REQUEST type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "IntroduceRequestMessage",
+                expectedType = DhtMessageType.INTRODUCE_REQUEST,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val targetId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val addressBytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
-            val ownAddress = try {
-                PeerAddress.decode(addressBytes)
-            } catch (e: PeerAddressDecodeException) {
-                throw DhtMessageDecodeException("Malformed ownAddress in IntroduceRequestMessage: ${e.message}")
-            }
+            val ownAddress = DhtMessageHeader.decodePeerAddress(
+                addressBytes,
+                fieldName = "ownAddress",
+                messageTypeName = "IntroduceRequestMessage",
+            )
 
             return IntroduceRequestMessage(transactionId = transactionId, senderId = senderId, targetId = targetId, ownAddress = ownAddress)
         }
@@ -210,17 +204,11 @@ data class IntroduceResponseMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported IntroduceResponseMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.INTRODUCE_RESPONSE) {
-                throw DhtMessageDecodeException("Expected INTRODUCE_RESPONSE type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "IntroduceResponseMessage",
+                expectedType = DhtMessageType.INTRODUCE_RESPONSE,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
@@ -243,11 +231,11 @@ data class IntroduceResponseMessage(
                 return IntroduceResponseMessage(transactionId = transactionId, senderId = senderId, found = false, address = null)
             }
 
-            val address = try {
-                PeerAddress.decode(addressBytes)
-            } catch (e: PeerAddressDecodeException) {
-                throw DhtMessageDecodeException("Malformed address in IntroduceResponseMessage: ${e.message}")
-            }
+            val address = DhtMessageHeader.decodePeerAddress(
+                addressBytes,
+                fieldName = "address",
+                messageTypeName = "IntroduceResponseMessage",
+            )
             return IntroduceResponseMessage(transactionId = transactionId, senderId = senderId, found = true, address = address)
         }
     }
@@ -305,27 +293,21 @@ data class IntroductionMessage(
 
             val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
 
-            val version = buffer.get().toInt() and 0xFF
-            if (version != DhtMessage.CURRENT_VERSION) {
-                throw DhtMessageDecodeException(
-                    "Unsupported IntroductionMessage version: $version (this decoder only understands version ${DhtMessage.CURRENT_VERSION})"
-                )
-            }
-
-            val type = DhtMessageType.fromWireValue(buffer.get().toInt() and 0xFF)
-            if (type != DhtMessageType.INTRODUCTION) {
-                throw DhtMessageDecodeException("Expected INTRODUCTION type byte, got $type")
-            }
+            DhtMessageHeader.requireVersionAndType(
+                buffer,
+                messageTypeName = "IntroductionMessage",
+                expectedType = DhtMessageType.INTRODUCTION,
+            )
 
             val transactionId = TransactionId(ByteArray(TransactionId.SIZE_BYTES).also { buffer.get(it) })
             val senderId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val fromId = NodeId(ByteArray(NodeId.SIZE_BYTES).also { buffer.get(it) })
             val addressBytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
-            val claimedAddress = try {
-                PeerAddress.decode(addressBytes)
-            } catch (e: PeerAddressDecodeException) {
-                throw DhtMessageDecodeException("Malformed claimedAddress in IntroductionMessage: ${e.message}")
-            }
+            val claimedAddress = DhtMessageHeader.decodePeerAddress(
+                addressBytes,
+                fieldName = "claimedAddress",
+                messageTypeName = "IntroductionMessage",
+            )
 
             return IntroductionMessage(transactionId = transactionId, senderId = senderId, fromId = fromId, claimedAddress = claimedAddress)
         }

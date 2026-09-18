@@ -80,6 +80,31 @@ object ReachTierKeyDistribution {
     fun decayKeyStorageKey(contentId: String, tier: ReachTier): String = "$contentId:${tier.wireValue}"
 
     /**
+     * Encapsulates the `LOCALITY` special-case every current call site
+     * ([com.hop.app.composer.PostComposerViewModel], `WifiDirectTransport`'s
+     * `ReceivedFrameStore`, [EncryptedFrameCodec.decryptFromStore]) otherwise
+     * re-implements independently as its own inline
+     * `if (tier == LOCALITY) contentId else decayKeyStorageKey(contentId, tier)`
+     * branch: `LOCALITY` posts never touch this tiered scheme at all -- their
+     * decay key is stored/looked-up under the plain [contentId], unchanged
+     * pre-Slice-9 behavior -- while every other tier uses [decayKeyStorageKey]'s
+     * ordinary per-tier composition. A future fourth call site that calls
+     * [decayKeyStorageKey] directly instead of this function would silently
+     * use the wrong storage key for a `LOCALITY` post; calling this function
+     * instead makes that mistake structurally impossible.
+     *
+     * [decayKeyStorageKey] itself is deliberately left unchanged and still
+     * directly callable -- this is a pure additive wrapper, not a
+     * replacement, since [decayKeyStorageKey]'s own existing contract (a
+     * per-tier composition with no `LOCALITY` awareness of its own) is relied
+     * on directly by [releaseKeyFor] above, which only ever runs for a
+     * Town/City/Country claim (`LOCALITY` never reaches a `TierMembershipClaim`
+     * in the first place -- see that class's own `init`).
+     */
+    fun decayKeyStoreKeyFor(contentId: String, tier: ReachTier): String =
+        if (tier == ReachTier.LOCALITY) contentId else decayKeyStorageKey(contentId, tier)
+
+    /**
      * Decides whether to release the wrapped CEK for [contentId] to whoever
      * presented [claim], given the post's known origin location
      * ([targetLatitude]/[targetLongitude] -- the original poster's location

@@ -298,9 +298,58 @@ class WifiDirectTransport(
             connectionsSnapshot = activeConnections.toList()
         }
         onLog("Broadcasting post (${encoded.size} bytes) to ${connectionsSnapshot.size} connected peer(s)")
-        for (connection in connectionsSnapshot) {
-            if (!connection.trySend(envelope)) {
-                onLog("Live send failed to a connected peer; dropping that connection")
+        broadcastToConnections(envelope, connectionsToSend = connectionsSnapshot, failureDescription = "Live send")
+    }
+
+    /**
+     * Shared "iterate [connectionsToSend] (defaulting to every currently-open
+     * [activeConnections]), `trySend` [envelope], drop the connection on a
+     * failed send" tail every broadcast/live-relay method in this class
+     * otherwise duplicated verbatim: [broadcastPost], [broadcastDontRelayFlag],
+     * [sendMessage]'s flood-offer fallback, [handleNewlyReceivedFrame],
+     * [handleNewlyReceivedDontRelayFlag], [handleNewlyReceivedMessage],
+     * [handleNewlyReceivedBundle], and [broadcastTierKeyRequest].
+     *
+     * [connectionsToSend] defaults to [activeConnections] itself (already
+     * safe for concurrent iteration -- a [CopyOnWriteArrayList]) for the
+     * methods that read it directly. The three callers that must stay
+     * consistent with a persisted-backlog read under [outboxLock]
+     * ([broadcastPost], [broadcastDontRelayFlag], [sendMessage]) instead pass
+     * their own lock-protected snapshot -- either way, a failed send always
+     * evicts from [activeConnections] itself, never merely from whatever list
+     * was iterated, exactly matching every one of these methods' own prior
+     * eviction target.
+     *
+     * [excludeConnection], when non-null, skips that one connection by
+     * reference equality (`===`) -- the four `handleNewlyReceived*` methods
+     * pass [arrivedOn] here, to avoid echoing content back to the connection
+     * it just arrived on; the others never exclude one, since they're this
+     * device's own outbound broadcast of its own content and every open
+     * connection is a legitimate recipient.
+     *
+     * [onSendSucceeded], when supplied, runs only after a *successful* send
+     * to one connection -- [handleNewlyReceivedFrame] is the one caller that
+     * needs this, to award relay points only for a peer that genuinely
+     * received the re-broadcast frame.
+     *
+     * [failureDescription] is a short, call-site-specific phrase (e.g.
+     * `"Live relay push"`) folded into [onLog], preserving each call site's
+     * own previous log-message text exactly: `"$failureDescription failed to
+     * a connected peer; dropping that connection"`.
+     */
+    private fun broadcastToConnections(
+        envelope: ByteArray,
+        connectionsToSend: List<PeerConnection> = activeConnections,
+        excludeConnection: PeerConnection? = null,
+        failureDescription: String,
+        onSendSucceeded: (PeerConnection) -> Unit = {},
+    ) {
+        for (connection in connectionsToSend) {
+            if (connection === excludeConnection) continue
+            if (connection.trySend(envelope)) {
+                onSendSucceeded(connection)
+            } else {
+                onLog("$failureDescription failed to a connected peer; dropping that connection")
                 activeConnections.remove(connection)
             }
         }
@@ -350,12 +399,7 @@ class WifiDirectTransport(
             return false
         }
         onLog("Broadcasting a \"don't relay\" flag to ${connectionsSnapshot.size} connected peer(s)")
-        for (connection in connectionsSnapshot) {
-            if (!connection.trySend(envelope)) {
-                onLog("Live \"don't relay\" flag send failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(envelope, connectionsToSend = connectionsSnapshot, failureDescription = "Live \"don't relay\" flag send")
         return true
     }
 
@@ -438,12 +482,7 @@ class WifiDirectTransport(
             connectionsSnapshot = activeConnections.toList()
         }
         onLog("Recipient not directly connected -- flood-offering a message to ${connectionsSnapshot.size} connected peer(s)")
-        for (connection in connectionsSnapshot) {
-            if (!connection.trySend(wireBytes)) {
-                onLog("Live message flood-offer failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(wireBytes, connectionsToSend = connectionsSnapshot, failureDescription = "Live message flood-offer")
         return false
     }
 
@@ -948,15 +987,12 @@ class WifiDirectTransport(
         runBlocking { relayRepository.considerForRelay(frame) }
         val outgoingFrame = frame.copy(hopCount = frame.hopCount + 1)
         val envelope = WireEnvelope.encode(WirePayloadType.POST_FRAME, outgoingFrame.encode())
-        for (connection in activeConnections) {
-            if (connection === arrivedOn) continue
-            if (connection.trySend(envelope)) {
-                maybeAwardPointsForRelayedFrame(frame)
-            } else {
-                onLog("Live relay push failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(
+            envelope,
+            excludeConnection = arrivedOn,
+            failureDescription = "Live relay push",
+            onSendSucceeded = { maybeAwardPointsForRelayedFrame(frame) },
+        )
     }
 
     /**
@@ -972,13 +1008,7 @@ class WifiDirectTransport(
      */
     private fun handleNewlyReceivedDontRelayFlag(row: DontRelayFlagEntity, arrivedOn: PeerConnection) {
         val envelope = WireEnvelope.encode(WirePayloadType.DONT_RELAY_FLAG, row.toEnvelope().encode())
-        for (connection in activeConnections) {
-            if (connection === arrivedOn) continue
-            if (!connection.trySend(envelope)) {
-                onLog("Live \"don't relay\" flag relay push failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(envelope, excludeConnection = arrivedOn, failureDescription = "Live \"don't relay\" flag relay push")
     }
 
     /**
@@ -997,13 +1027,7 @@ class WifiDirectTransport(
         val storedEnvelope = MessageCiphertextEnvelope.decode(row.encodedEnvelope)
         val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
         val envelope = WireEnvelope.encode(WirePayloadType.MESSAGE_CIPHERTEXT, outgoingEnvelope.encode())
-        for (connection in activeConnections) {
-            if (connection === arrivedOn) continue
-            if (!connection.trySend(envelope)) {
-                onLog("Live message relay push failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(envelope, excludeConnection = arrivedOn, failureDescription = "Live message relay push")
     }
 
     /**
@@ -1027,13 +1051,7 @@ class WifiDirectTransport(
         val storedEnvelope = PreKeyBundleEnvelope.decode(row.encodedEnvelope)
         val outgoingEnvelope = storedEnvelope.copy(hopCount = storedEnvelope.hopCount + 1)
         val envelope = WireEnvelope.encode(WirePayloadType.PREKEY_BUNDLE, outgoingEnvelope.encode())
-        for (connection in activeConnections) {
-            if (connection === arrivedOn) continue
-            if (!connection.trySend(envelope)) {
-                onLog("Live bundle relay push failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(envelope, excludeConnection = arrivedOn, failureDescription = "Live bundle relay push")
     }
 
     /**
@@ -1102,12 +1120,7 @@ class WifiDirectTransport(
     fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
         val envelope = WireEnvelope.encode(WirePayloadType.TIER_KEY_REQUEST, request.encode())
         onLog("Broadcasting a tier-key request to ${activeConnections.size} connected peer(s)")
-        for (connection in activeConnections) {
-            if (!connection.trySend(envelope)) {
-                onLog("Live tier-key request send failed to a connected peer; dropping that connection")
-                activeConnections.remove(connection)
-            }
-        }
+        broadcastToConnections(envelope, failureDescription = "Live tier-key request send")
     }
 
     /**
@@ -1239,11 +1252,9 @@ internal class ReceivedFrameStore(
             // zero-filled contentEncryptionKey; there is nothing to store
             // yet, the real key arrives later via a TIER_KEY_RESPONSE.
             if (frame.keyIncluded && !relayPolicy.isExpired(frame.originatedAtMs, frame.ttlSeconds)) {
-                val decayKeyStorageKey = if (frame.reachTier == ReachTier.LOCALITY) {
-                    clipHashHex
-                } else {
-                    ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, frame.reachTier)
-                }
+                // decayKeyStoreKeyFor encapsulates the LOCALITY special-case
+                // itself -- see that function's own doc.
+                val decayKeyStorageKey = ReachTierKeyDistribution.decayKeyStoreKeyFor(clipHashHex, frame.reachTier)
                 decayKeyStore.store(
                     contentId = decayKeyStorageKey,
                     wrappedCek = frame.contentEncryptionKey,
