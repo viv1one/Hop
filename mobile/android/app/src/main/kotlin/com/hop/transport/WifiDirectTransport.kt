@@ -154,6 +154,16 @@ class WifiDirectTransport(
      */
     private val getOwnPeerId: suspend () -> String,
     /**
+     * Shared correlation tracker for outgoing `TIER_KEY_REQUEST`s -- see
+     * [PendingTierKeyRequests]'s own doc. Must be the *same* instance
+     * [TransportManager] passes to [InternetPeerConnectionManager] (via
+     * [com.hop.app.AppContainer]) and marks pending in
+     * [TransportManager.broadcastTierKeyRequest], since a single request goes
+     * out over both transports and a legitimate response can arrive on
+     * either.
+     */
+    private val pendingTierKeyRequests: PendingTierKeyRequests,
+    /**
      * Called (never on the main thread -- see [receivePosts]) whenever a
      * peer's [WirePayloadType.PREKEY_BUNDLE] announcement arrives, with the
      * announcing peer's id and their still-opaque bundle bytes. Deliberately
@@ -210,8 +220,10 @@ class WifiDirectTransport(
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
         getOwnPeerId = getOwnPeerId,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
+        onLog = onLog,
     )
 
     /**
@@ -1352,8 +1364,17 @@ internal class EnvelopeDispatcher(
      * this device or must be relay-queued instead.
      */
     private val getOwnPeerId: suspend () -> String,
+    /**
+     * The correlation fix for the `TIER_KEY_RESPONSE` branch below -- see
+     * [PendingTierKeyRequests]'s own doc for why a single shared instance
+     * (composed once in `com.hop.app.AppContainer`, also threaded into
+     * [TransportManager.broadcastTierKeyRequest]) must be used here rather
+     * than a private instance owned by this dispatcher alone.
+     */
+    private val pendingTierKeyRequests: PendingTierKeyRequests,
     private val onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit,
     private val onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit,
+    private val onLog: (String) -> Unit = {},
 ) {
     /**
      * Handles [envelope] and returns what the caller needs to act on next --
@@ -1465,38 +1486,48 @@ internal class EnvelopeDispatcher(
         }
         WirePayloadType.TIER_KEY_RESPONSE -> {
             val responseEnvelope = TierKeyResponseEnvelope.decode(envelope.payload)
-            // Requesting-side correlation (who asked, retry/timeout policy,
-            // notifying whatever UI/flow triggered the original request) is
-            // explicitly out of scope for this slice -- see this class's own
-            // doc and ReachTierKeyDistribution's "Explicitly out of scope"
-            // note. As a cheap, correlation-free improvement over discarding
-            // a granted key outright: if this device already holds the post
-            // locally (regardless of whether *this* device is the one that
-            // sent the original request -- a response always arrives on the
-            // connection its matching request went out on, so a device only
-            // ever sees a response to its own request), it already knows the
-            // post's own reachTier and can opportunistically cache the
-            // granted key under the correct tiered DecayKeyStore entry right
-            // now, rather than losing it. A follow-up slice building the
-            // requesting side will likely extend this branch/[DispatchResult]
-            // with real request/response correlation and UI notification.
+            // Correlation fix: this device only ever honors a granted
+            // response for a (contentId, tier) it can prove it actually
+            // requested -- see PendingTierKeyRequests' own doc for why the
+            // prior reasoning here ("a response always arrives on the
+            // connection its matching request went out on") was wrong on two
+            // counts: TransportManager.broadcastTierKeyRequest fans the same
+            // request out to every connected peer on both transports, and
+            // nothing about a live connection stops an already-connected
+            // peer from sending an unsolicited, well-formed response for a
+            // contentId this device never asked about at all. Without this
+            // gate, any connected peer could overwrite this device's
+            // DecayKeyStore entry (for a post it already holds a real,
+            // previously-granted key for) with attacker-supplied bytes.
+            //
+            // Requesting-side timeout/retry policy and UI notification remain
+            // out of scope for this slice -- see ReachTierKeyDistribution's
+            // "Explicitly out of scope" note; this only decides whether to
+            // trust a response at all, not what to do if one never arrives.
             if (responseEnvelope.granted) {
                 val contentIdHex = responseEnvelope.contentId.toHexString()
                 val post = postRepository.getByClipHash(contentIdHex)
                 if (post != null) {
                     val tier = ReachTier.valueOf(post.reachTier)
-                    // Origin-anchored expiry (Finding A's fix, mirrored here) --
-                    // not "now + ttlSeconds", which would silently re-extend
-                    // this post's decryption-key lifetime past its real decay
-                    // window if this grant arrives a while after the post
-                    // itself originated.
-                    decayKeyStore.store(
-                        contentId = ReachTierKeyDistribution.decayKeyStorageKey(contentIdHex, tier),
-                        wrappedCek = responseEnvelope.wrappedCek,
-                        expiresAt = Instant.ofEpochMilli(
-                            RelayPolicy().expiresAtMs(post.originatedAtMs, post.ttlSeconds),
-                        ),
-                    )
+                    if (pendingTierKeyRequests.consumeIfPending(contentIdHex, tier)) {
+                        // Origin-anchored expiry (Finding A's fix, mirrored here) --
+                        // not "now + ttlSeconds", which would silently re-extend
+                        // this post's decryption-key lifetime past its real decay
+                        // window if this grant arrives a while after the post
+                        // itself originated.
+                        decayKeyStore.store(
+                            contentId = ReachTierKeyDistribution.decayKeyStorageKey(contentIdHex, tier),
+                            wrappedCek = responseEnvelope.wrappedCek,
+                            expiresAt = Instant.ofEpochMilli(
+                                RelayPolicy().expiresAtMs(post.originatedAtMs, post.ttlSeconds),
+                            ),
+                        )
+                    } else {
+                        onLog(
+                            "Ignoring an uncorrelated/unsolicited TIER_KEY_RESPONSE for $contentIdHex -- " +
+                                "no live pending request found for this (contentId, tier)"
+                        )
+                    }
                 }
             }
             DispatchResult.NoOp
@@ -1566,10 +1597,12 @@ internal class EnvelopeDispatcher(
  * - [NoOp]: nothing further for the caller to do -- either an envelope that
  *   turned out to be an already-seen clipHash/already-recorded flag/
  *   already-held message custody/a stale-or-ineligible bundle, bytes that
- *   didn't decode, or a [WirePayloadType.TIER_KEY_RESPONSE] envelope (Phase 4
- *   Slice 9's requesting-side correlation is a separate, later slice -- see
- *   [EnvelopeDispatcher.dispatch]'s `TIER_KEY_RESPONSE` branch for the
- *   opportunistic local-cache best-effort it does before returning this).
+ *   didn't decode, or a [WirePayloadType.TIER_KEY_RESPONSE] envelope (see
+ *   [EnvelopeDispatcher.dispatch]'s `TIER_KEY_RESPONSE` branch: a granted
+ *   response is only ever cached if [PendingTierKeyRequests.consumeIfPending]
+ *   confirms this device actually has a live outstanding request for that
+ *   exact `(contentId, tier)` -- an uncorrelated/unsolicited response is
+ *   logged and otherwise ignored).
  */
 internal sealed interface DispatchResult {
     data class PeerIdentified(val peerId: String) : DispatchResult

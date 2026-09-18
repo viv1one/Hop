@@ -23,6 +23,9 @@ import com.hop.protocol.TierKeyResponseEnvelope
 import com.hop.protocol.TierMembershipClaim
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
+import com.hop.dht.Contact
+import com.hop.dht.NodeId
+import com.hop.dht.PeerAddress
 import com.hop.p2p.PeerChannel
 import com.hop.repository.BundleRepository
 import com.hop.repository.DontRelayRepository
@@ -40,6 +43,9 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -59,6 +65,12 @@ import kotlin.test.assertTrue
  * same dispatch logic [EnvelopeDispatcherTierKeyTest]/[WifiDirectTransportTest]
  * already prove for the WiFi Direct path now also works correctly when
  * driven over a `p2p/` socket instead.
+ *
+ * One exception: the `onConnected`-happens-before-`onClosed` ordering test
+ * below drives [InternetPeerConnection.connectTo] itself (a real dial against
+ * a real loopback [Contact]/[PeerAddress]), since that's the only entry
+ * point where the registration-race bug this test guards against could ever
+ * occur -- [receiveLoop] alone has no `onConnected` callback to race against.
  */
 class InternetPeerConnectionTest {
 
@@ -71,6 +83,7 @@ class InternetPeerConnectionTest {
     private fun newConnection(
         ownPeerId: String = "me",
         relayRepository: RelayRepository = RelayRepository(FakeRelayQueueDao(), RelayPolicy()),
+        pendingTierKeyRequests: PendingTierKeyRequests = PendingTierKeyRequests(),
     ): InternetPeerConnection = InternetPeerConnection(
         postRepository = PostRepository(postDao, decayKeyStore),
         decayKeyStore = decayKeyStore,
@@ -86,6 +99,7 @@ class InternetPeerConnectionTest {
         ),
         bundleRepository = BundleRepository(dao = FakeBundleQueueDao(), relayPolicy = RelayPolicy()),
         getOwnPeerId = { ownPeerId },
+        pendingTierKeyRequests = pendingTierKeyRequests,
         postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
     )
 
@@ -157,6 +171,70 @@ class InternetPeerConnectionTest {
         // EOF, this test method itself would fail with the propagated
         // exception.
         connection.receiveLoop(serverChannel)
+    }
+
+    @Test
+    fun `connectTo's onConnected callback is always recorded strictly before onClosed, even when the remote peer closes essentially immediately`() {
+        // Bug B's regression test: InternetPeerConnectionManager used to
+        // register a freshly-dialed channel in its registry only *after*
+        // connectTo() returned -- but connectTo() starts the receive thread
+        // (which can call onClosed the instant it hits EOF/an error) before
+        // returning. If the remote peer resets the connection immediately
+        // after accepting, the receive thread could call onClosed before the
+        // caller's own post-return registration line ever ran, leaving a
+        // permanently dead registry entry with nothing left to ever remove
+        // it. The fix moves registration into a new onConnected callback,
+        // invoked synchronously right after the channel is constructed but
+        // strictly before the receive thread starts.
+        //
+        // Reproducing the exact race window is inherently timing-sensitive
+        // (per this task's own guidance), so this test instead proves the
+        // *ordering guarantee* directly: a real server that accepts and
+        // immediately RST-closes the connection forces the receive thread to
+        // hit an I/O error as fast as physically possible after connectTo()
+        // starts it -- if onConnected and onClosed were ever misordered,
+        // this is the setup most likely to expose it.
+        val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        val serverThread = Thread({
+            try {
+                val accepted = serverSocket.accept()
+                accepted.setSoLinger(true, 0)
+                accepted.close()
+            } catch (e: Exception) {
+                // Expected once serverSocket.close() runs below.
+            }
+        }, "abortive-close-server")
+        serverThread.start()
+
+        val contact = Contact(
+            id = NodeId(ByteArray(NodeId.SIZE_BYTES) { it.toByte() }),
+            address = PeerAddress.encodeList(
+                listOf(PeerAddress.from(InetAddress.getByName("127.0.0.1"), serverSocket.localPort)),
+            ),
+            lastSeenAtMs = 0L,
+        )
+        val connection = newConnection()
+        val events = CopyOnWriteArrayList<String>()
+        val closedLatch = CountDownLatch(1)
+
+        connection.connectTo(
+            contact,
+            onConnected = { events.add("connected") },
+            onClosed = {
+                events.add("closed")
+                closedLatch.countDown()
+            },
+        )
+
+        assertTrue(closedLatch.await(5, TimeUnit.SECONDS), "the abortively-closed connection must end its receive loop within the timeout")
+        assertEquals(
+            listOf("connected", "closed"),
+            events.toList(),
+            "onConnected must always be recorded strictly before onClosed, even when the remote peer closes essentially immediately",
+        )
+
+        serverSocket.close()
+        serverThread.join(2_000)
     }
 
     @Test

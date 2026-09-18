@@ -38,6 +38,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -53,6 +54,17 @@ import kotlin.test.assertTrue
  * unheld content) alongside the happy path -- a bug in any of those is a
  * silent reach-tier access-control bypass or a silent denial-of-service
  * against a legitimate requester, not a cosmetic issue.
+ *
+ * Also covers the `TIER_KEY_RESPONSE` branch's [PendingTierKeyRequests]
+ * correlation fix: a `granted=true` response is only ever honored when this
+ * device can prove (via a live [PendingTierKeyRequests] entry) that it
+ * actually broadcast a matching request -- see
+ * `tierKeyResponseWithNoMatchingPendingRequestIsIgnoredEvenForAnAlreadyHeldPost`
+ * for the regression test that would have failed before this fix (any
+ * connected peer could otherwise overwrite an already-held tiered key with
+ * attacker-supplied bytes), and
+ * `secondResponseForAnAlreadyConsumedPendingRequestIsIgnored` for the
+ * replay-after-accept case.
  */
 class EnvelopeDispatcherTierKeyTest {
 
@@ -62,7 +74,10 @@ class EnvelopeDispatcherTierKeyTest {
     private val postDao = FakePostDao()
     private val decayKeyStore = DecayKeyStore()
 
-    private fun newDispatcher(ownPeerId: String = "me"): EnvelopeDispatcher {
+    private fun newDispatcher(
+        ownPeerId: String = "me",
+        pendingTierKeyRequests: PendingTierKeyRequests = PendingTierKeyRequests(),
+    ): EnvelopeDispatcher {
         val receivedFrameStore = ReceivedFrameStore(
             postRepository = PostRepository(postDao, decayKeyStore),
             decayKeyStore = decayKeyStore,
@@ -83,6 +98,7 @@ class EnvelopeDispatcherTierKeyTest {
             ),
             bundleRepository = BundleRepository(dao = FakeBundleQueueDao(), relayPolicy = RelayPolicy()),
             getOwnPeerId = { ownPeerId },
+            pendingTierKeyRequests = pendingTierKeyRequests,
             onPreKeyBundleReceived = { _, _ -> },
             onMessageCiphertextReceived = { _, _ -> },
         )
@@ -226,11 +242,17 @@ class EnvelopeDispatcherTierKeyTest {
     }
 
     @Test
-    fun tierKeyResponseOpportunisticallyCachesAGrantedKeyForAnAlreadyHeldPost() = runBlocking {
+    fun tierKeyResponseWithALivePendingRequestOpportunisticallyCachesAGrantedKeyForAnAlreadyHeldPost() = runBlocking {
         val originGeohashPrefix = "9q8yy"
         val (_, clipHash, _) = storeHeldTownPost(originGeohashPrefix)
         val clipHashHex = clipHash.joinToString("") { "%02x".format(it) }
-        val dispatcher = newDispatcher()
+        val pendingTierKeyRequests = PendingTierKeyRequests()
+        val dispatcher = newDispatcher(pendingTierKeyRequests = pendingTierKeyRequests)
+
+        // This device must have actually broadcast a request for this exact
+        // (contentId, tier) before a response is honored -- see
+        // PendingTierKeyRequests' own doc for why.
+        pendingTierKeyRequests.markPending(clipHashHex, ReachTier.TOWN)
 
         // Simulate this device's own tiered key having already decayed/never
         // arrived (distinct from storeHeldTownPost's own separately-stored
@@ -245,7 +267,76 @@ class EnvelopeDispatcherTierKeyTest {
 
         assertEquals(DispatchResult.NoOp, result)
         val cachedKey = decayKeyStore.retrieve(ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, ReachTier.TOWN))
-        assertContentEquals(freshCek, cachedKey, "a granted response for an already-held post must be opportunistically cached under the tiered key")
+        assertContentEquals(freshCek, cachedKey, "a granted response with a live matching pending request must be accepted and cached under the tiered key")
+    }
+
+    @Test
+    fun tierKeyResponseWithNoMatchingPendingRequestIsIgnoredEvenForAnAlreadyHeldPost() = runBlocking {
+        // This is the actual security-fix regression test: without
+        // correlation, any connected peer could send a granted=true response
+        // for a contentId this device never requested (e.g. one it already
+        // holds a real, previously-granted key for) and silently overwrite
+        // that entry with attacker-supplied bytes. This test would have
+        // FAILED before the fix (the response used to be accepted
+        // unconditionally whenever this device already held the post).
+        val originGeohashPrefix = "9q8yy"
+        val (_, clipHash, _) = storeHeldTownPost(originGeohashPrefix)
+        val clipHashHex = clipHash.joinToString("") { "%02x".format(it) }
+        val dispatcher = newDispatcher() // Never marked pending for this (contentId, tier).
+
+        // storeHeldTownPost already stored a real, legitimately-obtained key
+        // under this exact (contentId, tier) -- capture it so the assertion
+        // below proves the attacker's bytes never overwrote it (rather than
+        // just asserting "something non-null exists," which storeHeldTownPost
+        // alone would already satisfy).
+        val legitimateKeyBeforeAttack = decayKeyStore.retrieve(ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, ReachTier.TOWN))
+        assertNotNull(legitimateKeyBeforeAttack, "storeHeldTownPost must have already stored a real key for this (contentId, tier)")
+
+        val attackerSuppliedCek = ByteArray(32) { 0xEE.toByte() }
+        val responseEnvelope = TierKeyResponseEnvelope.granted(clipHash, attackerSuppliedCek)
+        val wireEnvelope = WireEnvelope(WirePayloadType.TIER_KEY_RESPONSE, responseEnvelope.encode())
+
+        val result = dispatcher.dispatch(wireEnvelope)
+
+        assertEquals(DispatchResult.NoOp, result)
+        val cachedKey = decayKeyStore.retrieve(ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, ReachTier.TOWN))
+        assertContentEquals(
+            legitimateKeyBeforeAttack,
+            cachedKey,
+            "an uncorrelated/unsolicited response must never overwrite an already-held real key with attacker-supplied bytes",
+        )
+    }
+
+    @Test
+    fun secondResponseForAnAlreadyConsumedPendingRequestIsIgnored() = runBlocking {
+        // Replay-after-accept protection: consumeIfPending removes the entry
+        // on its first live match, so a second response for the same
+        // (contentId, tier) -- honest or not -- must not be able to
+        // overwrite an already-accepted grant.
+        val originGeohashPrefix = "9q8yy"
+        val (_, clipHash, _) = storeHeldTownPost(originGeohashPrefix)
+        val clipHashHex = clipHash.joinToString("") { "%02x".format(it) }
+        val pendingTierKeyRequests = PendingTierKeyRequests()
+        val dispatcher = newDispatcher(pendingTierKeyRequests = pendingTierKeyRequests)
+        pendingTierKeyRequests.markPending(clipHashHex, ReachTier.TOWN)
+
+        val firstCek = ByteArray(32) { 7 }
+        val firstResponse = WireEnvelope(
+            WirePayloadType.TIER_KEY_RESPONSE,
+            TierKeyResponseEnvelope.granted(clipHash, firstCek).encode(),
+        )
+        dispatcher.dispatch(firstResponse)
+
+        val secondCek = ByteArray(32) { 9 }
+        val secondResponse = WireEnvelope(
+            WirePayloadType.TIER_KEY_RESPONSE,
+            TierKeyResponseEnvelope.granted(clipHash, secondCek).encode(),
+        )
+        val result = dispatcher.dispatch(secondResponse)
+
+        assertEquals(DispatchResult.NoOp, result)
+        val cachedKey = decayKeyStore.retrieve(ReachTierKeyDistribution.decayKeyStorageKey(clipHashHex, ReachTier.TOWN))
+        assertContentEquals(firstCek, cachedKey, "a second response after the first was already consumed must be ignored, not overwrite the accepted grant")
     }
 
     @Test

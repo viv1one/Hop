@@ -27,6 +27,7 @@ import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
 import com.hop.repository.ReportRepository
 import com.hop.transport.InternetPeerConnectionManager
+import com.hop.transport.PendingTierKeyRequests
 import com.hop.transport.TransportManager
 
 /**
@@ -139,6 +140,21 @@ class AppContainer(applicationContext: Context) {
     )
 
     /**
+     * The code-review fix's shared `TIER_KEY_REQUEST`/`TIER_KEY_RESPONSE`
+     * correlation tracker (see [PendingTierKeyRequests]'s own doc). A single
+     * instance, composed here and threaded into [transportManager] (which
+     * marks a request pending, over both transports, from its own
+     * `broadcastTierKeyRequest`) and [internetPeerConnectionManager] (whose
+     * internal `InternetPeerConnection`'s `EnvelopeDispatcher` consumes it on
+     * an incoming response) -- [transportManager]'s own `WifiDirectTransport`
+     * consumes the same instance too, since it's threaded through
+     * [transportManager]'s constructor below. Must never be a second,
+     * separate instance per transport: a single request goes out over both
+     * transports at once, and a legitimate response can arrive on either.
+     */
+    val pendingTierKeyRequests: PendingTierKeyRequests = PendingTierKeyRequests()
+
+    /**
      * Persistent Double Ratchet session/key store (Stage 1). Typed as the
      * concrete [RoomSignalProtocolStore] (not the plain libsignal-client
      * `SignalProtocolStore` interface) since [preKeyRotationManager] below
@@ -242,6 +258,7 @@ class AppContainer(applicationContext: Context) {
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
         getOwnPeerId = getOwnPeerId,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
         postsDir = java.io.File(applicationContext.filesDir, "posts"),
@@ -295,6 +312,7 @@ class AppContainer(applicationContext: Context) {
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
         internetPeerConnectionManager = internetPeerConnectionManager,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
     )

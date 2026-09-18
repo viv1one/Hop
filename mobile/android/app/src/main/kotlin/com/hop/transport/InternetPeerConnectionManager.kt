@@ -65,11 +65,15 @@ import java.util.concurrent.ConcurrentHashMap
  * `TransportManager.CONNECT_COOLDOWN_MS`/`FeedViewModel.TIER_KEY_REQUEST_COOLDOWN_MS`
  * -- revisit once real mesh/internet-mode density data exists.
  *
- * **Cleanup on close:** [InternetPeerConnection.connectTo]'s `onClosed`
- * callback (added alongside this class) is wired, per connection, to remove
- * that connection's registry entry the moment its receive loop ends for any
- * reason -- a dead connection never permanently occupies a slot under the
- * cap.
+ * **Registration and cleanup:** [InternetPeerConnection.connectTo]'s
+ * `onConnected` callback registers `connections[contact.id]` synchronously,
+ * strictly before that connection's receive thread can possibly call
+ * `onClosed` (see [connectToDiscoveredHolders]'s own doc for the real
+ * registration race this ordering closes), and `onClosed` is wired, per
+ * connection, to remove that same registry entry the moment its receive loop
+ * ends for any reason -- together, a dead connection never permanently
+ * occupies a slot under the cap, including one that closes essentially
+ * immediately after connecting.
  *
  * **Connect-time backlog offer:** every newly-established connection gets
  * this device's queued outgoing content offered to it once, unconditionally
@@ -134,6 +138,15 @@ class InternetPeerConnectionManager(
     private val pendingMessageRepository: PendingMessageRepository,
     private val bundleRepository: BundleRepository,
     getOwnPeerId: suspend () -> String,
+    /**
+     * Shared correlation tracker for outgoing `TIER_KEY_REQUEST`s -- see
+     * [PendingTierKeyRequests]'s own doc. Must be the exact same instance
+     * [WifiDirectTransport] and [TransportManager.broadcastTierKeyRequest]
+     * use (all three composed once, from the same singleton, in
+     * `com.hop.app.AppContainer`), since a single request goes out over both
+     * transports and a legitimate response can arrive on either.
+     */
+    pendingTierKeyRequests: PendingTierKeyRequests,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
     postsDir: File,
@@ -149,6 +162,7 @@ class InternetPeerConnectionManager(
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
         getOwnPeerId = getOwnPeerId,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
         postsDir = postsDir,
@@ -178,6 +192,27 @@ class InternetPeerConnectionManager(
      * bytes) is caught, logged, and that contact simply stays absent from
      * the registry this cycle; no exception propagates out of this
      * function.
+     *
+     * Registers `connections[contact.id]` via [InternetPeerConnection.connectTo]'s
+     * `onConnected` callback -- invoked synchronously, strictly before the
+     * connection's own receive thread starts (see that parameter's own doc)
+     * -- rather than from this function's own post-[connectTo]-return
+     * assignment. This closes a real registration race: [connectTo] dials,
+     * wraps the socket in a [PeerChannel], starts the receive thread (which
+     * can call `onClosed` the instant it hits EOF/an error -- e.g. the
+     * remote peer resetting the connection immediately after connecting),
+     * and only then used to return the channel to this function. Since
+     * `onClosed` only ever fires once, registering *after* [connectTo]
+     * returned meant a fast-closing connection's `onClosed` (which removes
+     * this registry entry) could run and complete before this function's own
+     * `connections[contact.id] = channel` line ever executed -- leaving a
+     * permanently dead entry registered with nothing left to ever remove it,
+     * silently occupying a slot under [MAX_NEW_CONNECTIONS_PER_CALL] forever
+     * (contradicting this class's own "a dead connection never permanently
+     * occupies a slot under the cap" claim above). Registering from
+     * `onConnected` instead guarantees registration always happens-before
+     * `onClosed` can possibly run, for any connection, regardless of how
+     * quickly the remote peer closes it.
      */
     suspend fun connectToDiscoveredHolders(holders: List<Contact>) = withContext(ioDispatcher) {
         var newAttempts = 0
@@ -195,13 +230,13 @@ class InternetPeerConnectionManager(
             try {
                 val channel = internetPeerConnection.connectTo(
                     contact,
+                    onConnected = { connectedChannel -> connections[contact.id] = connectedChannel },
                     onClosed = {
                         connections.remove(contact.id)
                         onLog("Internet connection closed; removed from the connection registry")
                     },
                     onLiveRelay = ::fanOutLiveRelay,
                 )
-                connections[contact.id] = channel
                 Thread({ sendBacklog(channel) }, "hop-internet-send").start()
             } catch (e: PeerDialException) {
                 onLog("Failed to dial a discovered internet peer: ${e.message}")

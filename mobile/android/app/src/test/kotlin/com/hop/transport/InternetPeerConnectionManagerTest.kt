@@ -95,6 +95,7 @@ class InternetPeerConnectionManagerTest {
         ),
         bundleRepository = BundleRepository(dao = bundleQueueDao, relayPolicy = RelayPolicy()),
         getOwnPeerId = { "me" },
+        pendingTierKeyRequests = PendingTierKeyRequests(),
         postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
         onLog = onLog,
     )
@@ -318,6 +319,47 @@ class InternetPeerConnectionManagerTest {
             }
         }
         assertTrue(reconnected, "once the registry entry for a closed connection is removed, a later call must be able to dial that contact again")
+    }
+
+    @Test
+    fun `a connection that closes essentially immediately after connecting never leaves a permanently stuck registry entry`() = runBlocking {
+        // Bug B's regression test, isolated to a single abortively-closing
+        // contact (no healthy sibling in the same call, unlike the existing
+        // eviction tests further below): before the fix, registering
+        // connections[contact.id] only *after* connectTo() returned could
+        // lose the race against the receive thread's own onClosed callback
+        // (which removes that same entry) when the remote peer resets the
+        // connection immediately after accepting -- leaving contact.id
+        // permanently "occupied" in the registry with nothing left to ever
+        // remove it, so connectToDiscoveredHolders's own
+        // `if (connections.containsKey(contact.id)) continue` guard would
+        // skip this contact forever, on every future call.
+        val abortiveListener = AbortiveCloseListener()
+        val contact = loopbackContact(nodeId(0), abortiveListener.port)
+        val manager = newManager()
+
+        manager.connectToDiscoveredHolders(listOf(contact))
+
+        // Poll: if the fix is in place, this contact's registry entry (if
+        // ever registered at all) gets promptly removed once its receive
+        // loop notices the abortive close, so a later call must be able to
+        // dial (and be accepted by) it again. Before the fix, a lost-race
+        // stuck entry would make this contact permanently skipped and this
+        // assertion would time out.
+        val acceptedBefore = abortiveListener.acceptedCount.get()
+        var reconnected = false
+        repeat(30) {
+            manager.connectToDiscoveredHolders(listOf(contact))
+            if (abortiveListener.acceptedCount.get() > acceptedBefore) {
+                reconnected = true
+                return@repeat
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(
+            reconnected,
+            "a connection that closes essentially immediately after connecting must never permanently occupy its contact's registry slot",
+        )
     }
 
     @Test

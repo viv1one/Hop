@@ -134,6 +134,14 @@ class InternetPeerConnection(
     pendingMessageRepository: PendingMessageRepository,
     bundleRepository: BundleRepository,
     getOwnPeerId: suspend () -> String,
+    /**
+     * Shared correlation tracker for outgoing `TIER_KEY_REQUEST`s -- see
+     * [PendingTierKeyRequests]'s own doc. Must be the exact same instance
+     * [WifiDirectTransport] and [TransportManager.broadcastTierKeyRequest]
+     * use, since a single request goes out over both transports and a
+     * legitimate response can arrive on either.
+     */
+    pendingTierKeyRequests: PendingTierKeyRequests,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
     postsDir: File,
@@ -155,8 +163,10 @@ class InternetPeerConnection(
         pendingMessageRepository = pendingMessageRepository,
         bundleRepository = bundleRepository,
         getOwnPeerId = getOwnPeerId,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
+        onLog = onLog,
     )
 
     /**
@@ -190,16 +200,36 @@ class InternetPeerConnection(
      * one, to fan a freshly-received item out to its *other* open internet
      * connections.
      *
+     * [onConnected] is invoked synchronously, on the *calling* thread,
+     * immediately after [channel] is constructed but strictly *before* the
+     * `hop-internet-receive` thread (and therefore [onClosed]) can possibly
+     * run -- this is what closes a real registration race: without this
+     * ordering guarantee, a caller that registers [channel] itself only
+     * *after* this function returns (as
+     * [InternetPeerConnectionManager.connectToDiscoveredHolders] used to)
+     * could lose the race against a remote peer that resets the connection
+     * immediately after connecting -- the receive thread's [onClosed] call
+     * (which removes the registry entry) could fire and complete *before*
+     * the caller's own post-return registration line ever runs, leaving a
+     * permanently dead entry registered with nothing left to ever remove it.
+     * Defaulted to a no-op for the same every-existing-caller-keeps-working
+     * reason as [onClosed]/[onLiveRelay]; [InternetPeerConnectionManager] is
+     * the first real caller that supplies one, to register [channel] in its
+     * connection registry from here rather than from its own post-[connectTo]
+     * return-value assignment.
+     *
      * Throws [com.hop.p2p.PeerDialException] if every candidate address
      * fails to connect, or [com.hop.dht.PeerAddressDecodeException] if
      * [contact]'s address bytes don't decode -- neither is caught here;
      * callers decide how to handle a failed connection attempt (this slice
-     * has no retry/backoff, per the class doc). Neither [onClosed] nor
-     * [onLiveRelay] is ever invoked for either of these -- the connection
-     * never started, so it never "closed" and never received anything.
+     * has no retry/backoff, per the class doc). None of [onConnected],
+     * [onClosed], or [onLiveRelay] is ever invoked for either of these -- the
+     * connection never started, so it was never "connected," never "closed,"
+     * and never received anything.
      */
     fun connectTo(
         contact: Contact,
+        onConnected: (PeerChannel) -> Unit = {},
         onClosed: () -> Unit = {},
         onLiveRelay: (outgoingEnvelopeBytes: ByteArray, arrivedOn: PeerChannel) -> Unit = { _, _ -> },
     ): PeerChannel {
@@ -207,6 +237,9 @@ class InternetPeerConnection(
         val socket = PeerDialer.dial(candidates)
         onLog("Dialed an internet peer connection (${candidates.size} candidate address(es))")
         val channel = PeerChannel(socket)
+        // Register before starting the receive thread -- see onConnected's
+        // own doc for the registration race this ordering closes.
+        onConnected(channel)
         Thread({ receiveLoop(channel, onClosed, onLiveRelay) }, "hop-internet-receive").start()
         return channel
     }

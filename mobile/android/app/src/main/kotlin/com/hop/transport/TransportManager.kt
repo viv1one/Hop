@@ -90,6 +90,17 @@ class TransportManager(
      * second instance constructed here.
      */
     private val internetPeerConnectionManager: InternetPeerConnectionManager,
+    /**
+     * Shared correlation tracker for outgoing `TIER_KEY_REQUEST`s -- see
+     * [PendingTierKeyRequests]'s own doc. [broadcastTierKeyRequest] below
+     * calls [PendingTierKeyRequests.markPending] the moment a request
+     * actually goes out (over *both* transports at once, from this single
+     * call site), and this exact same instance must also be threaded into
+     * [wifiDirectTransport]'s and [internetPeerConnectionManager]'s own
+     * [EnvelopeDispatcher] construction (see `com.hop.app.AppContainer`) so a
+     * response arriving on either transport can be correlated against it.
+     */
+    private val pendingTierKeyRequests: PendingTierKeyRequests,
     onPreKeyBundleReceived: (peerId: String, bundleBytes: ByteArray) -> Unit = { _, _ -> },
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
 ) : DefaultLifecycleObserver {
@@ -109,6 +120,7 @@ class TransportManager(
         bundleRepository = bundleRepository,
         preKeyRotationManager = preKeyRotationManager,
         getOwnPeerId = getOwnPeerId,
+        pendingTierKeyRequests = pendingTierKeyRequests,
         onPreKeyBundleReceived = onPreKeyBundleReceived,
         onMessageCiphertextReceived = onMessageCiphertextReceived,
         onLog = { message -> Log.d(TAG, message) },
@@ -261,15 +273,22 @@ class TransportManager(
     }
 
     /**
-     * Delegates to both [WifiDirectTransport.broadcastTierKeyRequest] (see
-     * its doc for the fire-and-forget, no-backlog/no-retry semantics) and
+     * Marks [request] pending in [pendingTierKeyRequests] (this is the one
+     * call site: a single request goes out over *both* transports from here,
+     * so marking it once here -- rather than separately inside
+     * [WifiDirectTransport]/[InternetPeerConnectionManager] -- is what lets a
+     * response arriving on *either* transport correlate against the same
+     * pending entry) before delegating to both
+     * [WifiDirectTransport.broadcastTierKeyRequest] (see its doc for the
+     * fire-and-forget, no-backlog/no-retry semantics) and
      * [InternetPeerConnectionManager.broadcastTierKeyRequest] -- a tier-key
      * request now also reaches every open internet connection, on the
      * chance a peer reached over the internet (not just local mesh) holds
-     * the key. No custody/dedup concern on either side, so this is
-     * unconditional, same as [broadcastPost].
+     * the key. No custody/dedup concern on either side, so the fan-out itself
+     * is unconditional, same as [broadcastPost].
      */
     fun broadcastTierKeyRequest(request: TierKeyRequestEnvelope) {
+        pendingTierKeyRequests.markPending(request.contentId.toHexString(), request.claim.reachTier)
         wifiDirectTransport.broadcastTierKeyRequest(request)
         internetPeerConnectionManager.broadcastTierKeyRequest(request)
     }
@@ -353,3 +372,6 @@ class TransportManager(
         }
     }
 }
+
+/** Matches this codebase's established per-file `ByteArray.toHexString()` convention (see e.g. `WifiDirectTransport.kt`). */
+private fun ByteArray.toHexString(): String = joinToString(separator = "") { "%02x".format(it) }

@@ -81,6 +81,7 @@ class EnvelopeDispatcherBundleRelayTest {
             pendingMessageRepository = pendingMessageRepository,
             bundleRepository = bundleRepository,
             getOwnPeerId = { ownPeerId },
+            pendingTierKeyRequests = PendingTierKeyRequests(),
             onPreKeyBundleReceived = { _, _ -> },
             onMessageCiphertextReceived = { _, _ -> },
         )
