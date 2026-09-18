@@ -248,7 +248,17 @@ class FeedViewModel(
         val result = decryptCacheMutex.withLock {
             decryptCache[post.clipHash]?.let { cached -> return@withLock cached }
             val fresh = postRepository.decrypt(post)
-            decryptCache[post.clipHash] = fresh
+            // Never cache AwaitingKey: unlike Decrypted/Decayed, which are
+            // permanently stable outcomes, an AwaitingKey post can transition
+            // to Decrypted the moment a requested tier key is granted and
+            // stored into DecayKeyStore -- nothing in that grant path touches
+            // this cache, so caching AwaitingKey here would leave a post
+            // stuck showing "not available yet" until unrelated LRU pressure
+            // happened to evict it, defeating the whole point of requesting
+            // the key in the first place.
+            if (fresh !is PostRepository.DecryptResult.AwaitingKey) {
+                decryptCache[post.clipHash] = fresh
+            }
             fresh
         }
         if (result is PostRepository.DecryptResult.AwaitingKey) {
@@ -302,8 +312,18 @@ class FeedViewModel(
 
     /**
      * Flags [post] "don't relay" with this device's own attested identity
-     * (Phase 2 Slice 2, PRD §4.6/ADR 0004): records it locally, then
-     * propagates it onto the mesh. [DontRelayFlagEntity.originatedAtMs]/
+     * (Phase 2 Slice 2, PRD §4.6/ADR 0004): propagates it onto the mesh,
+     * which records it locally as the first step of that same call (see
+     * [TransportManager.broadcastDontRelayFlag] -> `WifiDirectTransport
+     * .broadcastDontRelayFlag`'s own `recordFlag`-then-check-`isNew`
+     * sequence) -- this function must NOT also call
+     * [DontRelayRepository.recordFlag] itself first. Doing so was a real bug:
+     * it made the flag already non-new by the time the broadcast path's own
+     * `recordFlag` call ran (Room's `OnConflictStrategy.IGNORE` returns
+     * `false`), which made `TransportManager.broadcastDontRelayFlag`'s
+     * `isNew`-gated internet-mode fanout dead code for every self-authored
+     * flag -- silently breaking propagation to internet-connected peers.
+     * [DontRelayFlagEntity.originatedAtMs]/
      * [DontRelayFlagEntity.ttlSeconds] are copied off [post] itself -- see
      * [DontRelayFlagEntity]'s own doc for why the flag carries these rather
      * than relying on a lookup once it's already propagating (the
@@ -322,7 +342,6 @@ class FeedViewModel(
                 originatedAtMs = post.originatedAtMs,
                 ttlSeconds = post.ttlSeconds,
             )
-            dontRelayRepository.recordFlag(row)
             broadcastDontRelayFlag(row)
         }
     }

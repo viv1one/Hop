@@ -305,7 +305,7 @@ class FeedViewModelTest {
     }
 
     @Test
-    fun `flagDontRelay records the flag locally and broadcasts it`() = runTest(testDispatcher) {
+    fun `flagDontRelay does not record the flag itself -- that is the broadcast path's job`() = runTest(testDispatcher) {
         val flagDao = FakeDontRelayFlagDao()
         // samplePost's fixed originatedAtMs/ttlSeconds (1_700_000_000_000L, 1
         // hour) are long past relative to the real system clock -- pin
@@ -321,7 +321,21 @@ class FeedViewModelTest {
             reportRepository = ReportRepository(FakeReportedPostDao(emptyList())),
             dontRelayRepository = dontRelayRepository,
             getAttestedDeviceKey = { "own-attested-key" },
-            broadcastDontRelayFlag = { row -> broadcastRow = row },
+            // The fake broadcast path here also calls recordFlag itself,
+            // mirroring production's real contract exactly: TransportManager
+            // .broadcastDontRelayFlag -> WifiDirectTransport.broadcastDontRelayFlag
+            // records the flag as the first step of that same call, then
+            // checks its own isNew result before fanning out to internet
+            // peers. flagDontRelay itself must NOT call recordFlag first --
+            // doing so was a real bug (see flagDontRelay's own doc): it made
+            // the flag already non-new by the time the broadcast path's own
+            // recordFlag call ran, silently making TransportManager's
+            // isNew-gated internet-mode fanout dead code for every
+            // self-authored flag.
+            broadcastDontRelayFlag = { row ->
+                runBlocking { dontRelayRepository.recordFlag(row) }
+                broadcastRow = row
+            },
         )
 
         val post = samplePost("clip-to-flag")
