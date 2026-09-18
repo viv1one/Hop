@@ -9,9 +9,13 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * Loopback round-trip coverage for [PeerChannel] — the "exchange bytes"
@@ -191,6 +195,82 @@ class PeerChannelTest {
             assertFailsWith<WireEnvelopeDecodeException> { serverChannel.receiveEnvelope() }
 
             client.close()
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `concurrent sendEnvelope and sendRawBytes callers on the same channel never interleave writes`() {
+        // Regression test for the missing write-lock bug: several threads
+        // (mirroring mobile/android's backlog-drain thread, a connection's
+        // own receive thread answering inline, and broadcast fan-out from
+        // another connection's receive thread, all of which legitimately
+        // write to one shared registered PeerChannel) call sendEnvelope /
+        // sendRawBytes concurrently on the *same* clientChannel. Without a
+        // write lock, DataOutputStream.write calls from different threads
+        // can interleave mid-envelope, corrupting the byte stream so the
+        // receiving side's WireEnvelope.decode can't parse it (or, worse,
+        // silently parses a corrupted-but-well-formed-looking frame). This
+        // loops many iterations with distinct, identifiable payloads so a
+        // real race has many chances to reproduce even though corruption
+        // from an unsynchronized race isn't guaranteed to hit every run.
+        val loopback = InetAddress.getByName("127.0.0.1")
+        val server = ServerSocket(0, 50, loopback)
+        try {
+            val client = Socket()
+            client.connect(java.net.InetSocketAddress(loopback, server.localPort), 2_000)
+            val accepted = server.accept()
+
+            val clientChannel = PeerChannel(client)
+            val serverChannel = PeerChannel(accepted)
+
+            val perThreadCount = 500
+            val totalCount = perThreadCount * 2
+
+            // Distinct, recognizable payloads per thread so we can confirm
+            // every single one arrived intact, in some interleaved order,
+            // with none dropped, duplicated, or corrupted.
+            val threadAEnvelopes = (0 until perThreadCount).map { i ->
+                WireEnvelope(WirePayloadType.POST_FRAME, byteArrayOf(1, (i and 0xFF).toByte(), ((i shr 8) and 0xFF).toByte()))
+            }
+            val threadBEnvelopes = (0 until perThreadCount).map { i ->
+                // sendRawBytes exercises the sibling write path against the
+                // same write lock.
+                WireEnvelope(WirePayloadType.TIER_KEY_REQUEST, byteArrayOf(2, (i and 0xFF).toByte(), ((i shr 8) and 0xFF).toByte()))
+            }
+
+            val barrier = CyclicBarrier(2)
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                val futureA = executor.submit {
+                    barrier.await()
+                    threadAEnvelopes.forEach { clientChannel.sendEnvelope(it) }
+                }
+                val futureB = executor.submit {
+                    barrier.await()
+                    threadBEnvelopes.forEach { clientChannel.sendRawBytes(it.encode()) }
+                }
+                futureA.get(30, TimeUnit.SECONDS)
+                futureB.get(30, TimeUnit.SECONDS)
+            } finally {
+                executor.shutdown()
+            }
+
+            val received = (0 until totalCount).map { serverChannel.receiveEnvelope() }
+
+            val expectedA = threadAEnvelopes.toSet()
+            val expectedB = threadBEnvelopes.toSet()
+            val receivedA = received.filter { it.type == WirePayloadType.POST_FRAME }.toSet()
+            val receivedB = received.filter { it.type == WirePayloadType.TIER_KEY_REQUEST }.toSet()
+
+            assertEquals(totalCount, received.size)
+            assertEquals(expectedA, receivedA)
+            assertEquals(expectedB, receivedB)
+            assertTrue(received.none { it.type != WirePayloadType.POST_FRAME && it.type != WirePayloadType.TIER_KEY_REQUEST })
+
+            clientChannel.close()
+            serverChannel.close()
         } finally {
             server.close()
         }

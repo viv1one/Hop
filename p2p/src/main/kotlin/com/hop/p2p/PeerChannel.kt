@@ -26,15 +26,19 @@ import java.nio.ByteOrder
  * `PreKeyBundleEnvelope`'s wire format shipping before its own transport
  * wiring did, in this same codebase's history).
  *
- * Not thread-safe for concurrent [sendEnvelope] calls, or concurrent
- * [receiveEnvelope] calls, from more than one thread each — matches
- * `WifiDirectTransport`'s own inner `PeerConnection` (a `writeLock`-guarded
- * single writer) posture. A caller needing concurrent multi-writer access
- * should add its own lock around [sendEnvelope], same as that class does,
- * rather than this low-level primitive imposing one unconditionally. A
- * single reader loop per [PeerChannel] (one dedicated thread calling
- * [receiveEnvelope] in a loop until it throws) is the expected usage shape,
- * again mirroring `WifiDirectTransport.receivePosts`.
+ * [sendEnvelope] and [sendRawBytes] are internally synchronized on a shared
+ * write lock, so multiple threads may call either concurrently on the same
+ * [PeerChannel] without interleaving each other's bytes on the wire —
+ * matching `WifiDirectTransport`'s own inner `PeerConnection` (a
+ * `writeLock`-guarded single writer) posture, since this channel has the
+ * same multi-writer-single-socket shape in practice (backlog-drain thread,
+ * receive-thread-driven responses, and broadcast fan-out can all legitimately
+ * write to the same registered channel). [receiveEnvelope] is deliberately
+ * left unsynchronized — a single reader loop per [PeerChannel] (one dedicated
+ * thread calling [receiveEnvelope] in a loop until it throws) is the
+ * expected, and only supported, usage shape, again mirroring
+ * `WifiDirectTransport.receivePosts`; concurrent readers are not a supported
+ * usage and remain the caller's responsibility to avoid.
  *
  * [receiveEnvelope] rejects a declared payload length over [MAX_PAYLOAD_BYTES]
  * before allocating anything for it — unlike a local WiFi Direct group member,
@@ -48,10 +52,15 @@ class PeerChannel(private val socket: Socket) : Closeable {
     private val input = DataInputStream(socket.getInputStream())
     private val output = DataOutputStream(socket.getOutputStream())
 
+    /** Guards [output] so concurrent [sendEnvelope]/[sendRawBytes] callers never interleave writes. */
+    private val writeLock = Any()
+
     /** Writes one [WireEnvelope], self-framed per [WireEnvelope.encode] — no additional outer length prefix. */
     fun sendEnvelope(envelope: WireEnvelope) {
-        output.write(envelope.encode())
-        output.flush()
+        synchronized(writeLock) {
+            output.write(envelope.encode())
+            output.flush()
+        }
     }
 
     /**
@@ -73,8 +82,10 @@ class PeerChannel(private val socket: Socket) : Closeable {
      * [sendEnvelope] keeps working unchanged.
      */
     fun sendRawBytes(bytes: ByteArray) {
-        output.write(bytes)
-        output.flush()
+        synchronized(writeLock) {
+            output.write(bytes)
+            output.flush()
+        }
     }
 
     /**
