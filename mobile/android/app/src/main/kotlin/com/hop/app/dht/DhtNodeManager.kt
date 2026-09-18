@@ -4,6 +4,7 @@ import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import com.hop.dht.Contact
 import com.hop.dht.DhtNode
 import com.hop.dht.DhtUdpTransport
 import com.hop.dht.NodeId
@@ -88,6 +89,21 @@ class DhtNodeManager(
      */
     private val bootstrapHost: String,
     private val bootstrapPort: Int,
+    /**
+     * The last piece of the Phase 4 hole-punching thread: called with a
+     * [Contact] built from whatever [DhtNode.onIntroductionReceived] just
+     * fired with, whenever a rendezvous/DHT node relays an unsolicited
+     * introduction naming this device's peer and its self-reported address
+     * (see `IntroductionMessage.kt`'s own file doc in `dht/`). In production
+     * (see [com.hop.app.AppContainer]) this is
+     * `InternetPeerConnectionManager.connectToDiscoveredHolders` -- a
+     * received introduction is treated as just another way of learning about
+     * a [Contact] worth trying, same entry point a DHT topic browse result
+     * already uses, deduped/capped there exactly the same way. Defaults to a
+     * no-op for tests that have no [com.hop.transport.InternetPeerConnectionManager]
+     * to hand it.
+     */
+    private val connectToIntroducedPeer: suspend (Contact) -> Unit = {},
     registerWithProcessLifecycle: Boolean = true,
 ) : DefaultLifecycleObserver {
 
@@ -151,7 +167,25 @@ class DhtNodeManager(
                 // (see localBindAddress's own doc: no IPv6/dual-stack address selection
                 // here yet), so wrap it as a single-entry list rather than inventing a
                 // parallel single-address convenience constructor.
-                val dhtNode = DhtNode(routingTable, dhtTransport, scope, listOf(boundAddress))
+                val dhtNode = DhtNode(
+                    routingTable,
+                    dhtTransport,
+                    scope,
+                    listOf(boundAddress),
+                    onIntroductionReceived = { fromId, claimedAddress ->
+                        // Fires synchronously from DhtUdpTransport's receive
+                        // thread, not a coroutine -- scope.launch is required
+                        // to call the suspend connectToIntroducedPeer lambda
+                        // at all. Reuses `scope` (this function's own
+                        // CoroutineScope), never a second, separate one.
+                        val contact = Contact(
+                            id = fromId,
+                            address = claimedAddress.encode(),
+                            lastSeenAtMs = System.currentTimeMillis(),
+                        )
+                        scope.launch { connectToIntroducedPeer(contact) }
+                    },
+                )
                 dhtTransport.start()
 
                 socket = boundSocket

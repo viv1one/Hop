@@ -556,8 +556,19 @@ class DhtNodeTest {
 
         var receivedFromId: NodeId? = null
         val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
-        targetTransport.onIntroductionReceived = { fromId, _ -> receivedFromId = fromId }
-        DhtNode(RoutingTable(targetId), targetTransport, scope, ownAddressFor(targetSocket))
+        // Passed through DhtNode's own onIntroductionReceived constructor
+        // parameter (Phase 4's final hole-punching slice), not set on
+        // targetTransport directly -- setting it directly here would now be
+        // clobbered by DhtNode's own init-block forwarding (see that
+        // parameter's own doc), which runs after this line if a caller ever
+        // tried the old workaround.
+        DhtNode(
+            RoutingTable(targetId),
+            targetTransport,
+            scope,
+            ownAddressFor(targetSocket),
+            onIntroductionReceived = { fromId, _ -> receivedFromId = fromId },
+        )
 
         val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
         DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
@@ -620,6 +631,81 @@ class DhtNodeTest {
             val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 1)
             val result = aTransport.introduce(socketContact(rId, rSocket), neverObservedTargetId, ownReflectedAddress)
             assertEquals(null, result, "a target R's RoutingTable has never observed must answer not-found (null), even when it knows of some other closer contact")
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    // ---- Phase 4's final hole-punching slice: onIntroductionReceived forwarding ----
+
+    /**
+     * The last piece of the Phase 4 hole-punching thread, at [DhtNode]'s own
+     * layer: proves [DhtNode]'s `onIntroductionReceived` constructor
+     * parameter is actually forwarded to `transport.onIntroductionReceived`
+     * in `init`, rather than being silently left at the transport's own
+     * no-op default (the gap this exact test file's own
+     * `onIntroduceRequested answers from RoutingTable...` test above worked
+     * around by setting `targetTransport.onIntroductionReceived` directly,
+     * since [DhtNode] didn't forward it yet at the time that test was
+     * written). Same real loopback round trip as that test -- R genuinely
+     * observes the target via PING, then A calls a real
+     * [DhtUdpTransport.introduce] through R -- but the target's [DhtNode] is
+     * now constructed with a real callback lambda passed through the
+     * constructor, never touching `targetTransport` directly, so this only
+     * passes if [DhtNode]'s forwarding is actually wired.
+     */
+    @Test
+    fun `onIntroductionReceived passed to DhtNode's constructor is forwarded to transport and fires on a real INTRODUCTION`() = runBlocking {
+        val rId = chainNodeId(91)
+        val aId = chainNodeId(92)
+        val targetId = chainNodeId(93)
+
+        val rSocket = loopbackSocket()
+        val aSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        DhtNode(RoutingTable(rId), rTransport, scope, ownAddressFor(rSocket)) // init block wires rTransport's onIntroduceRequested
+
+        var receivedFromId: NodeId? = null
+        var receivedAddress: PeerAddress? = null
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        // The callback is threaded through DhtNode's constructor here --
+        // NOT set on targetTransport directly -- this is the exact thing
+        // under test.
+        DhtNode(
+            RoutingTable(targetId),
+            targetTransport,
+            scope,
+            ownAddressFor(targetSocket),
+            onIntroductionReceived = { fromId, claimedAddress ->
+                receivedFromId = fromId
+                receivedAddress = claimedAddress
+            },
+        )
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val transports = listOf(rTransport, targetTransport, aTransport)
+        transports.forEach { it.start() }
+        try {
+            // R must genuinely observe the target via an ordinary PING before
+            // its RoutingTable has a live entry for it -- not a synthetic
+            // insert.
+            assertTrue(rTransport.ping(socketContact(targetId, targetSocket)))
+
+            val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54322)
+            val result = aTransport.introduce(socketContact(rId, rSocket), targetId, ownReflectedAddress)
+            requireNotNull(result) { "a real DhtNode must answer found=true for a target it has genuinely observed via PING" }
+
+            val deadlineMs = System.currentTimeMillis() + 2000
+            while (receivedFromId == null && System.currentTimeMillis() < deadlineMs) {
+                Thread.sleep(20)
+            }
+            assertEquals(aId, receivedFromId, "DhtNode's onIntroductionReceived constructor parameter must fire with the real fromId, proving it was forwarded to transport")
+            assertEquals(ownReflectedAddress, receivedAddress, "the forwarded callback must receive A's real self-reported reflected address, unmodified")
         } finally {
             transports.forEach { it.stop() }
         }

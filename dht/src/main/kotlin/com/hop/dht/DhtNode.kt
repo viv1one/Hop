@@ -41,6 +41,15 @@ import kotlinx.coroutines.selects.select
  * now has a real way to announce both, via [PeerAddress.encodeList] --
  * [PeerAddress.decodeList] recovers them on the receiving side. See [Contact]'s
  * own class doc for why this needed zero changes to any wire-framing class.
+ *
+ * Phase 4's final hole-punching slice closes the last gap left open by the
+ * rendezvous-relayed-introduction slice (see `onIntroductionReceived`'s own
+ * doc below): this class previously left `transport.onIntroductionReceived`
+ * entirely unset, meaning a received INTRODUCTION reached nobody. Now
+ * forwarded straight through from a new constructor parameter, same shape as
+ * every other transport callback wired in `init` -- this class still decides
+ * nothing about *what* to do with an introduction, only makes sure the
+ * caller-supplied decision actually reaches [transport].
  */
 class DhtNode(
     val routingTable: RoutingTable,
@@ -59,6 +68,19 @@ class DhtNode(
      */
     private val ownAddresses: List<PeerAddress>,
     private val store: DhtStore = DhtStore(),
+    /**
+     * Fired when [transport] receives an unsolicited INTRODUCTION naming
+     * another peer and its self-reported [PeerAddress] -- the rendezvous-
+     * relayed NAT-hole-punching primitive from [IntroductionMessage.kt]'s own
+     * file doc. Defaults to a no-op, same as [DhtUdpTransport]'s own default,
+     * for every construction site that has no use for it (e.g. a bare
+     * `rendezvous/` node -- see `com.hop.rendezvous.RendezvousNode`'s own
+     * doc for why it's correct for that class to never act on this). The one
+     * real consumer today is `com.hop.app.dht.DhtNodeManager`, which forwards
+     * this into `com.hop.transport.InternetPeerConnectionManager` to actually
+     * attempt a connection to the introduced peer.
+     */
+    onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
 ) {
     init {
         // THE REQUIRED FIX: wires transport's two callbacks to this instance.
@@ -100,9 +122,12 @@ class DhtNode(
         // guards the "not actually known" case, where findClosest(targetId, 1)
         // would otherwise just return whatever contact happens to be closest,
         // silently misreporting an unknown target as found.
-        // transport.onIntroductionReceived is deliberately left at its
-        // default no-op, same reasoning as RendezvousNode -- acting on a
-        // received INTRODUCTION is a separate, later slice.
+        // Forwards this constructor's onIntroductionReceived (default no-op)
+        // straight through to transport -- the last piece of the Phase 4
+        // hole-punching thread: reacting to a received INTRODUCTION by
+        // actually attempting a connection is the caller's job (see this
+        // param's own doc above), not something DhtNode itself decides.
+        transport.onIntroductionReceived = onIntroductionReceived
         transport.onIntroduceRequested = { targetId ->
             routingTable.findClosest(targetId, 1).firstOrNull { it.id == targetId }
         }
