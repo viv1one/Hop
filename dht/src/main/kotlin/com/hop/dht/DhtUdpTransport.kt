@@ -30,6 +30,20 @@ sealed class FindValueOutcome {
  * its own public-facing address -- never the harder peer-introduction/
  * simultaneous-connect signaling step, which is separate, later work.
  *
+ * Phase 4's rendezvous-relayed-introduction slice adds that step (2), in the
+ * deliberately conservative shape `IntroductionMessage.kt`'s own file doc
+ * describes: [introduce] (INTRODUCE_REQUEST/INTRODUCE_RESPONSE, request/
+ * response-shaped via [sendAndAwait], same as every RPC above) lets a device
+ * ask a rendezvous/DHT contact to look up a target it can't yet reach; that
+ * same contact, if it finds the target, ALSO fires an unsolicited
+ * INTRODUCTION at the target via [sendUnsolicited] -- the first fire-and-
+ * forget send this class has (every RPC above is request/response-shaped).
+ * This slice builds only the wire-level relay mechanism: receiving an
+ * INTRODUCTION fires [onIntroductionReceived] and stops there -- nothing in
+ * this class attempts an actual connection. That's separate, later work, and
+ * so is any volunteer relay-node fallback for the symmetric-NAT case this
+ * mechanism doesn't solve.
+ *
  * **UDP, not TCP -- deliberately.** [RoutingTable] holds up to thousands of
  * *known-of* contacts, not *connected-to* peers: TCP would force either
  * holding one socket open per routing-table entry (doesn't scale) or a fresh
@@ -61,10 +75,11 @@ class DhtUdpTransport(
     /**
      * Fires for EVERY valid inbound message (PING, PONG, FIND_NODE_REQUEST,
      * FIND_NODE_RESPONSE, STORE_REQUEST, STORE_RESPONSE, FIND_VALUE_REQUEST,
-     * FIND_VALUE_RESPONSE, ADDRESS_REFLECTION_REQUEST, or
-     * ADDRESS_REFLECTION_RESPONSE), keyed to the packet's OBSERVED source address
-     * -- never a self-reported field, per this class's hard rule. This is
-     * the actual routing-table self-population mechanism.
+     * FIND_VALUE_RESPONSE, ADDRESS_REFLECTION_REQUEST,
+     * ADDRESS_REFLECTION_RESPONSE, INTRODUCE_REQUEST, INTRODUCE_RESPONSE, or
+     * INTRODUCTION), keyed to the packet's OBSERVED source address -- never a
+     * self-reported field, per this class's hard rule. This is the actual
+     * routing-table self-population mechanism.
      *
      * `var` with a no-op default (not `val`) so [DhtNode] can wire itself in
      * after construction (see [DhtNode]'s `init` block) without forcing
@@ -98,20 +113,45 @@ class DhtUdpTransport(
      */
     var onFindValueRequested: (key: NodeId, excludeId: NodeId) -> FindValueOutcome =
         { _, _ -> FindValueOutcome.CloserNodes(emptyList()) },
+    /**
+     * Answers an inbound INTRODUCE_REQUEST: given the requested [NodeId],
+     * returns this device's live-known [Contact] for it, or `null` if
+     * unknown. `var` with a no-op default ({ null }) for the same reason as
+     * [onFindNodeRequested] -- wired by [DhtNode]'s/`RendezvousNode`'s own
+     * `init` block to their own registry/routing-table lookup. See
+     * `IntroductionMessage.kt`'s own file doc for the mechanism this backs.
+     */
+    var onIntroduceRequested: (targetId: NodeId) -> Contact? = { null },
+    /**
+     * Fires when this device receives an unsolicited INTRODUCTION: [fromId]
+     * is the introduced peer's id, [claimedAddress] is that peer's
+     * self-reported reflected address, relayed through by whichever
+     * rendezvous/DHT contact sent this -- see [IntroductionMessage]'s own
+     * doc for why [claimedAddress] carries only as much trust as the
+     * introduced peer itself, never independently verified by the relay or
+     * this device. `var` with a no-op default -- **this slice deliberately
+     * goes no further than firing this callback.** Attempting an actual
+     * connection in response (e.g. `InternetPeerConnection.connectTo`) is
+     * explicitly out of scope here; see `IntroductionMessage.kt`'s own file
+     * doc.
+     */
+    var onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
     private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
 ) {
     /**
      * Pending outbound requests (PING, FIND_NODE_REQUEST, STORE_REQUEST,
-     * FIND_VALUE_REQUEST, or ADDRESS_REFLECTION_REQUEST) awaiting a matching
-     * response, keyed by [TransactionId] (content-based equality -- see that
-     * class's own doc for why a raw `ByteArray` key would silently break
-     * every correlation lookup). Deferred with the raw response bytes, not a
-     * shared typed message -- most response types here are not a
-     * [DhtMessage] (the STORE_RESPONSE ack is the one exception), so parsing
-     * is left to each caller ([ping]/[findNode]/[store]/[findValue]/
-     * [reflectOwnAddress]) rather than forced into one shared decode.
-     * [ConcurrentHashMap] since
-     * the receive thread and any number of concurrent callers touch this map
+     * FIND_VALUE_REQUEST, ADDRESS_REFLECTION_REQUEST, or INTRODUCE_REQUEST)
+     * awaiting a matching response, keyed by [TransactionId] (content-based
+     * equality -- see that class's own doc for why a raw `ByteArray` key
+     * would silently break every correlation lookup). Deferred with the raw
+     * response bytes, not a shared typed message -- most response types here
+     * are not a [DhtMessage] (the STORE_RESPONSE ack is the one exception),
+     * so parsing is left to each caller ([ping]/[findNode]/[store]/
+     * [findValue]/[reflectOwnAddress]/[introduce]) rather than forced into
+     * one shared decode. Never registered for INTRODUCTION -- that's the
+     * one fire-and-forget send this class makes (via [sendUnsolicited]), and
+     * has no response to correlate. [ConcurrentHashMap] since the receive
+     * thread and any number of concurrent callers touch this map
      * independently.
      */
     private val pendingRequests = ConcurrentHashMap<TransactionId, CompletableDeferred<ByteArray>>()
@@ -260,6 +300,49 @@ class DhtUdpTransport(
     }
 
     /**
+     * Sends an INTRODUCE_REQUEST to [via] (a rendezvous/DHT contact this
+     * device already talks to) asking it to introduce this device to
+     * [targetId], and suspends until either a matching INTRODUCE_RESPONSE
+     * arrives or [requestTimeoutMs] elapses. Returns the found [PeerAddress]
+     * on a `found=true` response; returns `null` on timeout, a `found=false`
+     * response, a malformed response, or a response that doesn't decode as
+     * an INTRODUCE_RESPONSE -- never trusts payload shape from the
+     * transaction id match alone, and never throws for any of these cases
+     * (same posture as every other RPC above).
+     *
+     * [ownReflectedAddress] should be this device's own address as learned
+     * via [reflectOwnAddress] -- it's carried inside the request so [via]
+     * has something correct to relay onward to [targetId] if it's found; see
+     * [IntroduceRequestMessage]'s own doc for why that field is genuinely
+     * self-reported (the one deliberate exception to this class's "never
+     * self-reported" rule) and what trust limitation that implies.
+     *
+     * This is Phase 4's rendezvous-relayed-introduction primitive -- see
+     * `IntroductionMessage.kt`'s own file doc for the full design (why this
+     * shape, not simultaneous-open TCP hole punching) and its scope (this
+     * function and [via]'s own [handlePacket] handling are the entire
+     * mechanism; nothing here or in [onIntroductionReceived] attempts an
+     * actual connection).
+     */
+    suspend fun introduce(via: Contact, targetId: NodeId, ownReflectedAddress: PeerAddress): PeerAddress? {
+        val transactionId = TransactionId.random()
+        val message = IntroduceRequestMessage(
+            transactionId = transactionId,
+            senderId = ownId,
+            targetId = targetId,
+            ownAddress = ownReflectedAddress,
+        )
+        val destination = firstDialableAddress(via)
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
+        return try {
+            val response = IntroduceResponseMessage.decode(responseBytes)
+            if (response.found) response.address else null
+        } catch (e: DhtMessageDecodeException) {
+            null
+        }
+    }
+
+    /**
      * Resolves the single [InetSocketAddress] [ping]/[findNode]/[store]/
      * [findValue]/[reflectOwnAddress] each dial [contact] at. `contact.address` may now hold more
      * than one [PeerAddress] (Phase 4's dual-stack self-registration, see
@@ -283,9 +366,9 @@ class DhtUdpTransport(
     }
 
     /**
-     * Shared primitive [ping], [findNode], [store], [findValue], and
-     * [reflectOwnAddress] all build on: registers a pending deferred for
-     * [transactionId], sends
+     * Shared primitive [ping], [findNode], [store], [findValue],
+     * [reflectOwnAddress], and [introduce] all build on: registers a pending
+     * deferred for [transactionId], sends
      * [requestBytes] to [destination], and suspends up to [requestTimeoutMs]
      * for a matching response's raw bytes (or `null` on timeout). Always
      * cleans up the pending-request entry, success or not.
@@ -303,6 +386,22 @@ class DhtUdpTransport(
         } finally {
             pendingRequests.remove(transactionId)
         }
+    }
+
+    /**
+     * Fire-and-forget send: writes [bytes] to [destination] with no
+     * pending-request registration and nothing awaited -- the first
+     * fire-and-forget outbound send this class makes (every function above
+     * is request/response-shaped via [sendAndAwait]). Used by
+     * [handlePacket]'s `INTRODUCE_REQUEST` case to deliver an unsolicited
+     * INTRODUCTION to a found target -- see [IntroductionMessage]'s own doc
+     * for why that message expects no reply. A genuine local I/O error (e.g.
+     * a closed socket) still propagates; there is no response to time out
+     * on, so there is nothing to swallow here the way [ping]/[findNode]/etc.
+     * swallow a timeout.
+     */
+    fun sendUnsolicited(destination: PeerAddress, bytes: ByteArray) {
+        socket.send(DatagramPacket(bytes, bytes.size, destination.toInetSocketAddress()))
     }
 
     private fun receiveLoop() {
@@ -337,8 +436,10 @@ class DhtUdpTransport(
      * (`[1B version][1B type]...`) to decide which type's decoder to invoke,
      * reports the sender via [onMessageObserved] using the packet's
      * *observed* source address (never a self-reported field -- this class's
-     * hard rule), then either answers a request or completes a matching
-     * pending call.
+     * hard rule), then either answers a request, completes a matching
+     * pending call, or -- INTRODUCTION's own case, the one exception --
+     * neither: it fires [onIntroductionReceived] and sends nothing back,
+     * since INTRODUCTION expects no reply (see [sendUnsolicited]).
      *
      * A response whose transaction ID doesn't match a currently-pending
      * outbound request (never issued, or already completed/timed out) is
@@ -465,6 +566,60 @@ class DhtUdpTransport(
                 val message = AddressReflectionResponseMessage.decode(payload)
                 observe(message.senderId, observedAddress)
                 pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.INTRODUCE_REQUEST -> {
+                val message = IntroduceRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                // App-level callback hook, same shape as onFindNodeRequested --
+                // this transport class doesn't own any registry/routing-table
+                // data itself. Wired by DhtNode/RendezvousNode's own init block
+                // to their respective lookup-by-id.
+                val target = onIntroduceRequested(message.targetId)
+                // A found Contact may carry more than one PeerAddress (Phase 4's
+                // dual-stack self-registration) -- dial the first, same posture
+                // as firstDialableAddress, but without throwing on a genuinely
+                // empty/malformed address blob: that's treated the same as
+                // "not found" rather than crashing this handler.
+                val targetAddress = target?.let { PeerAddress.decodeList(it.address).firstOrNull() }
+                val response = if (targetAddress != null) {
+                    IntroduceResponseMessage.found(transactionId = message.transactionId, senderId = ownId, address = targetAddress)
+                } else {
+                    IntroduceResponseMessage.notFound(transactionId = message.transactionId, senderId = ownId)
+                }
+                val bytes = response.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+
+                // Separately, and only when found: fire an unsolicited
+                // INTRODUCTION at the target, relaying the requester's
+                // self-reported address THROUGH, unmodified -- see
+                // IntroduceRequestMessage.ownAddress's own doc for why this
+                // device (R) has no way to independently verify that address
+                // either. If not found, nothing is sent to anyone.
+                if (targetAddress != null) {
+                    val introduction = IntroductionMessage(
+                        transactionId = TransactionId.random(),
+                        senderId = ownId,
+                        fromId = message.senderId,
+                        claimedAddress = message.ownAddress,
+                    )
+                    sendUnsolicited(targetAddress, introduction.encode())
+                }
+            }
+            DhtMessageType.INTRODUCE_RESPONSE -> {
+                val message = IntroduceResponseMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.INTRODUCTION -> {
+                val message = IntroductionMessage.decode(payload)
+                // message.senderId is R (the relay that genuinely, observably
+                // sent this packet) -- observed the ordinary way. message.fromId/
+                // message.claimedAddress describe A, and are NOT observed from
+                // this packet's source (that would just be R's own address) --
+                // they're handed to onIntroductionReceived below instead, never
+                // fed into observe().
+                observe(message.senderId, observedAddress)
+                onIntroductionReceived(message.fromId, message.claimedAddress)
             }
         }
     }

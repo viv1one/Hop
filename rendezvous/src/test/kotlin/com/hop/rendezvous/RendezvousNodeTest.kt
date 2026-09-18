@@ -137,6 +137,100 @@ class RendezvousNodeTest {
         }
     }
 
+    @Test
+    fun `INTRODUCE_REQUEST is answered from a previously-observed contact, and a real INTRODUCTION relays through to the target`() = runBlocking {
+        // Mirrors the address-reflection proof above: this is NOT a new
+        // capability RendezvousNode itself implements -- the wire-level
+        // relay mechanism (both the found/not-found INTRODUCE_RESPONSE and
+        // the fire-and-forget INTRODUCTION) lives entirely in
+        // DhtUdpTransport.handlePacket; this module only supplies the
+        // registry lookup via onIntroduceRequested (see this module's own
+        // class doc). Answering "do I know this exact peer's address" is the
+        // same address-only shape ADR 0002 already permits via
+        // onFindNodeRequested, just keyed to one exact id instead of a
+        // bounded random subset.
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val aSocket = loopbackSocket()
+        val aId = nodeId(2)
+        val aTransport = DhtUdpTransport(aSocket, aId)
+
+        val targetSocket = loopbackSocket()
+        val targetId = nodeId(3)
+        var receivedFromId: NodeId? = null
+        var receivedClaimedAddress: PeerAddress? = null
+        val targetTransport = DhtUdpTransport(targetSocket, targetId)
+        targetTransport.onIntroductionReceived = { fromId, claimedAddress ->
+            receivedFromId = fromId
+            receivedClaimedAddress = claimedAddress
+        }
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        rendezvous.start()
+        aTransport.start()
+        targetTransport.start()
+        try {
+            // The rendezvous node must first genuinely observe the target
+            // (via an ordinary PING) before it can answer an INTRODUCE_REQUEST
+            // for it -- this is RendezvousRegistry.lookup backing
+            // onIntroduceRequested, not a synthetic insert.
+            assertTrue(targetTransport.ping(contactFor(rendezvousSocket, rendezvousId)))
+
+            val result = aTransport.introduce(contactFor(rendezvousSocket, rendezvousId), targetId, ownReflectedAddress)
+            requireNotNull(result) { "the rendezvous node must answer found=true for a target it has genuinely observed" }
+            assertEquals(
+                PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort),
+                result,
+                "the returned address must be the target's genuinely observed address",
+            )
+
+            // The separate, unsolicited INTRODUCTION relay to the target --
+            // give its receive thread a moment to process it.
+            val deadlineMs = System.currentTimeMillis() + 2000
+            while (receivedFromId == null && System.currentTimeMillis() < deadlineMs) {
+                Thread.sleep(20)
+            }
+
+            assertEquals(aId, receivedFromId, "the target must receive a real INTRODUCTION naming A as fromId")
+            assertEquals(
+                ownReflectedAddress,
+                receivedClaimedAddress,
+                "the target must receive A's self-reported ownAddress, relayed through by the rendezvous node unmodified",
+            )
+        } finally {
+            rendezvous.stop()
+            aTransport.stop()
+            targetTransport.stop()
+        }
+    }
+
+    @Test
+    fun `INTRODUCE_REQUEST for a target the rendezvous node has never observed answers not-found, and nothing is sent to anyone`() = runBlocking {
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val aSocket = loopbackSocket()
+        val aId = nodeId(2)
+        val aTransport = DhtUdpTransport(aSocket, aId)
+
+        val neverObservedTargetId = nodeId(4)
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        rendezvous.start()
+        aTransport.start()
+        try {
+            val result = aTransport.introduce(contactFor(rendezvousSocket, rendezvousId), neverObservedTargetId, ownReflectedAddress)
+            assertEquals(null, result, "a target the rendezvous node has never observed must answer not-found (null)")
+        } finally {
+            rendezvous.stop()
+            aTransport.stop()
+        }
+    }
+
     // ---- The critical negative test: the whole point of this module (ADR 0002) ----
 
     @Test

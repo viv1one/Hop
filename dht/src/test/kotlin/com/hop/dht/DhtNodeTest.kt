@@ -527,6 +527,104 @@ class DhtNodeTest {
         }
     }
 
+    // ---- Phase 4 rendezvous-relayed-introduction additions ----
+
+    /**
+     * A real [DhtNode] answers INTRODUCE_REQUEST correctly using its own
+     * [RoutingTable] -- not a synthetic insert -- once it has genuinely
+     * observed the target via the ordinary PING/PONG mechanism, mirroring
+     * [RendezvousNodeTest]'s equivalent proof for [RendezvousNode] over the
+     * same shared [DhtUdpTransport]. No new method was added to
+     * [RoutingTable]/[KBucket] for this -- [DhtNode]'s `init` block reuses
+     * [RoutingTable.findClosest] at `count = 1`, which is guaranteed to
+     * return exactly the requested id when it's genuinely a live entry
+     * (distance-to-self is the minimum possible, zero).
+     */
+    @Test
+    fun `onIntroduceRequested answers from RoutingTable once the target has been observed via PING`() = runBlocking {
+        val rId = chainNodeId(71) // plays the "rendezvous/DHT contact" role
+        val aId = chainNodeId(72)
+        val targetId = chainNodeId(73)
+
+        val rSocket = loopbackSocket()
+        val aSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        DhtNode(RoutingTable(rId), rTransport, scope, ownAddressFor(rSocket)) // init block wires rTransport's onIntroduceRequested
+
+        var receivedFromId: NodeId? = null
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        targetTransport.onIntroductionReceived = { fromId, _ -> receivedFromId = fromId }
+        DhtNode(RoutingTable(targetId), targetTransport, scope, ownAddressFor(targetSocket))
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val transports = listOf(rTransport, targetTransport, aTransport)
+        transports.forEach { it.start() }
+        try {
+            // R must genuinely observe the target via an ordinary PING before
+            // its RoutingTable has a live entry for it -- not a synthetic
+            // insert.
+            assertTrue(rTransport.ping(socketContact(targetId, targetSocket)))
+
+            val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+            val result = aTransport.introduce(socketContact(rId, rSocket), targetId, ownReflectedAddress)
+
+            requireNotNull(result) { "a real DhtNode must answer found=true for a target it has genuinely observed via PING" }
+            assertEquals(
+                PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort),
+                result,
+                "the returned address must be the target's genuinely observed address from R's own RoutingTable",
+            )
+
+            val deadlineMs = System.currentTimeMillis() + 2000
+            while (receivedFromId == null && System.currentTimeMillis() < deadlineMs) {
+                Thread.sleep(20)
+            }
+            assertEquals(aId, receivedFromId, "the target must receive a real INTRODUCTION naming A as fromId")
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
+    @Test
+    fun `onIntroduceRequested answers not-found for a target never observed, even when RoutingTable knows an unrelated closer contact`() = runBlocking {
+        val rId = chainNodeId(81)
+        val aId = chainNodeId(82)
+        val unrelatedId = chainNodeId(84) // known to R, but NOT the requested target
+        val neverObservedTargetId = chainNodeId(83)
+
+        val rSocket = loopbackSocket()
+        val aSocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        val rNode = DhtNode(RoutingTable(rId), rTransport, scope, ownAddressFor(rSocket))
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val transports = listOf(rTransport, aTransport)
+        transports.forEach { it.start() }
+        try {
+            // R knows of a DIFFERENT peer -- RoutingTable.findClosest(targetId, 1)
+            // will happily return this "closest known" contact even though it
+            // isn't the requested target. The `it.id == targetId` filter in
+            // DhtNode's init block must reject that mismatch rather than
+            // misreporting an unrelated contact as the found target.
+            rNode.observe(dummyContact(unrelatedId))
+
+            val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 1)
+            val result = aTransport.introduce(socketContact(rId, rSocket), neverObservedTargetId, ownReflectedAddress)
+            assertEquals(null, result, "a target R's RoutingTable has never observed must answer not-found (null), even when it knows of some other closer contact")
+        } finally {
+            transports.forEach { it.stop() }
+        }
+    }
+
     // ---- IPv6-first/dual-stack self-registration slice additions ----
 
     /**

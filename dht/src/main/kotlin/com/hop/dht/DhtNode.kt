@@ -89,6 +89,23 @@ class DhtNode(
                 )
             }
         }
+        // Phase 4's rendezvous-relayed-introduction primitive (see
+        // IntroductionMessage.kt's own file doc): answers "do I know this
+        // exact peer's address," using RoutingTable itself rather than a
+        // dedicated lookup-by-id method. RoutingTable.findClosest(targetId, 1)
+        // sorts every known contact by XOR distance to targetId and takes the
+        // single closest one -- if targetId is genuinely a live entry, its
+        // distance to itself is zero, the minimum possible, so it's always
+        // selected at count = 1. The explicit `it.id == targetId` filter
+        // guards the "not actually known" case, where findClosest(targetId, 1)
+        // would otherwise just return whatever contact happens to be closest,
+        // silently misreporting an unknown target as found.
+        // transport.onIntroductionReceived is deliberately left at its
+        // default no-op, same reasoning as RendezvousNode -- acting on a
+        // received INTRODUCTION is a separate, later slice.
+        transport.onIntroduceRequested = { targetId ->
+            routingTable.findClosest(targetId, 1).firstOrNull { it.id == targetId }
+        }
     }
 
     /**

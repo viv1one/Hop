@@ -12,7 +12,9 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 
 /**
  * Real loopback UDP [DatagramSocket] pairs, driving real production classes
@@ -487,4 +489,183 @@ class DhtUdpTransportTest {
             aTransport.stop()
         }
     }
+
+    // ---- Phase 4 additions: rendezvous-relayed introduction ----
+
+    @Test
+    fun `introduce returns the found address and the target receives a real INTRODUCTION naming the requester`() = runBlocking {
+        val aId = nodeId(1)
+        val rId = nodeId(2)
+        val targetId = nodeId(3)
+        val aSocket = loopbackSocket()
+        val rSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+        val targetKnownAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort)
+
+        var receivedFromId: NodeId? = null
+        var receivedClaimedAddress: PeerAddress? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        rTransport.onIntroduceRequested = { requestedTargetId ->
+            if (requestedTargetId == targetId) {
+                Contact(id = targetId, address = targetKnownAddress.encode(), lastSeenAtMs = 0L)
+            } else {
+                null
+            }
+        }
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        targetTransport.onIntroductionReceived = { fromId, claimedAddress ->
+            receivedFromId = fromId
+            receivedClaimedAddress = claimedAddress
+        }
+
+        aTransport.start()
+        rTransport.start()
+        targetTransport.start()
+        try {
+            val result = aTransport.introduce(contactFor(rSocket, rId), targetId, ownReflectedAddress)
+            assertEquals(targetKnownAddress, result, "introduce() must return R's found address for the target")
+
+            // R's fire-and-forget INTRODUCTION to the target is sent
+            // independently of the INTRODUCE_RESPONSE reaching a -- give the
+            // target's receive thread a moment to process it.
+            withTimeout(2000) {
+                while (receivedFromId == null) {
+                    delay(20)
+                }
+            }
+
+            assertEquals(aId, receivedFromId, "the target's onIntroductionReceived must name A as fromId")
+            assertEquals(
+                ownReflectedAddress,
+                receivedClaimedAddress,
+                "the target must receive A's self-reported ownAddress, relayed through by R unmodified",
+            )
+        } finally {
+            aTransport.stop()
+            rTransport.stop()
+            targetTransport.stop()
+        }
+    }
+
+    @Test
+    fun `introduce returns null for a target R has never seen, and nothing is sent to any third party`() = runBlocking {
+        val aId = nodeId(1)
+        val rId = nodeId(2)
+        val unknownTargetId = nodeId(3)
+        val aSocket = loopbackSocket()
+        val rSocket = loopbackSocket()
+        // A real, listening third-party socket -- proves R never sends it
+        // anything when it doesn't know the requested target, not merely
+        // that some OTHER address (which might not even exist) was left alone.
+        val thirdPartySocket = loopbackSocket()
+        val thirdPartyReceived = CopyOnWriteArrayList<ByteArray>()
+        val thirdPartyThread = Thread {
+            val buffer = ByteArray(2048)
+            try {
+                while (true) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    thirdPartySocket.receive(packet)
+                    thirdPartyReceived.add(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                }
+            } catch (e: Exception) {
+                // socket closed at teardown -- fine.
+            }
+        }
+        thirdPartyThread.start()
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        rTransport.onIntroduceRequested = { null } // R never knows about anyone
+
+        aTransport.start()
+        rTransport.start()
+        try {
+            val result = aTransport.introduce(contactFor(rSocket, rId), unknownTargetId, ownReflectedAddress)
+            assertEquals(null, result, "introduce() against an unknown target must return null")
+
+            Thread.sleep(150)
+            assertTrue(thirdPartyReceived.isEmpty(), "R must never send anything to any third party when the requested target is not found")
+        } finally {
+            aTransport.stop()
+            rTransport.stop()
+            thirdPartySocket.close()
+            thirdPartyThread.join(1000)
+        }
+    }
+
+    @Test
+    fun `introduce to a closed, non-listening port times out cleanly, returning null`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 200)
+        aTransport.start()
+        try {
+            val deadSocket = loopbackSocket()
+            val deadPort = deadSocket.localPort
+            deadSocket.close()
+            val deadContact = Contact(
+                id = nodeId(99),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), deadPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+
+            val startedAtMs = System.currentTimeMillis()
+            val result = aTransport.introduce(deadContact, nodeId(3), PeerAddress.from(InetAddress.getLoopbackAddress(), 1))
+            val elapsedMs = System.currentTimeMillis() - startedAtMs
+
+            assertEquals(null, result, "introduce with no responder must time out to null, not hang or throw")
+            assertTrue(
+                elapsedMs < DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS,
+                "timeout must be bounded by the short injected requestTimeoutMs (200ms), not the production default (${DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS}ms); took ${elapsedMs}ms",
+            )
+        } finally {
+            aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `introduce returns null when the response's type byte doesn't match what was expected`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 1000)
+        aTransport.start()
+        try {
+            // An "attacker" socket that answers any inbound INTRODUCE_REQUEST
+            // with a bare PONG carrying the same transaction id -- introduce()
+            // must not trust this as a real INTRODUCE_RESPONSE.
+            val attackerSocket = DatagramSocket(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            val attackerThread = Thread {
+                val buffer = ByteArray(2048)
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    attackerSocket.receive(packet)
+                    val request = IntroduceRequestMessage.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                    val bogusPong = DhtMessage(DhtMessageType.PONG, request.transactionId, nodeId(2)).encode()
+                    attackerSocket.send(DatagramPacket(bogusPong, bogusPong.size, packet.address, packet.port))
+                } catch (e: Exception) {
+                    // socket closed underneath us at test teardown -- fine.
+                }
+            }
+            attackerThread.start()
+
+            val attackerContact = Contact(
+                id = nodeId(2),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), attackerSocket.localPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+            val result = aTransport.introduce(attackerContact, nodeId(3), PeerAddress.from(InetAddress.getLoopbackAddress(), 1))
+            assertEquals(null, result, "a type-mismatched response must be treated as failure, never trusted")
+
+            attackerSocket.close()
+            attackerThread.join(1000)
+        } finally {
+            aTransport.stop()
+        }
+    }
+
 }

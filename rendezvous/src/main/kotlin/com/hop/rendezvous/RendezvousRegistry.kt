@@ -82,6 +82,29 @@ class RendezvousRegistry(
         return alive
     }
 
+    /**
+     * The live (non-expired) contact for [id], or `null` if this registry
+     * has never observed it or its entry has expired -- same read-time
+     * expiry semantics as [liveContacts]: an entry found to be past
+     * [entryTtlMs] is pruned as a side effect of THIS call, not left for a
+     * later sweep. Backs Phase 4's rendezvous-relayed-introduction primitive
+     * (see `DhtUdpTransport.onIntroduceRequested`, wired to this method in
+     * [RendezvousNode]'s own `init` block) -- unlike [liveContacts]
+     * (a bounded random subset for cold-start peer exchange, ADR 0002),
+     * this answers "do I know this exact id," the one lookup shape
+     * [liveContacts] alone can't answer without a linear scan at every call
+     * site.
+     */
+    @Synchronized
+    fun lookup(id: NodeId): Contact? {
+        val entry = entries[id] ?: return null
+        if (entry.expiresAtMs <= nowMs()) {
+            entries.remove(id)
+            return null
+        }
+        return entry.contact
+    }
+
     /** Raw entry count, including entries not yet checked for expiry -- exposed for tests only. */
     val size: Int
         get() = entries.size

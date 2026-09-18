@@ -99,6 +99,43 @@ class RendezvousRegistryTest {
         )
     }
 
+    // ---- Phase 4 rendezvous-relayed-introduction additions: lookup(id) ----
+
+    @Test
+    fun `lookup returns the observed contact for a known id`() {
+        val registry = RendezvousRegistry()
+        val peer = contact(nodeId(1))
+
+        registry.observe(peer)
+
+        assertEquals(peer.id, registry.lookup(nodeId(1))?.id, "lookup must find an exact-match id previously observed")
+    }
+
+    @Test
+    fun `lookup returns null for an id the registry has never observed`() {
+        val registry = RendezvousRegistry()
+        registry.observe(contact(nodeId(1)))
+
+        assertEquals(null, registry.lookup(nodeId(2)), "lookup must return null for an id nobody ever announced")
+    }
+
+    @Test
+    fun `lookup returns null for an expired entry and prunes it as a side effect`() {
+        var now = 1_000L
+        val registry = RendezvousRegistry(entryTtlMs = 10_000L, nowMs = { now })
+        val peer = contact(nodeId(1))
+
+        registry.observe(peer)
+        now += 10_000L // exactly at expiry -- expiresAtMs <= now must be treated as expired
+
+        assertEquals(null, registry.lookup(peer.id), "an expired entry must never be returned by lookup")
+
+        // Prove the expiry deleted the entry as a side effect of THIS lookup
+        // call, not merely filtered it for this one read -- same posture as
+        // liveContacts()'s own expiry-on-read test above.
+        assertEquals(0, registry.size, "the expired entry must have been pruned by the lookup() call itself")
+    }
+
     @Test
     fun `re-observing a known contact bumps it to most-recently-seen, protecting it from capacity eviction`() {
         val registry = RendezvousRegistry(capacity = 2)

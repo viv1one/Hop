@@ -23,8 +23,14 @@ import java.net.DatagramSocket
  * [DhtUdpTransport] -- reused byte-for-byte from `dht/`, never forked or
  * reimplemented, so it speaks the identical PING/FIND_NODE wire format any
  * other peer (including a real [com.hop.dht.DhtNode]) already speaks -- and
- * wires ONLY [DhtUdpTransport.onMessageObserved] and
- * [DhtUdpTransport.onFindNodeRequested].
+ * wires ONLY [DhtUdpTransport.onMessageObserved],
+ * [DhtUdpTransport.onFindNodeRequested], and, as of Phase 4's rendezvous-
+ * relayed-introduction slice, [DhtUdpTransport.onIntroduceRequested] (to
+ * [RendezvousRegistry.lookup]) -- the same address-only shape
+ * [onFindNodeRequested] already answers, just keyed to one exact id instead
+ * of a bounded random subset. [DhtUdpTransport.onIntroductionReceived] is
+ * left at its default no-op -- this node has no reason to act on a received
+ * INTRODUCTION itself.
  *
  * **[DhtUdpTransport.onStoreRequested] and
  * [DhtUdpTransport.onFindValueRequested] are DELIBERATELY LEFT UNWIRED.**
@@ -93,6 +99,14 @@ class RendezvousNode(
                 .shuffled()
                 .take(responseCap)
         }
+        // Phase 4's rendezvous-relayed-introduction primitive (see
+        // IntroductionMessage.kt's own file doc): answers "do I know this
+        // exact peer's address," the same address-only shape ADR 0002
+        // already permits via onFindNodeRequested above -- not a content or
+        // topic query. transport.onIntroductionReceived is deliberately left
+        // at its default no-op: this node never itself needs to act on a
+        // received INTRODUCTION.
+        transport.onIntroduceRequested = { targetId -> registry.lookup(targetId) }
         // transport.onStoreRequested and transport.onFindValueRequested are
         // DELIBERATELY left at DhtUdpTransport's own safe no-op defaults --
         // see this class's doc above. Do not wire them here.

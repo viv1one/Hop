@@ -18,21 +18,23 @@ class DhtMessageDecodeException(message: String) : Exception(message)
  * `FindNodeMessage.kt`'s independent `FindNodeRequestMessage`/
  * `FindNodeResponseMessage`, as of Slice 5, `StoreMessage.kt`'s
  * `StoreRequestMessage` and `FindValueMessage.kt`'s independent
- * `FindValueRequestMessage`/`FindValueResponseMessage`, and as of Phase 4's
- * NAT hole-punching address-self-discovery slice,
- * `AddressReflectionMessage.kt`'s independent
- * `AddressReflectionRequestMessage`/`AddressReflectionResponseMessage`) puts
- * its type byte at the same fixed offset 1 (`[1B version][1B type]...`),
- * letting a receiver dispatch on this one byte before choosing which type's
- * decoder to invoke.
+ * `FindValueRequestMessage`/`FindValueResponseMessage`, as of Phase 4's NAT
+ * hole-punching address-self-discovery slice, `AddressReflectionMessage.kt`'s
+ * independent `AddressReflectionRequestMessage`/`AddressReflectionResponseMessage`,
+ * and as of Phase 4's rendezvous-relayed-introduction slice,
+ * `IntroductionMessage.kt`'s independent `IntroduceRequestMessage`/
+ * `IntroduceResponseMessage`/`IntroductionMessage`) puts its type byte at
+ * the same fixed offset 1 (`[1B version][1B type]...`), letting a receiver
+ * dispatch on this one byte before choosing which type's decoder to invoke.
  *
  * FIND_NODE_REQUEST/FIND_NODE_RESPONSE/STORE_REQUEST/FIND_VALUE_REQUEST/
- * FIND_VALUE_RESPONSE/ADDRESS_REFLECTION_REQUEST/ADDRESS_REFLECTION_RESPONSE
- * are wire-value constants only -- [DhtMessage] itself (this class's
- * `encode`/`decode`, its fixed 42-byte [WIRE_SIZE]) is never constructed with
- * those seven type values; their actual encode/decode logic lives entirely
- * in each request/response type's own file, deliberately not a retrofit of
- * [DhtMessage] into a sealed hierarchy.
+ * FIND_VALUE_RESPONSE/ADDRESS_REFLECTION_REQUEST/ADDRESS_REFLECTION_RESPONSE/
+ * INTRODUCE_REQUEST/INTRODUCE_RESPONSE/INTRODUCTION are wire-value constants
+ * only -- [DhtMessage] itself (this class's `encode`/`decode`, its fixed
+ * 42-byte [WIRE_SIZE]) is never constructed with those ten type values;
+ * their actual encode/decode logic lives entirely in each request/response
+ * type's own file, deliberately not a retrofit of [DhtMessage] into a sealed
+ * hierarchy.
  *
  * STORE_RESPONSE is the one exception: it *is* constructed as a plain
  * [DhtMessage] (the same bare-ack shape as PONG) -- a STORE ack carries
@@ -46,6 +48,13 @@ class DhtMessageDecodeException(message: String) : Exception(message)
  * therefore a distinct class, per this enum's own convention) is still
  * required even though the wire bytes carry nothing beyond
  * transactionId/senderId.
+ *
+ * INTRODUCE_REQUEST/INTRODUCE_RESPONSE/INTRODUCTION (wire values 10-12) are
+ * Phase 4's rendezvous-relayed-introduction primitive -- see
+ * `IntroductionMessage.kt`'s own file doc for the design decision this
+ * implements (rendezvous-relayed introduction, not simultaneous-open TCP
+ * hole punching) and its scope (wire-level relay mechanism only; nothing
+ * here attempts an actual connection on receipt of an INTRODUCTION).
  */
 enum class DhtMessageType(val wireValue: Int) {
     PING(0),
@@ -58,6 +67,9 @@ enum class DhtMessageType(val wireValue: Int) {
     FIND_VALUE_RESPONSE(7),
     ADDRESS_REFLECTION_REQUEST(8),
     ADDRESS_REFLECTION_RESPONSE(9),
+    INTRODUCE_REQUEST(10),
+    INTRODUCE_RESPONSE(11),
+    INTRODUCTION(12),
     ;
 
     companion object {
