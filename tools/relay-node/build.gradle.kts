@@ -26,6 +26,14 @@ plugins {
 // standalone volunteer-operated process, not inside the Android app.
 dependencies {
     implementation(project(":dht"))
+    // Needed for RelayAnnouncer's own runBlocking call (a thin wrapper around
+    // DhtUdpTransport.announceRelay, a suspend function) -- :dht's own
+    // dependency on this same artifact is `implementation`, not `api`, so it
+    // isn't visible on this module's compile classpath transitively; this
+    // module needs its own declaration. RelayNode's own accept/bridging loop
+    // (RelayNode.kt) still uses plain java.net sockets/threads, unchanged by
+    // this addition -- see RelayAnnouncer's own class doc.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")

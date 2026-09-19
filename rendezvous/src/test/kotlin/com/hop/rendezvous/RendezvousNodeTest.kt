@@ -231,6 +231,67 @@ class RendezvousNodeTest {
         }
     }
 
+    // ---- Phase 4 volunteer-relay-discovery additions ----
+
+    @Test
+    fun `a relay's RELAY_ANNOUNCE is acked and recorded, and a later RELAY_QUERY returns it with its self-reported address`() = runBlocking {
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val relaySocket = loopbackSocket()
+        val relayId = nodeId(2)
+        val relayTransport = DhtUdpTransport(relaySocket, relayId)
+
+        val querierSocket = loopbackSocket()
+        val querierTransport = DhtUdpTransport(querierSocket, nodeId(3))
+
+        // Deliberately NOT relaySocket's own UDP address -- proving the
+        // returned entry is the relay's genuinely self-reported TCP bridge
+        // address, not anything derived from this packet's observed source.
+        val selfReportedBridgeAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        rendezvous.start()
+        relayTransport.start()
+        querierTransport.start()
+        try {
+            val acked = relayTransport.announceRelay(contactFor(rendezvousSocket, rendezvousId), selfReportedBridgeAddress)
+            assertTrue(acked, "a RELAY_ANNOUNCE to a running RendezvousNode must ack true")
+
+            val relays = querierTransport.queryRelays(contactFor(rendezvousSocket, rendezvousId))
+            assertEquals(listOf(relayId), relays.map { it.id })
+            assertEquals(
+                selfReportedBridgeAddress.encode().toList(),
+                relays[0].address.toList(),
+                "the returned relay's address must be exactly its self-reported relayAddress",
+            )
+        } finally {
+            rendezvous.stop()
+            relayTransport.stop()
+            querierTransport.stop()
+        }
+    }
+
+    @Test
+    fun `RELAY_QUERY against a RendezvousNode that has never had a relay announce returns an empty list`() = runBlocking {
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val querierSocket = loopbackSocket()
+        val querierTransport = DhtUdpTransport(querierSocket, nodeId(2))
+
+        rendezvous.start()
+        querierTransport.start()
+        try {
+            val relays = querierTransport.queryRelays(contactFor(rendezvousSocket, rendezvousId))
+            assertTrue(relays.isEmpty(), "querying a RendezvousNode with nothing announced must return an empty list")
+        } finally {
+            rendezvous.stop()
+            querierTransport.stop()
+        }
+    }
+
     // ---- The critical negative test: the whole point of this module (ADR 0002) ----
 
     @Test

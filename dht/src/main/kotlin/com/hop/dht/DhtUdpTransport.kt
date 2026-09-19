@@ -44,6 +44,17 @@ sealed class FindValueOutcome {
  * so is any volunteer relay-node fallback for the symmetric-NAT case this
  * mechanism doesn't solve.
  *
+ * Phase 4's volunteer-relay-discovery slice adds the discovery half of that
+ * fallback: [announceRelay] (RELAY_ANNOUNCE/RELAY_ANNOUNCE_ACK, request/
+ * response via [sendAndAwait]) lets a `tools/relay-node/` `RelayNode` tell a
+ * rendezvous/DHT contact its own real TCP bridge address, and [queryRelays]
+ * (RELAY_QUERY/RELAY_QUERY_RESPONSE) lets a client later ask that same
+ * contact "what relay nodes do you know about." See
+ * `RelayAnnounceRequestMessage.kt`'s own file doc for why this can't reuse
+ * [store]/[findValue]. This slice builds only the wire-level discovery
+ * mechanism -- a client falling back to a discovered relay when direct dial
+ * and NAT hole-punching both fail is separate, later, client-side work.
+ *
  * **UDP, not TCP -- deliberately.** [RoutingTable] holds up to thousands of
  * *known-of* contacts, not *connected-to* peers: TCP would force either
  * holding one socket open per routing-table entry (doesn't scale) or a fresh
@@ -76,10 +87,11 @@ class DhtUdpTransport(
      * Fires for EVERY valid inbound message (PING, PONG, FIND_NODE_REQUEST,
      * FIND_NODE_RESPONSE, STORE_REQUEST, STORE_RESPONSE, FIND_VALUE_REQUEST,
      * FIND_VALUE_RESPONSE, ADDRESS_REFLECTION_REQUEST,
-     * ADDRESS_REFLECTION_RESPONSE, INTRODUCE_REQUEST, INTRODUCE_RESPONSE, or
-     * INTRODUCTION), keyed to the packet's OBSERVED source address -- never a
-     * self-reported field, per this class's hard rule. This is the actual
-     * routing-table self-population mechanism.
+     * ADDRESS_REFLECTION_RESPONSE, INTRODUCE_REQUEST, INTRODUCE_RESPONSE,
+     * INTRODUCTION, RELAY_ANNOUNCE, RELAY_ANNOUNCE_ACK, RELAY_QUERY, or
+     * RELAY_QUERY_RESPONSE), keyed to the packet's OBSERVED source address --
+     * never a self-reported field, per this class's hard rule. This is the
+     * actual routing-table self-population mechanism.
      *
      * `var` with a no-op default (not `val`) so [DhtNode] can wire itself in
      * after construction (see [DhtNode]'s `init` block) without forcing
@@ -136,23 +148,46 @@ class DhtUdpTransport(
      * doc.
      */
     var onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
+    /**
+     * Answers an inbound RELAY_ANNOUNCE: [relayId] is the announcing relay's
+     * own [NodeId] and [relayAddress] is its self-reported TCP bridge
+     * address (see [RelayAnnounceRequestMessage]'s own doc for why that
+     * field is genuinely self-reported and what trust limitation that
+     * implies). `var` with a no-op default for the same reason as
+     * [onFindNodeRequested] -- wired by [DhtNode]'s/`RendezvousNode`'s own
+     * `init` block to a `RelayDirectory` instance's `announce` method.
+     */
+    var onRelayAnnounceRequested: (relayId: NodeId, relayAddress: PeerAddress) -> Unit = { _, _ -> },
+    /**
+     * Answers an inbound RELAY_QUERY: returns up to a small bounded number
+     * of previously-announced relay [Contact]s this device knows about.
+     * `var` with a no-op default (`{ emptyList() }`) for the same reason as
+     * [onFindNodeRequested] -- wired by [DhtNode]'s/`RendezvousNode`'s own
+     * `init` block to a `RelayDirectory` instance's `liveRelays` method.
+     * Callers must return an already-bounded list -- this transport does not
+     * itself re-truncate the answer before handing it to
+     * [RelayQueryResponseMessage.encode] (same posture as
+     * [onFindNodeRequested]'s own already-bounded `routingTable.k` answer).
+     */
+    var onRelayQueryRequested: () -> List<Contact> = { emptyList() },
     private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
 ) {
     /**
      * Pending outbound requests (PING, FIND_NODE_REQUEST, STORE_REQUEST,
-     * FIND_VALUE_REQUEST, ADDRESS_REFLECTION_REQUEST, or INTRODUCE_REQUEST)
-     * awaiting a matching response, keyed by [TransactionId] (content-based
-     * equality -- see that class's own doc for why a raw `ByteArray` key
-     * would silently break every correlation lookup). Deferred with the raw
-     * response bytes, not a shared typed message -- most response types here
-     * are not a [DhtMessage] (the STORE_RESPONSE ack is the one exception),
-     * so parsing is left to each caller ([ping]/[findNode]/[store]/
-     * [findValue]/[reflectOwnAddress]/[introduce]) rather than forced into
-     * one shared decode. Never registered for INTRODUCTION -- that's the
-     * one fire-and-forget send this class makes (via [sendUnsolicited]), and
-     * has no response to correlate. [ConcurrentHashMap] since the receive
-     * thread and any number of concurrent callers touch this map
-     * independently.
+     * FIND_VALUE_REQUEST, ADDRESS_REFLECTION_REQUEST, INTRODUCE_REQUEST,
+     * RELAY_ANNOUNCE, or RELAY_QUERY) awaiting a matching response, keyed by
+     * [TransactionId] (content-based equality -- see that class's own doc
+     * for why a raw `ByteArray` key would silently break every correlation
+     * lookup). Deferred with the raw response bytes, not a shared typed
+     * message -- most response types here are not a [DhtMessage] (the
+     * STORE_RESPONSE/RELAY_ANNOUNCE_ACK acks are the exceptions), so parsing
+     * is left to each caller ([ping]/[findNode]/[store]/[findValue]/
+     * [reflectOwnAddress]/[introduce]/[announceRelay]/[queryRelays]) rather
+     * than forced into one shared decode. Never registered for INTRODUCTION
+     * -- that's the one fire-and-forget send this class makes (via
+     * [sendUnsolicited]), and has no response to correlate.
+     * [ConcurrentHashMap] since the receive thread and any number of
+     * concurrent callers touch this map independently.
      */
     private val pendingRequests = ConcurrentHashMap<TransactionId, CompletableDeferred<ByteArray>>()
 
@@ -339,6 +374,70 @@ class DhtUdpTransport(
             if (response.found) response.address else null
         } catch (e: DhtMessageDecodeException) {
             null
+        }
+    }
+
+    /**
+     * Sends a RELAY_ANNOUNCE to [via] (a rendezvous/DHT contact this device
+     * already talks to) declaring this device's own [ownAddress] as a
+     * volunteer relay's real TCP bridge address, and suspends until either a
+     * matching RELAY_ANNOUNCE_ACK arrives (`true`) or [requestTimeoutMs]
+     * elapses (`false`). Same never-throw-on-timeout/malformed-response
+     * posture as [ping]/[findNode]/[store]/[findValue]/[reflectOwnAddress]/
+     * [introduce].
+     *
+     * [ownAddress] is carried on the wire exactly as given -- genuinely
+     * self-reported, the same deliberate exception to this class's "never
+     * self-reported" rule [introduce]'s `ownReflectedAddress` already makes;
+     * see [RelayAnnounceRequestMessage]'s own doc for why that's unavoidable
+     * here (a TCP bridge port has no relationship to this UDP packet's own
+     * source port) and what trust limitation that implies.
+     *
+     * This is Phase 4's volunteer-relay-discovery primitive, the discovery
+     * half only -- see this class's own doc and [RelayAnnounceRequestMessage]'s
+     * file doc for the full design and scope (falling back to a discovered
+     * relay is separate, later, client-side work).
+     */
+    suspend fun announceRelay(via: Contact, ownAddress: PeerAddress): Boolean {
+        val transactionId = TransactionId.random()
+        val message = RelayAnnounceRequestMessage(transactionId = transactionId, senderId = ownId, relayAddress = ownAddress)
+        val destination = firstDialableAddress(via)
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return false
+        return try {
+            DhtMessage.decode(responseBytes).type == DhtMessageType.RELAY_ANNOUNCE_ACK
+        } catch (e: DhtMessageDecodeException) {
+            false
+        }
+    }
+
+    /**
+     * Sends a RELAY_QUERY to [via] (a rendezvous/DHT contact this device
+     * already talks to) asking it what relay nodes it knows about, and
+     * suspends until either a matching RELAY_QUERY_RESPONSE arrives (its
+     * relay [Contact] list) or [requestTimeoutMs] elapses. Returns
+     * `emptyList()` on timeout, a malformed response, or a response that
+     * doesn't decode as a RELAY_QUERY_RESPONSE -- never trusts payload shape
+     * from the transaction id match alone, and never throws for any of these
+     * cases (same posture as [findNode]/[findValue], except an empty list
+     * rather than `null` on failure: there is no meaningful distinction here
+     * between "the contact answered with zero known relays" and "the
+     * contact never answered at all" -- both mean "nothing usable came
+     * back").
+     *
+     * Every returned entry's address is exactly as trustworthy as whichever
+     * relay originally announced it to [via] -- see
+     * [RelayAnnounceRequestMessage]'s own doc for that limitation, which
+     * this call does nothing to mitigate.
+     */
+    suspend fun queryRelays(via: Contact): List<Contact> {
+        val transactionId = TransactionId.random()
+        val message = RelayQueryRequestMessage(transactionId = transactionId, senderId = ownId)
+        val destination = firstDialableAddress(via)
+        val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return emptyList()
+        return try {
+            RelayQueryResponseMessage.decode(responseBytes).relays
+        } catch (e: DhtMessageDecodeException) {
+            emptyList()
         }
     }
 
@@ -620,6 +719,51 @@ class DhtUdpTransport(
                 // fed into observe().
                 observe(message.senderId, observedAddress)
                 onIntroductionReceived(message.fromId, message.claimedAddress)
+            }
+            DhtMessageType.RELAY_ANNOUNCE -> {
+                val message = RelayAnnounceRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                // App-level callback hook, same shape as onStoreRequested --
+                // this transport class doesn't own any directory/registry
+                // data itself. Wired by DhtNode/RendezvousNode's own init
+                // block to a RelayDirectory instance's announce method.
+                // message.relayAddress is handed through UNMODIFIED, never
+                // replaced by observedAddress -- see RelayAnnounceRequestMessage's
+                // own doc for why that field must stay genuinely
+                // self-reported (a TCP bridge port has no relationship to
+                // this UDP packet's own observed source port).
+                onRelayAnnounceRequested(message.senderId, message.relayAddress)
+                val ack = DhtMessage(type = DhtMessageType.RELAY_ANNOUNCE_ACK, transactionId = message.transactionId, senderId = ownId)
+                val bytes = ack.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+            }
+            DhtMessageType.RELAY_ANNOUNCE_ACK -> {
+                val message = DhtMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
+            }
+            DhtMessageType.RELAY_QUERY -> {
+                val message = RelayQueryRequestMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                // App-level callback hook, same shape as onFindNodeRequested
+                // -- this transport class doesn't own any directory data
+                // itself. Wired by DhtNode/RendezvousNode's own init block to
+                // a RelayDirectory instance's liveRelays method, already
+                // bounded before it reaches here (see onRelayQueryRequested's
+                // own doc).
+                val relays = onRelayQueryRequested()
+                val response = RelayQueryResponseMessage(
+                    transactionId = message.transactionId,
+                    senderId = ownId,
+                    relays = relays,
+                )
+                val bytes = response.encode()
+                socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+            }
+            DhtMessageType.RELAY_QUERY_RESPONSE -> {
+                val message = RelayQueryResponseMessage.decode(payload)
+                observe(message.senderId, observedAddress)
+                pendingRequests[message.transactionId]?.complete(payload)
             }
         }
     }

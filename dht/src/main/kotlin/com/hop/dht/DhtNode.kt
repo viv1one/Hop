@@ -81,6 +81,18 @@ class DhtNode(
      * attempt a connection to the introduced peer.
      */
     onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
+    /**
+     * Backs [transport]'s [DhtUdpTransport.onRelayAnnounceRequested]/
+     * [DhtUdpTransport.onRelayQueryRequested] -- Phase 4's volunteer-relay-
+     * discovery primitive (see [RelayAnnounceRequestMessage]'s own file doc).
+     * A full [DhtNode] can just as well answer "what relay nodes do you know
+     * about" as `rendezvous/`'s `RendezvousNode` can -- both sit on the same
+     * [DhtUdpTransport] -- so this is wired unconditionally here, not left
+     * rendezvous-only. See [RelayDirectory]'s own class doc for why it lives
+     * in this module rather than `rendezvous/` despite mirroring that
+     * module's `RendezvousRegistry` shape.
+     */
+    private val relayDirectory: RelayDirectory = RelayDirectory(),
 ) {
     init {
         // THE REQUIRED FIX: wires transport's two callbacks to this instance.
@@ -131,6 +143,17 @@ class DhtNode(
         transport.onIntroduceRequested = { targetId ->
             routingTable.findClosest(targetId, 1).firstOrNull { it.id == targetId }
         }
+        // Phase 4's volunteer-relay-discovery primitive (see
+        // RelayAnnounceRequestMessage.kt's own file doc): recording an
+        // announcement and answering a query are both address-only, the
+        // same shape onFindNodeRequested/onIntroduceRequested already
+        // exercise -- relayDirectory is structurally incapable of answering
+        // anything beyond "here are some relay id+address pairs."
+        // .shuffled().take(...) here mirrors RendezvousNode.onFindNodeRequested's
+        // own bounding convention -- RelayDirectory.liveRelays() itself
+        // returns every live entry, uncapped.
+        transport.onRelayAnnounceRequested = { relayId, relayAddress -> relayDirectory.announce(relayId, relayAddress) }
+        transport.onRelayQueryRequested = { relayDirectory.liveRelays().shuffled().take(RelayDirectory.DEFAULT_RESPONSE_CAP) }
     }
 
     /**

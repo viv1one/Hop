@@ -36,11 +36,13 @@ class DhtMessageDecodeException(message: String) : Exception(message)
  * type's own file, deliberately not a retrofit of [DhtMessage] into a sealed
  * hierarchy.
  *
- * STORE_RESPONSE is the one exception: it *is* constructed as a plain
+ * STORE_RESPONSE is one exception: it *is* constructed as a plain
  * [DhtMessage] (the same bare-ack shape as PONG) -- a STORE ack carries
  * nothing beyond "acknowledged," unlike FIND_VALUE_RESPONSE, which must
  * distinguish holders-found from closer-routing-candidates and so needs its
  * own type. See `StoreRequestMessage`'s own doc for that contrast.
+ * RELAY_ANNOUNCE_ACK (wire value 14) is the other exception, same reasoning:
+ * see `RelayDirectoryMessage.kt`'s own file doc.
  * ADDRESS_REFLECTION_REQUEST's payload shape is *also* bare (identical to
  * PING's), but it still gets its own dedicated
  * `AddressReflectionRequestMessage` type rather than reusing [DhtMessage]
@@ -55,6 +57,17 @@ class DhtMessageDecodeException(message: String) : Exception(message)
  * implements (rendezvous-relayed introduction, not simultaneous-open TCP
  * hole punching) and its scope (wire-level relay mechanism only; nothing
  * here attempts an actual connection on receipt of an INTRODUCTION).
+ *
+ * RELAY_ANNOUNCE/RELAY_ANNOUNCE_ACK/RELAY_QUERY/RELAY_QUERY_RESPONSE (wire
+ * values 13-16) are Phase 4's volunteer relay-node discovery primitive --
+ * see `RelayDirectoryMessage.kt`'s own file doc for the design decision this
+ * implements (why this can't reuse STORE_REQUEST/FIND_VALUE_REQUEST) and its
+ * scope (wire-level discovery only; the client-side "fall back to a
+ * discovered relay" orchestration is separate, later work). RELAY_ANNOUNCE_ACK
+ * follows STORE_RESPONSE's own precedent: it IS constructed as a plain
+ * [DhtMessage] (a bare ack carries nothing beyond "registered"), unlike the
+ * other three, whose actual encode/decode logic lives in their own file, same
+ * as every other request/response type in this module.
  */
 enum class DhtMessageType(val wireValue: Int) {
     PING(0),
@@ -70,6 +83,10 @@ enum class DhtMessageType(val wireValue: Int) {
     INTRODUCE_REQUEST(10),
     INTRODUCE_RESPONSE(11),
     INTRODUCTION(12),
+    RELAY_ANNOUNCE(13),
+    RELAY_ANNOUNCE_ACK(14),
+    RELAY_QUERY(15),
+    RELAY_QUERY_RESPONSE(16),
     ;
 
     companion object {

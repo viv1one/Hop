@@ -801,4 +801,81 @@ class DhtNodeTest {
             transports.forEach { it.stop() }
         }
     }
+
+    // ---- Phase 4 volunteer-relay-discovery additions ----
+
+    /**
+     * Proves a full [DhtNode] answers RELAY_ANNOUNCE/RELAY_QUERY correctly
+     * too, not just `rendezvous/`'s `RendezvousNode` (see [DhtNode]'s own
+     * `init`-block wiring and [RelayDirectory]'s own class doc for why both
+     * consumers share this same class) -- mirrors
+     * `RendezvousNodeTest`'s equivalent end-to-end test.
+     */
+    @Test
+    fun `a relay's RELAY_ANNOUNCE against a DhtNode is acked and recorded, and a later RELAY_QUERY returns it`() = runBlocking {
+        val hostId = zeroId()
+        val hostSocket = loopbackSocket()
+        val hostTransport = DhtUdpTransport(hostSocket, hostId, onMessageObserved = {})
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+        // Constructed purely for its init-block wiring side effect --
+        // never otherwise referenced, same posture as RendezvousNodeTest's
+        // own `val rendezvous = RendezvousNode(...)` binding.
+        DhtNode(RoutingTable(hostId), hostTransport, scope, ownAddressFor(hostSocket))
+
+        val relaySocket = loopbackSocket()
+        val relayId = idInBucketZero(1)
+        val relayTransport = DhtUdpTransport(relaySocket, relayId)
+
+        val querierSocket = loopbackSocket()
+        val querierTransport = DhtUdpTransport(querierSocket, idInBucketZero(2))
+
+        // Deliberately NOT relaySocket's own UDP address -- the returned
+        // entry must be the relay's genuinely self-reported TCP bridge
+        // address, never anything derived from this packet's observed
+        // source.
+        val selfReportedBridgeAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        hostTransport.start()
+        relayTransport.start()
+        querierTransport.start()
+        try {
+            val acked = relayTransport.announceRelay(contactAt(hostId, hostSocket), selfReportedBridgeAddress)
+            assertTrue(acked, "a RELAY_ANNOUNCE to a running DhtNode must ack true")
+
+            val relays = querierTransport.queryRelays(contactAt(hostId, hostSocket))
+            assertEquals(listOf(relayId), relays.map { it.id })
+            assertEquals(
+                selfReportedBridgeAddress.encode().toList(),
+                relays[0].address.toList(),
+                "the returned relay's address must be exactly its self-reported relayAddress",
+            )
+        } finally {
+            hostTransport.stop()
+            relayTransport.stop()
+            querierTransport.stop()
+        }
+    }
+
+    @Test
+    fun `RELAY_QUERY against a DhtNode that has never had a relay announce returns an empty list`() = runBlocking {
+        val hostId = zeroId()
+        val hostSocket = loopbackSocket()
+        val hostTransport = DhtUdpTransport(hostSocket, hostId, onMessageObserved = {})
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+        // Constructed purely for its init-block wiring side effect -- see the test above.
+        DhtNode(RoutingTable(hostId), hostTransport, scope, ownAddressFor(hostSocket))
+
+        val querierSocket = loopbackSocket()
+        val querierTransport = DhtUdpTransport(querierSocket, idInBucketZero(2))
+
+        hostTransport.start()
+        querierTransport.start()
+        try {
+            val relays = querierTransport.queryRelays(contactAt(hostId, hostSocket))
+            assertTrue(relays.isEmpty(), "querying a DhtNode with nothing announced must return an empty list")
+        } finally {
+            hostTransport.stop()
+            querierTransport.stop()
+        }
+    }
 }

@@ -2,6 +2,7 @@ package com.hop.rendezvous
 
 import com.hop.dht.DhtUdpTransport
 import com.hop.dht.NodeId
+import com.hop.dht.RelayDirectory
 import java.net.DatagramSocket
 
 /**
@@ -31,6 +32,20 @@ import java.net.DatagramSocket
  * of a bounded random subset. [DhtUdpTransport.onIntroductionReceived] is
  * left at its default no-op -- this node has no reason to act on a received
  * INTRODUCTION itself.
+ *
+ * As of Phase 4's volunteer-relay-discovery slice, also wires
+ * [DhtUdpTransport.onRelayAnnounceRequested]/[DhtUdpTransport.onRelayQueryRequested]
+ * to a [RelayDirectory] instance -- see that class's own doc for why it
+ * lives in `dht/` rather than this module despite mirroring
+ * [RendezvousRegistry]'s shape closely, and [RelayAnnounceRequestMessage][com.hop.dht.RelayAnnounceRequestMessage]'s
+ * own file doc for why this is still squarely within ADR 0002's carve-out:
+ * an announced relay entry is exactly "a peer's id + address," the same
+ * address-only shape [onFindNodeRequested] already answers, just for a peer
+ * role (relay) instead of an arbitrary DHT contact. This does NOT weaken this
+ * module's structural guarantee -- [RelayDirectory] has no method capable of
+ * constructing or answering a content-hash or topic-key query, so wiring it
+ * here stays incapable of an ADR 0002 violation by construction, same as
+ * every other wiring in this `init` block.
  *
  * **[DhtUdpTransport.onStoreRequested] and
  * [DhtUdpTransport.onFindValueRequested] are DELIBERATELY LEFT UNWIRED.**
@@ -88,6 +103,8 @@ class RendezvousNode(
     ownId: NodeId,
     private val registry: RendezvousRegistry = RendezvousRegistry(),
     private val responseCap: Int = DEFAULT_RESPONSE_CAP,
+    /** Backs [DhtUdpTransport.onRelayAnnounceRequested]/[DhtUdpTransport.onRelayQueryRequested] -- see this class's own doc, above, for why wiring it here is still within ADR 0002's carve-out. */
+    private val relayDirectory: RelayDirectory = RelayDirectory(),
 ) {
     private val transport = DhtUdpTransport(socket, ownId)
 
@@ -107,6 +124,14 @@ class RendezvousNode(
         // at its default no-op: this node never itself needs to act on a
         // received INTRODUCTION.
         transport.onIntroduceRequested = { targetId -> registry.lookup(targetId) }
+        // Phase 4's volunteer-relay-discovery primitive (see
+        // RelayAnnounceRequestMessage.kt's own file doc) -- address-only, the
+        // same shape onFindNodeRequested/onIntroduceRequested above already
+        // exercise. .shuffled().take(...) mirrors onFindNodeRequested's own
+        // bounding convention -- RelayDirectory.liveRelays() itself returns
+        // every live entry, uncapped.
+        transport.onRelayAnnounceRequested = { relayId, relayAddress -> relayDirectory.announce(relayId, relayAddress) }
+        transport.onRelayQueryRequested = { relayDirectory.liveRelays().shuffled().take(RelayDirectory.DEFAULT_RESPONSE_CAP) }
         // transport.onStoreRequested and transport.onFindValueRequested are
         // DELIBERATELY left at DhtUdpTransport's own safe no-op defaults --
         // see this class's doc above. Do not wire them here.

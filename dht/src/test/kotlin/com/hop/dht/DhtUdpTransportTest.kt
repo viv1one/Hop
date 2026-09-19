@@ -668,4 +668,211 @@ class DhtUdpTransportTest {
         }
     }
 
+    // ---- Phase 4 additions: volunteer relay-node discovery ----
+
+    @Test
+    fun `announceRelay acks and fires onRelayAnnounceRequested with the announcing relay's id and self-reported address`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        var receivedRelayId: NodeId? = null
+        var receivedRelayAddress: PeerAddress? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onRelayAnnounceRequested = { relayId, relayAddress ->
+            receivedRelayId = relayId
+            receivedRelayAddress = relayAddress
+        }
+        aTransport.start()
+        bTransport.start()
+        try {
+            // A deliberately different address than a's own UDP socket's real
+            // source, proving relayAddress is carried through as the
+            // genuinely self-reported field it is, never replaced by
+            // whatever address b actually observed this packet arriving
+            // from -- see RelayAnnounceRequestMessage's own doc.
+            val selfReportedBridgeAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+            val result = aTransport.announceRelay(contactFor(bSocket, bId), selfReportedBridgeAddress)
+            assertTrue(result, "a RELAY_ANNOUNCE to a live, responding peer must ack true")
+            assertEquals(aId, receivedRelayId, "the announced relayId must be RelayAnnounceRequestMessage.senderId")
+            assertEquals(
+                selfReportedBridgeAddress,
+                receivedRelayAddress,
+                "the announced relayAddress must be exactly what the caller supplied, never the packet's observed source",
+            )
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `announceRelay to a closed, non-listening port times out cleanly, returning false`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 200)
+        aTransport.start()
+        try {
+            val deadSocket = loopbackSocket()
+            val deadPort = deadSocket.localPort
+            deadSocket.close()
+            val deadContact = Contact(
+                id = nodeId(99),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), deadPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+
+            val startedAtMs = System.currentTimeMillis()
+            val result = aTransport.announceRelay(deadContact, PeerAddress.from(InetAddress.getLoopbackAddress(), 1))
+            val elapsedMs = System.currentTimeMillis() - startedAtMs
+
+            assertFalse(result, "announceRelay with no responder must time out to false, not hang or throw")
+            assertTrue(
+                elapsedMs < DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS,
+                "timeout must be bounded by the short injected requestTimeoutMs (200ms), not the production default (${DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS}ms); took ${elapsedMs}ms",
+            )
+        } finally {
+            aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `queryRelays returns the announced relays, and returns empty when nothing was ever announced`() = runBlocking {
+        val aId = nodeId(1)
+        val bId = nodeId(2)
+        val aSocket = loopbackSocket()
+        val bSocket = loopbackSocket()
+
+        val relayEntry = Contact(
+            id = nodeId(7),
+            address = PeerAddress.from(InetAddress.getLoopbackAddress(), 12345).encode(),
+            lastSeenAtMs = 0L,
+        )
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val bTransport = DhtUdpTransport(bSocket, bId, onMessageObserved = {})
+        bTransport.onRelayQueryRequested = { emptyList() }
+        aTransport.start()
+        bTransport.start()
+        try {
+            val emptyResult = aTransport.queryRelays(contactFor(bSocket, bId))
+            assertTrue(emptyResult.isEmpty(), "querying a responder that knows of no relays must return an empty list, not null or an error")
+
+            bTransport.onRelayQueryRequested = { listOf(relayEntry) }
+            val result = aTransport.queryRelays(contactFor(bSocket, bId))
+            assertEquals(listOf(relayEntry.id), result.map { it.id })
+            assertTrue(relayEntry.address.contentEquals(result[0].address))
+        } finally {
+            aTransport.stop()
+            bTransport.stop()
+        }
+    }
+
+    @Test
+    fun `queryRelays to a closed, non-listening port times out cleanly, returning an empty list`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 200)
+        aTransport.start()
+        try {
+            val deadSocket = loopbackSocket()
+            val deadPort = deadSocket.localPort
+            deadSocket.close()
+            val deadContact = Contact(
+                id = nodeId(99),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), deadPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+
+            val startedAtMs = System.currentTimeMillis()
+            val result = aTransport.queryRelays(deadContact)
+            val elapsedMs = System.currentTimeMillis() - startedAtMs
+
+            assertTrue(result.isEmpty(), "queryRelays with no responder must time out to an empty list, not hang or throw")
+            assertTrue(
+                elapsedMs < DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS,
+                "timeout must be bounded by the short injected requestTimeoutMs (200ms), not the production default (${DhtUdpTransport.DEFAULT_REQUEST_TIMEOUT_MS}ms); took ${elapsedMs}ms",
+            )
+        } finally {
+            aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `announceRelay returns false when the response's type byte doesn't match what was expected`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 1000)
+        aTransport.start()
+        try {
+            val attackerSocket = DatagramSocket(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            val attackerThread = Thread {
+                val buffer = ByteArray(2048)
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    attackerSocket.receive(packet)
+                    val request = RelayAnnounceRequestMessage.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                    val bogusPong = DhtMessage(DhtMessageType.PONG, request.transactionId, nodeId(2)).encode()
+                    attackerSocket.send(DatagramPacket(bogusPong, bogusPong.size, packet.address, packet.port))
+                } catch (e: Exception) {
+                    // socket closed underneath us at test teardown -- fine.
+                }
+            }
+            attackerThread.start()
+
+            val attackerContact = Contact(
+                id = nodeId(2),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), attackerSocket.localPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+            val result = aTransport.announceRelay(attackerContact, PeerAddress.from(InetAddress.getLoopbackAddress(), 1))
+            assertFalse(result, "a type-mismatched response must be treated as failure, never trusted")
+
+            attackerSocket.close()
+            attackerThread.join(1000)
+        } finally {
+            aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `queryRelays returns empty when the response's type byte doesn't match what was expected`() = runBlocking {
+        val aId = nodeId(1)
+        val aSocket = loopbackSocket()
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {}, requestTimeoutMs = 1000)
+        aTransport.start()
+        try {
+            val attackerSocket = DatagramSocket(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            val attackerThread = Thread {
+                val buffer = ByteArray(2048)
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    attackerSocket.receive(packet)
+                    val request = RelayQueryRequestMessage.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
+                    val bogusPong = DhtMessage(DhtMessageType.PONG, request.transactionId, nodeId(2)).encode()
+                    attackerSocket.send(DatagramPacket(bogusPong, bogusPong.size, packet.address, packet.port))
+                } catch (e: Exception) {
+                    // socket closed underneath us at test teardown -- fine.
+                }
+            }
+            attackerThread.start()
+
+            val attackerContact = Contact(
+                id = nodeId(2),
+                address = PeerAddress.from(InetAddress.getLoopbackAddress(), attackerSocket.localPort).encode(),
+                lastSeenAtMs = 0L,
+            )
+            val result = aTransport.queryRelays(attackerContact)
+            assertTrue(result.isEmpty(), "a type-mismatched response must be treated as failure, never trusted")
+
+            attackerSocket.close()
+            attackerThread.join(1000)
+        } finally {
+            aTransport.stop()
+        }
+    }
+
 }
