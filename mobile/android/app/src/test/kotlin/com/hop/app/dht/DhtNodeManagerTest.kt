@@ -1,10 +1,21 @@
 package com.hop.app.dht
 
+import com.hop.dht.PeerAddress
+import com.hop.p2p.PeerChannel
+import com.hop.p2p.PeerDialer
 import com.hop.protocol.ReachTier
+import com.hop.protocol.WireEnvelope
+import com.hop.protocol.WirePayloadType
+import java.net.InetAddress
+import java.net.Socket
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.fail
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -21,10 +32,12 @@ class DhtNodeManagerTest {
         seed: ByteArray,
         bootstrapHost: String = "",
         bootstrapPort: Int = 0,
+        onInboundInternetConnection: (PeerChannel) -> Unit = {},
     ): DhtNodeManager = DhtNodeManager(
         getOwnNodeIdSeed = { seed },
         bootstrapHost = bootstrapHost,
         bootstrapPort = bootstrapPort,
+        onInboundInternetConnection = onInboundInternetConnection,
         registerWithProcessLifecycle = false,
     )
 
@@ -122,5 +135,66 @@ class DhtNodeManagerTest {
 
         val subscriptionAfterStop = manager.awaitTopicSubscription(timeoutMs = 200)
         assertNull(subscriptionAfterStop, "stop() must tear down the DHT node, not leave a stale TopicSubscription reachable")
+    }
+
+    // -- Inbound internet-mode TCP (the PeerListener wiring): proves the
+    // TCP/UDP same-port bind genuinely works end-to-end -- a real dial at
+    // ownAddress's (loopback, port) actually gets accepted and fires
+    // onInboundInternetConnection -- not just that the code compiles. --
+
+    @Test
+    fun `a raw TCP dial at ownAddress's port is accepted and fires onInboundInternetConnection`() = runBlocking {
+        val accepted = LinkedBlockingQueue<PeerChannel>()
+        val manager = newManager(seed = ByteArray(16) { 6 }, onInboundInternetConnection = { channel -> accepted.add(channel) })
+        try {
+            manager.start()
+            assertNotNull(manager.awaitTopicSubscription(), "the DHT node must still come up normally alongside the TCP listener")
+            val address = manager.ownAddress
+            assertNotNull(address, "ownAddress must be set once start() has finished")
+
+            // Dial the exact same port number the UDP DHT socket got --
+            // proves the TCP listener is genuinely bound there, not just
+            // that PeerListener compiles/constructs.
+            val candidate = PeerAddress.from(InetAddress.getByName("127.0.0.1"), address.port)
+            val clientSocket = PeerDialer.dial(listOf(candidate))
+            val clientChannel = PeerChannel(clientSocket)
+
+            val serverChannel = accepted.poll(2, TimeUnit.SECONDS)
+                ?: fail("onInboundInternetConnection was never invoked for a dial at ownAddress's port")
+
+            // Round-trip a WireEnvelope both ways to confirm this is a real,
+            // usable PeerChannel, not just an accepted-then-abandoned socket.
+            val fromClient = WireEnvelope(WirePayloadType.POST_FRAME, byteArrayOf(1, 2, 3))
+            clientChannel.sendEnvelope(fromClient)
+            assertEquals(fromClient, serverChannel.receiveEnvelope())
+
+            clientChannel.close()
+            serverChannel.close()
+        } finally {
+            manager.stop()
+        }
+    }
+
+    @Test
+    fun `stop actually stops accepting inbound TCP connections -- a subsequent dial to the same port is refused`() = runBlocking {
+        val manager = newManager(seed = ByteArray(16) { 7 })
+        manager.start()
+        assertNotNull(manager.awaitTopicSubscription())
+        val address = manager.ownAddress
+        assertNotNull(address, "ownAddress must be set once start() has finished")
+        val port = address.port
+
+        manager.stop()
+
+        // The TCP listener must be torn down alongside everything else --
+        // a dial to the same port must now fail (connection refused),
+        // rather than still being accepted by an orphaned listener.
+        val threw = try {
+            Socket("127.0.0.1", port).close()
+            false
+        } catch (e: Exception) {
+            true
+        }
+        assertTrue(threw, "stop() must actually stop accepting inbound TCP connections, not just tear down the DHT node")
     }
 }

@@ -20,6 +20,7 @@ import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -150,6 +151,22 @@ import kotlinx.coroutines.withContext
  * (the module that actually owns the DHT transport and this device's own
  * [NodeId] -- see each parameter's own doc for why nothing DHT-specific is
  * reimplemented here).
+ *
+ * **Inbound connections ([acceptInbound], Phase 4's `PeerListener` wiring):**
+ * everything above this paragraph describes connections THIS device dialed
+ * out to. `com.hop.app.dht.DhtNodeManager` also now runs a
+ * [com.hop.p2p.PeerListener] that ACCEPTS inbound TCP connections other
+ * devices dial at this one -- [acceptInbound] is where an accepted connection
+ * enters this class's world, adopted into a second, separate registry
+ * ([inboundConnections]) rather than forced into the [NodeId]-keyed
+ * [connections] map, since an inbound socket carries no [NodeId] at accept
+ * time. [broadcastToConnections] (and therefore every broadcast/live-relay
+ * path above) now reaches both registries. See [acceptInbound]'s own doc for
+ * the full reasoning, including two explicitly-not-attempted problems this
+ * makes newly reachable in practice: mapping a later
+ * [DispatchResult.PeerIdentified] back to a durable identity for an inbound
+ * connection, and deduping an inbound connection against a later outbound
+ * dial to the same logical peer.
  */
 class InternetPeerConnectionManager(
     postRepository: PostRepository,
@@ -241,6 +258,23 @@ class InternetPeerConnectionManager(
      * [connectToDiscoveredHolders].
      */
     private val connections = ConcurrentHashMap<NodeId, PeerChannel>()
+
+    /**
+     * Every currently-open internet connection this device ACCEPTED (via
+     * `com.hop.app.dht.DhtNodeManager`'s [com.hop.p2p.PeerListener], see
+     * [acceptInbound]'s own doc), as opposed to [connections], which holds
+     * only connections this device itself dialed *out* to. Deliberately a
+     * plain [PeerChannel] set, not a [NodeId]-keyed map: an inbound socket
+     * carries zero identity information at accept time -- there is no
+     * [Contact], no [NodeId], nothing -- so there is no key to keyed this
+     * registry by. See [acceptInbound]'s own doc for the full reasoning,
+     * including the identity-mapping problem this deliberately does NOT
+     * attempt to solve. [Collections.newSetFromMap] over a
+     * [ConcurrentHashMap] mirrors [com.hop.p2p.PeerListener.trackedSockets]'s
+     * own pattern for the identical "concurrently added/removed set of live
+     * connections" shape.
+     */
+    private val inboundConnections: MutableSet<PeerChannel> = Collections.newSetFromMap(ConcurrentHashMap())
 
     /**
      * For each [holders] entry this device doesn't already have an open
@@ -393,6 +427,66 @@ class InternetPeerConnectionManager(
 
         // Last resort only, after the direct dial above has already failed.
         fallBackToRelay(contact.id, knownRelayId = relayId, knownRelayAddress = relayAddress)
+    }
+
+    /**
+     * Adopts [channel] -- an already-accepted, already-connected inbound TCP
+     * connection, handed here by `com.hop.app.dht.DhtNodeManager`'s
+     * [com.hop.p2p.PeerListener] via its `onInboundInternetConnection`
+     * callback -- into this device's live fanout/broadcast machinery. Unlike
+     * [connectToDiscoveredHolders]/[connectToIntroducedPeer], there is no
+     * dial here: the connection already exists by the time this is called.
+     *
+     * Three things happen, mirroring exactly what a freshly-dialed outbound
+     * connection already gets (see [connectToDiscoveredHolders]'s own doc for
+     * the outbound side of this same shape, and [fallBackToRelay]'s own tail
+     * -- the closest existing precedent for "adopt an already-connected
+     * [PeerChannel], no dial involved," reused here unchanged):
+     * 1. [channel] is added to [inboundConnections].
+     * 2. The connect-time backlog is offered, on its own dedicated
+     *    `"hop-internet-send"` thread, via the exact same [sendBacklog] every
+     *    other newly-established connection already uses.
+     * 3. [InternetPeerConnection.receiveLoop] starts on its own dedicated
+     *    `"hop-internet-receive"` thread, wired to [fanOutLiveRelay] for live
+     *    relay-flood fanout and to remove [channel] from [inboundConnections]
+     *    the moment its receive loop ends (peer closes, or any I/O error).
+     *
+     * **Deliberately does NOT attempt to key this connection by [NodeId] --
+     * see [inboundConnections]'s own doc.** A freshly-accepted inbound socket
+     * carries no [Contact]/[NodeId] at accept time; the only thing that could
+     * later identify the peer on the other end is
+     * [DispatchResult.PeerIdentified] (a **messaging-layer** peer id, from
+     * `PreKeyBundleEnvelope`/`MessageCiphertextEnvelope.senderPeerId` -- a
+     * completely different identity space from the DHT [NodeId] this
+     * device's other connection registry is keyed by). Mapping one to the
+     * other is a real, already-flagged, unsolved problem (see this class's
+     * own doc's "Explicitly out of scope" section) -- not attempted here.
+     *
+     * **Also NOT attempted here: deduping against a later outbound dial to
+     * the same logical peer.** If this device later discovers (via DHT browse
+     * or introduction) the same peer that's already connected inbound, it
+     * will dial out to it too -- [connections] and [inboundConnections] have
+     * no shared key to dedupe against, so the two connections simply coexist,
+     * each independently receiving backlog/live-relay traffic. A real,
+     * pre-existing-shaped limitation (this exact "two connections, one
+     * peer" gap already existed in theory before inbound connections were
+     * reachable at all -- see [Contact.id]-based dedup's own scope in
+     * [connectToDiscoveredHolders]), now newly reachable in practice. Neither
+     * problem is solved in this slice.
+     */
+    fun acceptInbound(channel: PeerChannel) {
+        inboundConnections.add(channel)
+        Thread({ sendBacklog(channel) }, "hop-internet-send").start()
+        Thread({
+            internetPeerConnection.receiveLoop(
+                channel,
+                onClosed = {
+                    inboundConnections.remove(channel)
+                    onLog("Inbound internet connection closed; removed from the connection registry")
+                },
+                onLiveRelay = ::fanOutLiveRelay,
+            )
+        }, "hop-internet-receive").start()
     }
 
     /**
@@ -645,32 +739,53 @@ class InternetPeerConnectionManager(
     }
 
     /**
-     * Shared "iterate every open [connections] entry, send [bytes], drop the
-     * entry on a failed send" tail every broadcast/live-relay method in this
-     * class ([fanOutLiveRelay], [broadcastPost], [broadcastDontRelayFlag],
-     * [broadcastTierKeyRequest]) otherwise duplicated verbatim. [excludeChannel],
-     * when non-null, skips that one connection by reference equality (`===`)
-     * -- only [fanOutLiveRelay] ever passes this, to avoid echoing content
-     * back to the connection it just arrived on; the other three callers
-     * broadcast this device's own authored content/flag/request to *every*
-     * open connection, so they never exclude one.
+     * Shared "iterate every open connection -- both [connections] (outbound,
+     * [NodeId]-keyed) and [inboundConnections] (inbound, unkeyed) -- send
+     * [bytes], drop the entry on a failed send" tail every broadcast/live-relay
+     * method in this class ([fanOutLiveRelay], [broadcastPost],
+     * [broadcastDontRelayFlag], [broadcastTierKeyRequest]) otherwise
+     * duplicated verbatim. [excludeChannel], when non-null, skips that one
+     * connection by reference equality (`===`) -- only [fanOutLiveRelay] ever
+     * passes this, to avoid echoing content back to the connection it just
+     * arrived on; the other three callers broadcast this device's own
+     * authored content/flag/request to *every* open connection, so they never
+     * exclude one.
      *
      * [failureDescription] is a short, call-site-specific phrase (e.g.
      * `"Broadcast post send"`) that [onLog] gets folded into, preserving each
      * call site's own previous log-message text exactly: `"$failureDescription
      * failed to a connected internet peer; dropping that connection: ${e.message}"`.
+     *
+     * **Eviction differs per registry** -- `connections.remove(nodeId, channel)`
+     * vs. `inboundConnections.remove(channel)` -- so [BroadcastTarget] pairs
+     * each channel with its own correct evict callback, built once up front
+     * as a single list, then iterated once with one shared send/catch/evict
+     * block, rather than duplicating that block once per registry (or three
+     * times across this file, which is what this shared helper already
+     * existed to avoid before inbound connections existed).
      */
     private fun broadcastToConnections(bytes: ByteArray, excludeChannel: PeerChannel? = null, failureDescription: String) {
-        for ((nodeId, channel) in connections) {
-            if (channel === excludeChannel) continue
+        val targets = buildList {
+            for ((nodeId, channel) in connections) {
+                add(BroadcastTarget(channel) { connections.remove(nodeId, channel) })
+            }
+            for (channel in inboundConnections) {
+                add(BroadcastTarget(channel) { inboundConnections.remove(channel) })
+            }
+        }
+        for (target in targets) {
+            if (target.channel === excludeChannel) continue
             try {
-                channel.sendRawBytes(bytes)
+                target.channel.sendRawBytes(bytes)
             } catch (e: Exception) {
                 onLog("$failureDescription failed to a connected internet peer; dropping that connection: ${e.message}")
-                connections.remove(nodeId, channel)
+                target.evict()
             }
         }
     }
+
+    /** One broadcast/live-relay fanout target paired with the correct eviction callback for whichever registry ([connections] or [inboundConnections]) it came from -- see [broadcastToConnections]'s own doc. */
+    private class BroadcastTarget(val channel: PeerChannel, val evict: () -> Unit)
 
     /**
      * Broadcasts [encoded] (a caller-built [com.hop.protocol.Frame]'s already-

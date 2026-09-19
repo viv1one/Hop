@@ -11,11 +11,15 @@ import com.hop.dht.IntroduceResult
 import com.hop.dht.NodeId
 import com.hop.dht.PeerAddress
 import com.hop.dht.RoutingTable
+import com.hop.p2p.PeerChannel
+import com.hop.p2p.PeerListener
 import com.hop.topics.TopicSubscription
+import java.io.IOException
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.util.Collections
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +60,24 @@ import kotlinx.coroutines.launch
  *
  * **Address/NAT: no external-address discovery.** See [localBindAddress]'s
  * own doc.
+ *
+ * **Inbound internet-mode TCP (the [PeerListener] wiring):** this class also
+ * owns the one [PeerListener] this device runs, bound to **the exact same
+ * port number** [socket] (the UDP DHT socket) got from `DatagramSocket(0)` --
+ * see [start]'s own doc for why that's not a coincidence, and why it needs no
+ * change to [Contact]/`dht/`'s wire format at all. TCP and UDP are
+ * independent port namespaces on the same host; sharing the port number is
+ * purely a convenience so this device's one advertised [PeerAddress] (already
+ * used for DHT FIND_NODE/introduction/[RelayDirectory] purposes) is *also*
+ * where a peer dialing in for content
+ * ([com.hop.transport.InternetPeerConnection.connectTo]) will actually find
+ * something listening -- before [PeerListener] existed, nothing did, making
+ * every such dial silently unreachable. See [start]'s own doc for exactly
+ * where this bind happens and how a bind failure is handled (never fatal to
+ * DHT participation), and
+ * [com.hop.transport.InternetPeerConnectionManager]'s own `acceptInbound` doc
+ * for what happens to an accepted connection on the other side of
+ * [onInboundInternetConnection].
  *
  * **[registerWithProcessLifecycle]:** `true` at every real construction site
  * (see [com.hop.app.AppContainer]). `false` is a test-only escape hatch --
@@ -110,6 +132,22 @@ class DhtNodeManager(
      * [com.hop.transport.InternetPeerConnectionManager] to hand it.
      */
     private val connectToIntroducedPeer: suspend (contact: Contact, relayId: NodeId?, relayAddress: PeerAddress?) -> Unit = { _, _, _ -> },
+    /**
+     * Called, synchronously on [PeerListener]'s own `hop-peer-listener-accept`
+     * thread, with the [PeerChannel] for every inbound internet-mode TCP
+     * connection this device accepts (see [PeerListener]'s own doc for the
+     * accept-loop/callback contract this class relies on unchanged). In
+     * production (see [com.hop.app.AppContainer])
+     * this is `InternetPeerConnectionManager::acceptInbound` -- see that
+     * method's own doc for what "handling" an inbound connection actually
+     * means (connect-time backlog offer, receive-loop start, live-relay
+     * fanout participation), none of which this class knows or needs to know
+     * anything about. Defaults to a no-op for every test that has no
+     * `InternetPeerConnectionManager` to hand it -- an accepted inbound
+     * connection is then simply wrapped in a [PeerChannel] and otherwise
+     * ignored, matching [PeerListener]'s own "caller's job" posture.
+     */
+    private val onInboundInternetConnection: (channel: PeerChannel) -> Unit = {},
     registerWithProcessLifecycle: Boolean = true,
 ) : DefaultLifecycleObserver {
 
@@ -119,6 +157,15 @@ class DhtNodeManager(
     @Volatile private var topicSubscription: TopicSubscription? = null
     @Volatile private var nodeScope: CoroutineScope? = null
     @Volatile private var starting = false
+
+    /**
+     * This device's inbound internet-mode TCP listener, once [start] has
+     * (successfully) bound it -- `null` before then, after [stop], or
+     * permanently for the lifetime of one session if the TCP bind itself
+     * failed (see [start]'s own doc for exactly how that failure is handled:
+     * logged, never fatal to DHT participation or outbound dialing).
+     */
+    @Volatile private var peerListener: PeerListener? = null
 
     /**
      * This device's own currently-bound [PeerAddress], once [start] has
@@ -182,6 +229,20 @@ class DhtNodeManager(
      * this device's routing table already reflecting whatever bootstrapJoin
      * managed to learn (or definitively didn't), rather than racing an
      * in-flight bootstrap attempt.
+     *
+     * **Also binds this device's inbound internet-mode TCP listener
+     * ([peerListener]), on the exact same port number [boundSocket] (the UDP
+     * DHT socket) got from `DatagramSocket(0)`.** TCP and UDP are independent
+     * port namespaces on the same host, so this is a free, deliberate choice,
+     * not a conflict -- it means the single [PeerAddress] this device already
+     * advertises everywhere ([boundAddress], used for DHT FIND_NODE
+     * responses, address reflection, introductions, and
+     * [com.hop.dht.RelayDirectory]) is *also* the address a peer dialing in
+     * via [com.hop.transport.InternetPeerConnection.connectTo] will actually
+     * find something listening on -- **no change to [Contact] or any `dht/`
+     * wire format was needed for this.** See [startPeerListener]'s own doc
+     * for exactly how a bind failure is handled (never fatal to this
+     * function or to DHT participation generally).
      */
     fun start() {
         if (node != null || starting) return
@@ -221,11 +282,18 @@ class DhtNodeManager(
                 )
                 dhtTransport.start()
 
+                // Order relative to DhtNode construction above doesn't matter
+                // (the two are independent) -- this just needs boundSocket's
+                // own port number, already known by this point. See
+                // startPeerListener's own doc for the bind-failure posture.
+                val listener = startPeerListener(boundSocket.localPort)
+
                 socket = boundSocket
                 transport = dhtTransport
                 node = dhtNode
                 ownAddress = boundAddress
                 ownNodeId = ownId
+                peerListener = listener
 
                 maybeBootstrap(dhtNode)
 
@@ -235,6 +303,44 @@ class DhtNodeManager(
             } finally {
                 starting = false
             }
+        }
+    }
+
+    /**
+     * Binds a wildcard [ServerSocket] to [port] (the exact port number the
+     * UDP DHT socket already got from `DatagramSocket(0)` -- see [start]'s
+     * own doc for why sharing the number, not the socket, is what's shared),
+     * wraps it in a [PeerListener] wired to [onInboundInternetConnection],
+     * starts it, and returns it -- or returns `null`, logged, if the bind
+     * itself fails.
+     *
+     * **Deliberately wildcard-bound** (`ServerSocket(port)`, no explicit bind
+     * address), matching [DatagramSocket(0)]'s own wildcard-bind posture --
+     * [localBindAddress] is only ever used to build the *advertised*
+     * [PeerAddress], never to restrict what this device actually binds to
+     * (see that function's own doc).
+     *
+     * **A bind failure here is caught, logged, and never rethrown or allowed
+     * to fail [start].** TCP and UDP are independent port-allocation
+     * namespaces, so this is a genuinely different failure mode from the UDP
+     * bind succeeding -- rare in practice (something else would have to hold
+     * that exact port number for TCP specifically), but possible, and this
+     * function's contract is that it must never be the reason a DHT node
+     * fails to come up. A device that hits this failure simply cannot accept
+     * inbound internet-mode connections for this session -- DHT participation
+     * (routing table, publish/browse) and outbound dialing
+     * ([com.hop.transport.InternetPeerConnection.connectTo]) are both
+     * completely unaffected, since neither depends on this listener existing.
+     */
+    private fun startPeerListener(port: Int): PeerListener? {
+        return try {
+            val serverSocket = ServerSocket(port)
+            val listener = PeerListener(serverSocket, onConnected = onInboundInternetConnection)
+            listener.start()
+            listener
+        } catch (e: IOException) {
+            Log.e(TAG, "Failed to bind inbound internet-mode TCP listener on port $port -- this device will not be able to accept inbound internet connections this session (DHT participation and outbound dialing are unaffected)", e)
+            null
         }
     }
 
@@ -351,14 +457,16 @@ class DhtNodeManager(
     }
 
     /**
-     * Stops the receive thread, closes the socket, and cancels this node's
-     * coroutine scope. Idempotent. Matches
+     * Stops the receive thread, closes the socket, stops [peerListener] (if
+     * this session's TCP bind actually succeeded -- a no-op via `?.` if it
+     * didn't), and cancels this node's coroutine scope. Idempotent. Matches
      * [com.hop.transport.TransportManager.stop]'s posture: no attempt to
      * gracefully deregister from the network first -- no such RPC exists in
      * this protocol; a Kademlia node simply stops answering.
      */
     fun stop() {
         transport?.stop()
+        peerListener?.stop()
         nodeScope?.cancel()
         socket = null
         transport = null
@@ -368,6 +476,7 @@ class DhtNodeManager(
         ownAddress = null
         ownNodeId = null
         rendezvousContact = null
+        peerListener = null
     }
 
     companion object {

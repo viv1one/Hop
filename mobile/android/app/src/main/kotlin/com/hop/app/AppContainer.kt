@@ -322,6 +322,15 @@ class AppContainer(applicationContext: Context) {
         connectToIntroducedPeer = { contact, relayId, relayAddress ->
             internetPeerConnectionManager.connectToIntroducedPeer(contact, relayId, relayAddress)
         },
+        // The PeerListener wiring: DhtNodeManager owns and binds this
+        // device's one inbound internet-mode TCP listener (same port number
+        // as its UDP DHT socket -- see that class's own doc for why), and
+        // hands every accepted connection straight to
+        // InternetPeerConnectionManager.acceptInbound -- no forward
+        // reference needed here, unlike connectToIntroducedPeer/
+        // introduceViaRendezvous above, since internetPeerConnectionManager
+        // is already fully constructed by this point.
+        onInboundInternetConnection = internetPeerConnectionManager::acceptInbound,
     )
 
     val transportManager: TransportManager = TransportManager(

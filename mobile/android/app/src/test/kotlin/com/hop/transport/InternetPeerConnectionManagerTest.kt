@@ -241,6 +241,175 @@ class InternetPeerConnectionManagerTest {
         lastSeenAtMs = 0L,
     )
 
+    /**
+     * A real, already-connected loopback [PeerChannel] pair -- `.first` is
+     * what a real [com.hop.p2p.PeerListener] would have accepted (the side
+     * [InternetPeerConnectionManager.acceptInbound] is handed in production),
+     * `.second` is the "remote peer" side this test drives directly, playing
+     * the role of whatever device dialed in. `soTimeoutMs` is applied to both
+     * underlying sockets before wrapping, so a test's [PeerChannel.receiveEnvelope]
+     * call never hangs indefinitely if the behavior under test is broken.
+     */
+    private fun loopbackChannelPair(soTimeoutMs: Int = 3_000): Pair<PeerChannel, PeerChannel> {
+        val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        val clientRawSocket = Socket("127.0.0.1", serverSocket.localPort)
+        val serverRawSocket = serverSocket.accept()
+        serverSocket.close()
+        serverRawSocket.soTimeout = soTimeoutMs
+        clientRawSocket.soTimeout = soTimeoutMs
+        return PeerChannel(serverRawSocket) to PeerChannel(clientRawSocket)
+    }
+
+    // -- acceptInbound: the PeerListener wiring's other half -- a connection
+    // this device ACCEPTED (not dialed) must participate in the exact same
+    // connect-time backlog + live-relay fanout machinery every outbound
+    // connection already does, and must be evicted from inboundConnections
+    // (not connections, which is NodeId-keyed and never applies here) once
+    // its own receive loop ends. --
+
+    @Test
+    fun `acceptInbound delivers the connect-time backlog to a newly accepted inbound connection`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val dontRelayFlagDao = FakeDontRelayFlagDao()
+        val pendingMessageDao = FakePendingMessageDao()
+        val bundleQueueDao = FakeBundleQueueDao()
+        relayQueueDao.insert(freshRelayQueueRow("inbound-post"))
+        dontRelayFlagDao.insert(freshDontRelayFlagRow("inbound-flag"))
+        pendingMessageDao.insert(freshPendingMessageRow("inbound-message"))
+        bundleQueueDao.insertOrReplace(freshBundleQueueRow("inbound-bundle"))
+
+        val manager = newManager(
+            relayQueueDao = relayQueueDao,
+            dontRelayFlagDao = dontRelayFlagDao,
+            pendingMessageDao = pendingMessageDao,
+            bundleQueueDao = bundleQueueDao,
+        )
+        val (acceptedSide, remoteSide) = loopbackChannelPair()
+
+        manager.acceptInbound(acceptedSide)
+
+        val receivedTypes = mutableSetOf<WirePayloadType>()
+        repeat(4) { receivedTypes.add(remoteSide.receiveEnvelope().type) }
+
+        assertEquals(
+            setOf(
+                WirePayloadType.POST_FRAME,
+                WirePayloadType.DONT_RELAY_FLAG,
+                WirePayloadType.MESSAGE_CIPHERTEXT,
+                WirePayloadType.PREKEY_BUNDLE,
+            ),
+            receivedTypes,
+            "an accepted inbound connection must receive the exact same four-repository backlog an outbound connection already does",
+        )
+    }
+
+    @Test
+    fun `an inbound connection receives a live-relay push relayed in from a different, outbound connection`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val manager = newManager(relayQueueDao = relayQueueDao)
+
+        val outboundListener = LoopbackListener()
+        val outboundContact = loopbackContact(nodeId(0), outboundListener.port)
+        manager.connectToDiscoveredHolders(listOf(outboundContact))
+        val outboundServerSocket = outboundListener.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(outboundServerSocket != null, "the outbound sibling must have been dialed")
+        val outboundServerChannel = PeerChannel(outboundServerSocket!!)
+
+        val (acceptedSide, remoteSide) = loopbackChannelPair()
+        manager.acceptInbound(acceptedSide)
+
+        val frameBytes = encodedFrameBytes("inbound-receives-outbound-live-relay")
+        // This test plays the role of the remote peer on the OUTBOUND
+        // connection, sending genuinely new content.
+        outboundServerChannel.sendEnvelope(WireEnvelope(WirePayloadType.POST_FRAME, frameBytes))
+
+        val relayed = remoteSide.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, relayed.type)
+        val relayedFrame = Frame.decode(relayed.payload)
+        assertEquals(1, relayedFrame.hopCount, "a live-relayed frame must be re-encoded at hopCount + 1")
+    }
+
+    @Test
+    fun `content received on an inbound connection propagates live to both an outbound sibling and another inbound sibling, but not back to itself`() = runBlocking {
+        val relayQueueDao = FakeRelayQueueDao()
+        val manager = newManager(relayQueueDao = relayQueueDao)
+
+        val outboundListener = LoopbackListener()
+        val outboundContact = loopbackContact(nodeId(1), outboundListener.port)
+        manager.connectToDiscoveredHolders(listOf(outboundContact))
+        val outboundServerSocket = outboundListener.accepted.poll(2, TimeUnit.SECONDS)
+        assertTrue(outboundServerSocket != null, "the outbound sibling must have been dialed")
+        outboundServerSocket!!.soTimeout = 3_000
+        val outboundServerChannel = PeerChannel(outboundServerSocket)
+
+        val (acceptedSideA, remoteSideA) = loopbackChannelPair()
+        manager.acceptInbound(acceptedSideA)
+        val (acceptedSideB, remoteSideB) = loopbackChannelPair()
+        manager.acceptInbound(acceptedSideB)
+
+        val frameBytes = encodedFrameBytes("inbound-fanout-to-both-registries")
+        // remoteSideA plays the role of the remote peer on inbound connection
+        // A, sending genuinely new content -- this is what "content arrives
+        // on an inbound connection" means from the manager's own point of view.
+        remoteSideA.sendEnvelope(WireEnvelope(WirePayloadType.POST_FRAME, frameBytes))
+
+        val toOutboundSibling = outboundServerChannel.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, toOutboundSibling.type, "an outbound sibling must receive content that arrived on an inbound connection")
+
+        val toInboundSibling = remoteSideB.receiveEnvelope()
+        assertEquals(WirePayloadType.POST_FRAME, toInboundSibling.type, "another inbound sibling must also receive it")
+
+        // Must never be echoed back to the inbound connection it arrived on --
+        // remoteSideA's underlying socket already has a bounded soTimeout
+        // (set by loopbackChannelPair), so a read that times out (rather
+        // than returning bytes) proves nothing was sent back.
+        val echoedBack = try {
+            remoteSideA.receiveEnvelope()
+            true
+        } catch (e: java.net.SocketTimeoutException) {
+            false
+        }
+        assertTrue(!echoedBack, "content must never be echoed back to the inbound connection it arrived on")
+    }
+
+    @Test
+    fun `an inbound connection's peer closing drives its receive loop to end and evicts it from the connection registry`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val manager = newManager(onLog = { message -> synchronized(logs) { logs.add(message) } })
+        val (acceptedSide, remoteSide) = loopbackChannelPair()
+
+        manager.acceptInbound(acceptedSide)
+
+        // Close the "remote" side -- this is what drives the manager's own
+        // receive loop for this inbound connection to EOF and its onClosed
+        // callback (which removes it from inboundConnections) to fire.
+        remoteSide.close()
+
+        var sawClosedLog = false
+        repeat(30) {
+            if (synchronized(logs) { logs.any { it.contains("Inbound internet connection closed", ignoreCase = true) } }) {
+                sawClosedLog = true
+                return@repeat
+            }
+            Thread.sleep(100)
+        }
+        assertTrue(sawClosedLog, "a closed inbound connection must be logged and removed from the registry: $logs")
+
+        // Once removed, a later broadcast must never attempt (and therefore
+        // never fail/log an eviction for) this already-gone connection --
+        // this class's registry is deliberately private (see this test
+        // class's own doc), so this is the same "observe indirectly" posture
+        // every other eviction test in this file already uses.
+        val logsBefore = synchronized(logs) { logs.size }
+        manager.broadcastPost(encodedFrameBytes("post-after-inbound-already-closed"))
+        Thread.sleep(200)
+        val newLogs = synchronized(logs) { logs.drop(logsBefore) }
+        assertTrue(
+            newLogs.none { it.contains("Broadcast post send failed", ignoreCase = true) },
+            "an already-removed inbound connection must not still be targeted (and fail) on a later broadcast: $newLogs",
+        )
+    }
+
     @Test
     fun `connects to each real loopback-reachable contact up to the cap and registers them`() = runBlocking {
         val listeners = List(3) { LoopbackListener() }
