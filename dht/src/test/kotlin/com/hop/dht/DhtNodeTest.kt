@@ -567,7 +567,7 @@ class DhtNodeTest {
             targetTransport,
             scope,
             ownAddressFor(targetSocket),
-            onIntroductionReceived = { fromId, _ -> receivedFromId = fromId },
+            onIntroductionReceived = { fromId, _, _, _ -> receivedFromId = fromId },
         )
 
         val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
@@ -587,7 +587,7 @@ class DhtNodeTest {
             requireNotNull(result) { "a real DhtNode must answer found=true for a target it has genuinely observed via PING" }
             assertEquals(
                 PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort),
-                result,
+                result.targetAddress,
                 "the returned address must be the target's genuinely observed address from R's own RoutingTable",
             )
 
@@ -679,7 +679,7 @@ class DhtNodeTest {
             targetTransport,
             scope,
             ownAddressFor(targetSocket),
-            onIntroductionReceived = { fromId, claimedAddress ->
+            onIntroductionReceived = { fromId, claimedAddress, _, _ ->
                 receivedFromId = fromId
                 receivedAddress = claimedAddress
             },
@@ -853,6 +853,75 @@ class DhtNodeTest {
             hostTransport.stop()
             relayTransport.stop()
             querierTransport.stop()
+        }
+    }
+
+    /**
+     * The actual property that matters for Phase 4's relay-fallback-
+     * coordination fix, exercised through a real [DhtNode] (not just the
+     * bare [DhtUdpTransport] it sits on): when a relay has announced itself
+     * to R's [RelayDirectory], both A's INTRODUCE_RESPONSE and the target's
+     * INTRODUCTION carry the IDENTICAL relay id/address -- asserted via
+     * direct equality between what each side received, not merely that each
+     * independently got some relay.
+     */
+    @Test
+    fun `INTRODUCE_REQUEST through a real DhtNode hands A and the target the IDENTICAL relay suggestion when one was announced`() = runBlocking {
+        val rId = chainNodeId(101)
+        val aId = chainNodeId(102)
+        val targetId = chainNodeId(103)
+        val relayId = chainNodeId(104)
+
+        val rSocket = loopbackSocket()
+        val aSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+        val relaySocket = loopbackSocket()
+        val scope = CoroutineScope(Job() + Dispatchers.Default)
+
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        DhtNode(RoutingTable(rId), rTransport, scope, ownAddressFor(rSocket))
+
+        var receivedRelayId: NodeId? = null
+        var receivedRelayAddress: PeerAddress? = null
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        DhtNode(
+            RoutingTable(targetId),
+            targetTransport,
+            scope,
+            ownAddressFor(targetSocket),
+            onIntroductionReceived = { _, _, relayIdReceived, relayAddressReceived ->
+                receivedRelayId = relayIdReceived
+                receivedRelayAddress = relayAddressReceived
+            },
+        )
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        DhtNode(RoutingTable(aId), aTransport, scope, ownAddressFor(aSocket))
+
+        val relayTransport = DhtUdpTransport(relaySocket, relayId)
+        val selfReportedBridgeAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        val transports = listOf(rTransport, targetTransport, aTransport, relayTransport)
+        transports.forEach { it.start() }
+        try {
+            assertTrue(rTransport.ping(socketContact(targetId, targetSocket)))
+            assertTrue(relayTransport.announceRelay(socketContact(rId, rSocket), selfReportedBridgeAddress))
+
+            val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54322)
+            val result = aTransport.introduce(socketContact(rId, rSocket), targetId, ownReflectedAddress)
+            requireNotNull(result) { "a real DhtNode must answer found=true for a target it has genuinely observed via PING" }
+
+            val deadlineMs = System.currentTimeMillis() + 2000
+            while (receivedRelayId == null && System.currentTimeMillis() < deadlineMs) {
+                Thread.sleep(20)
+            }
+
+            assertEquals(relayId, result.relayId, "A's INTRODUCE_RESPONSE must carry the announced relay")
+            assertEquals(selfReportedBridgeAddress, result.relayAddress)
+            assertEquals(result.relayId, receivedRelayId, "A and the target must receive the IDENTICAL relayId")
+            assertEquals(result.relayAddress, receivedRelayAddress, "A and the target must receive the IDENTICAL relayAddress")
+        } finally {
+            transports.forEach { it.stop() }
         }
     }
 

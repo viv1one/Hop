@@ -3,10 +3,13 @@ package com.hop.transport
 import com.hop.crypto.DecayKeyStore
 import com.hop.data.DontRelayFlagEntity
 import com.hop.dht.Contact
+import com.hop.dht.IntroduceResult
 import com.hop.dht.NodeId
+import com.hop.dht.PeerAddress
 import com.hop.dht.PeerAddressDecodeException
 import com.hop.p2p.PeerChannel
 import com.hop.p2p.PeerDialException
+import com.hop.p2p.PeerDialer
 import com.hop.protocol.TierKeyRequestEnvelope
 import com.hop.protocol.WireEnvelope
 import com.hop.protocol.WirePayloadType
@@ -15,6 +18,9 @@ import com.hop.repository.DontRelayRepository
 import com.hop.repository.PendingMessageRepository
 import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
+import java.io.File
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -22,8 +28,6 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Closes the gap [FeedViewModel.discoveredRemoteHolders]'s own doc names
@@ -128,10 +132,24 @@ import java.util.concurrent.ConcurrentHashMap
  * only -- this class has no peer-id-to-connection lookup, only the
  * [NodeId]-keyed [connections] registry, and building a unicast path is real
  * scope beyond unifying the three *broadcast* paths. Retry/backoff for a
- * failed dial, NAT hole-punching, volunteer relay-node fallback, and any UI
- * surfacing of connection count ([FeedViewModel.discoveredRemoteHolders] was
- * deliberately left unrendered for its own product/UX reason -- this class
- * doesn't invent a new rendering for connection count either).
+ * failed dial, and any UI surfacing of connection count
+ * ([FeedViewModel.discoveredRemoteHolders] was deliberately left unrendered
+ * for its own product/UX reason -- this class doesn't invent a new rendering
+ * for connection count either).
+ *
+ * **Volunteer relay-node fallback (Phase 4, last resort only):** [connectToDiscoveredHolders]
+ * and [connectToIntroducedPeer] each fall back to [fallBackToRelay] the
+ * moment their own direct dial fails -- never a first attempt. See
+ * [fallBackToRelay]'s own doc for the shared tail both entry points funnel
+ * into, and [bridgeViaRelay]'s own doc for the actual relay-dial/handshake
+ * mechanism (dials `tools/relay-node/`'s `RelayNode` via the exact same
+ * [PeerDialer] this class already uses for direct dials, writes that class's
+ * own fixed 64-byte handshake, unmodified). [getOwnNodeId]/
+ * [introduceViaRendezvous] are this class's two new capabilities, both
+ * supplied from `com.hop.app.AppContainer`/`com.hop.app.dht.DhtNodeManager`
+ * (the module that actually owns the DHT transport and this device's own
+ * [NodeId] -- see each parameter's own doc for why nothing DHT-specific is
+ * reimplemented here).
  */
 class InternetPeerConnectionManager(
     postRepository: PostRepository,
@@ -154,6 +172,48 @@ class InternetPeerConnectionManager(
     onMessageCiphertextReceived: suspend (senderPeerId: String, ciphertext: ByteArray) -> Unit = { _, _ -> },
     postsDir: File,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    /**
+     * This device's own [NodeId], if the DHT node has finished starting --
+     * `null` otherwise (or on a test that has no DHT participation at all).
+     * Needed for [bridgeViaRelay]'s `[32B ownId][32B bridgeToId]` handshake
+     * -- `tools/relay-node/`'s `RelayNode` bridges by matching two mutual
+     * `(ownId, bridgeToId)` declarations, so this device must declare its own
+     * real id, not a placeholder. In production, `com.hop.app.AppContainer`
+     * supplies `com.hop.app.dht.DhtNodeManager::ownNodeId` -- the exact same
+     * per-DHT-node id [connectToDiscoveredHolders]'s/[connectToIntroducedPeer]'s
+     * own [Contact]s are keyed against elsewhere in this class, never a
+     * second identity concept.
+     */
+    private val getOwnNodeId: () -> NodeId? = { null },
+    /**
+     * Phase 4's rendezvous-relayed-introduction primitive
+     * ([com.hop.dht.DhtUdpTransport.introduce]), reached one hop removed
+     * from this class -- [connectToDiscoveredHolders]'s own relay-fallback
+     * trigger needs SOME rendezvous/DHT contact to introduce through, and the
+     * only one this app already knows about is the bootstrap node
+     * `com.hop.app.dht.DhtNodeManager.maybeBootstrap` joins via (see that
+     * property's own `rendezvousContact` doc for why reusing it, rather than
+     * inventing a second "known rendezvous contacts" concept, is this app's
+     * answer to that question today). In production,
+     * `com.hop.app.AppContainer` supplies
+     * `com.hop.app.dht.DhtNodeManager::introduceViaRendezvous`. Defaults to
+     * `{ null }` -- always "no rendezvous contact available" -- for every
+     * test that has no DHT node to introduce through, matching this class's
+     * other injected-capability defaults.
+     */
+    private val introduceViaRendezvous: suspend (targetId: NodeId) -> IntroduceResult? = { null },
+    /**
+     * Bounds [bridgeViaRelay]'s own relay TCP connect + 64-byte handshake
+     * write -- see that function's own doc for exactly what this does and
+     * does NOT bound (there is no bridge-formed acknowledgement on the wire
+     * to wait for; this is not a "wait for a live match" timeout). Mirrors
+     * `tools/relay-node/`'s own [com.hop.relaynode.RelayNode.DEFAULT_WAIT_TIMEOUT_MS]
+     * order of magnitude by default, per this slice's own guidance to mirror
+     * that constant (or choose a tighter client-side budget) -- unmeasured
+     * placeholder, same posture as every other timeout constant in this
+     * codebase.
+     */
+    private val relayBridgeTimeoutMs: Long = DEFAULT_RELAY_BRIDGE_TIMEOUT_MS,
     private val onLog: (String) -> Unit = {},
 ) {
     /** The single real content-transfer connection driver this manager dials through -- see class doc; not duplicated, threaded through once. */
@@ -232,6 +292,15 @@ class InternetPeerConnectionManager(
      * failure) has settled, via [awaitAll]. Registration/cleanup and
      * per-contact failure handling are unchanged, just running concurrently
      * instead of one after another.
+     *
+     * **Phase 4's relay-fallback trigger, the more common real-world one:**
+     * on a direct-dial failure for a given [contact] ([PeerDialException] or
+     * [PeerAddressDecodeException]), this is the entry point that calls
+     * [fallBackToRelay] with no relay suggestion already in hand -- unlike
+     * [connectToIntroducedPeer], which may already have one from the
+     * INTRODUCTION that triggered it, a browse-discovered [Contact] never
+     * came with a relay suggestion attached, so [fallBackToRelay] must ask
+     * [introduceViaRendezvous] for one first. See that function's own doc.
      */
     suspend fun connectToDiscoveredHolders(holders: List<Contact>) = withContext(ioDispatcher) {
         val candidates = holders.filterNot { connections.containsKey(it.id) }
@@ -246,8 +315,8 @@ class InternetPeerConnectionManager(
         coroutineScope {
             toDial.map { contact ->
                 async {
-                    try {
-                        val channel = internetPeerConnection.connectTo(
+                    val directChannel = try {
+                        internetPeerConnection.connectTo(
                             contact,
                             onConnected = { connectedChannel -> connections[contact.id] = connectedChannel },
                             onClosed = {
@@ -256,14 +325,236 @@ class InternetPeerConnectionManager(
                             },
                             onLiveRelay = ::fanOutLiveRelay,
                         )
-                        Thread({ sendBacklog(channel) }, "hop-internet-send").start()
                     } catch (e: PeerDialException) {
                         onLog("Failed to dial a discovered internet peer: ${e.message}")
+                        null
                     } catch (e: PeerAddressDecodeException) {
                         onLog("Failed to decode a discovered internet peer's address: ${e.message}")
+                        null
+                    }
+
+                    if (directChannel != null) {
+                        Thread({ sendBacklog(directChannel) }, "hop-internet-send").start()
+                    } else {
+                        // Last resort only, after the direct dial above has
+                        // already failed -- see fallBackToRelay's own doc.
+                        fallBackToRelay(contact.id, knownRelayId = null, knownRelayAddress = null)
                     }
                 }
             }.awaitAll()
+        }
+    }
+
+    /**
+     * Phase 4's relay-fallback trigger for a device that just RECEIVED a
+     * rendezvous-relayed introduction (`com.hop.dht.IntroductionMessage`) --
+     * wired from `com.hop.app.dht.DhtNodeManager`'s own `onIntroductionReceived`
+     * forwarding. Attempts an ordinary direct dial to [contact] (the
+     * introduced peer's self-reported claimed address) first, exactly like
+     * [connectToDiscoveredHolders] does for a browse-discovered [Contact];
+     * only on failure does it fall back to [fallBackToRelay] -- and unlike
+     * [connectToDiscoveredHolders], this entry point may already have a
+     * relay suggestion in hand ([relayId]/[relayAddress], carried on the very
+     * same INTRODUCTION that triggered this call -- see
+     * [com.hop.dht.IntroduceResponseMessage]'s own doc for why R hands the
+     * IDENTICAL suggestion to both sides), so [fallBackToRelay] doesn't need
+     * to ask [introduceViaRendezvous] for one a second time.
+     *
+     * Already-connected [contact]s are skipped, same dedup posture as
+     * [connectToDiscoveredHolders] -- an introduction naming a peer this
+     * device already has an open connection to is a no-op, not a second
+     * redundant dial.
+     */
+    suspend fun connectToIntroducedPeer(contact: Contact, relayId: NodeId?, relayAddress: PeerAddress?) = withContext(ioDispatcher) {
+        if (connections.containsKey(contact.id)) return@withContext
+
+        val directChannel = try {
+            internetPeerConnection.connectTo(
+                contact,
+                onConnected = { connectedChannel -> connections[contact.id] = connectedChannel },
+                onClosed = {
+                    connections.remove(contact.id)
+                    onLog("Internet connection closed; removed from the connection registry")
+                },
+                onLiveRelay = ::fanOutLiveRelay,
+            )
+        } catch (e: PeerDialException) {
+            onLog("Direct dial to an introduced peer failed: ${e.message}")
+            null
+        } catch (e: PeerAddressDecodeException) {
+            onLog("Failed to decode an introduced peer's claimed address: ${e.message}")
+            null
+        }
+
+        if (directChannel != null) {
+            Thread({ sendBacklog(directChannel) }, "hop-internet-send").start()
+            return@withContext
+        }
+
+        // Last resort only, after the direct dial above has already failed.
+        fallBackToRelay(contact.id, knownRelayId = relayId, knownRelayAddress = relayAddress)
+    }
+
+    /**
+     * Shared relay-fallback tail for [connectToDiscoveredHolders] and
+     * [connectToIntroducedPeer], both of which only ever call this AFTER
+     * their own direct dial has already failed -- this is a last resort, not
+     * a first attempt, matching every other best-effort connection posture
+     * in this class.
+     *
+     * If [knownRelayId]/[knownRelayAddress] are already both non-null (the
+     * [connectToIntroducedPeer] case -- the introduction that triggered this
+     * call already carried a relay suggestion), that pair is used directly.
+     * Otherwise (the [connectToDiscoveredHolders] case), asks
+     * [introduceViaRendezvous] for one: this both gives [targetId] a chance
+     * to hole-punch back on its own (the ordinary rendezvous-relayed-
+     * introduction mechanism, entirely out-of-band from this call -- nothing
+     * further to do here if that's what ends up working) and, via that same
+     * INTRODUCE_RESPONSE, returns a relay suggestion to fall back to if that
+     * doesn't pan out either.
+     *
+     * Any failure along the way -- no rendezvous contact to introduce
+     * through, no relay known, or [bridgeViaRelay] itself failing/timing
+     * out -- is logged and this function simply returns: no retry loop, no
+     * new persistent state, the caller simply doesn't get this connection
+     * this cycle, matching [fanOutLiveRelay]/[sendBacklog]'s own best-effort
+     * posture.
+     */
+    private suspend fun fallBackToRelay(targetId: NodeId, knownRelayId: NodeId?, knownRelayAddress: PeerAddress?) {
+        val relayId: NodeId
+        val relayAddress: PeerAddress
+        if (knownRelayId != null && knownRelayAddress != null) {
+            relayId = knownRelayId
+            relayAddress = knownRelayAddress
+        } else {
+            val introduced: IntroduceResult? = try {
+                introduceViaRendezvous(targetId)
+            } catch (e: Exception) {
+                onLog("Rendezvous introduce fallback failed: ${e.message}")
+                null
+            }
+            val candidateId = introduced?.relayId
+            val candidateAddress = introduced?.relayAddress
+            if (candidateId == null || candidateAddress == null) {
+                onLog("No relay suggestion available for a peer that failed direct dial; giving up on this connection attempt")
+                return
+            }
+            relayId = candidateId
+            relayAddress = candidateAddress
+        }
+
+        val ownId = getOwnNodeId()
+        if (ownId == null) {
+            onLog("This device's own node id isn't available yet; can't attempt a relay bridge")
+            return
+        }
+
+        // relayId itself isn't part of RelayNode's own handshake (only its
+        // dialable TCP relayAddress and the [ownId, targetId] pair are) --
+        // logged here purely for diagnostics, not used for dialing.
+        onLog("Attempting a last-resort relay bridge via relay $relayId at $relayAddress")
+        val channel = bridgeViaRelay(relayAddress, ownId, targetId)
+        if (channel == null) {
+            onLog("Relay bridge attempt failed or timed out; giving up on this connection attempt")
+            return
+        }
+
+        connections[targetId] = channel
+        Thread({ sendBacklog(channel) }, "hop-internet-send").start()
+        Thread({
+            internetPeerConnection.receiveLoop(
+                channel,
+                onClosed = {
+                    connections.remove(targetId)
+                    onLog("Relay-bridged internet connection closed; removed from the connection registry")
+                },
+                onLiveRelay = ::fanOutLiveRelay,
+            )
+        }, "hop-internet-receive").start()
+    }
+
+    /**
+     * Dials [relayAddress] (a volunteer relay's real TCP bridge address, per
+     * [com.hop.dht.RelayAnnounceRequestMessage]'s own trust-limitation doc --
+     * exactly as trustworthy as whichever relay announced it) via the same
+     * [PeerDialer] this class already uses for every other TCP dial -- no new
+     * dial logic -- then writes `tools/relay-node/`'s `RelayNode` own fixed
+     * [com.hop.relaynode.RelayNode.HANDSHAKE_SIZE_BYTES]-byte handshake:
+     * `[32B ownId][32B bridgeToId]`, with `ownId` = [ownId] (this device's
+     * own [NodeId]) and `bridgeToId` = [targetId] (the peer this device is
+     * trying to reach) -- matching that class's own "Wire shape" doc exactly,
+     * unmodified. Deliberately NOT [com.hop.protocol.WireEnvelope] framing;
+     * `RelayNode` has zero dependency on `protocol/` and never will (see that
+     * class's own doc) -- the handshake bytes are written raw, directly to
+     * the socket's output stream, before this connection is wrapped in a
+     * [PeerChannel] for anything else.
+     *
+     * **What this function does NOT do, and why:** `RelayNode`'s own wire
+     * shape has no bridge-formed acknowledgement -- once a mutual
+     * `(ownId, bridgeToId)`/`(bridgeToId, ownId)` pair is matched, `RelayNode`
+     * just starts blind bidirectional byte-forwarding; it never writes
+     * anything back to either side to confirm the match happened (see that
+     * class's own "Pairing" doc). Inventing a bridge-formed handshake of this
+     * class's own would mean speaking a wire shape `RelayNode` doesn't
+     * implement -- explicitly out of scope for this slice ("dial a relay
+     * using the wire shape RelayNode already implements, unmodified"). So
+     * [relayBridgeTimeoutMs] bounds only the relay's own TCP connect (via
+     * [PeerDialer]) and this handshake write -- mirroring
+     * [com.hop.relaynode.RelayNode.handleConnection]'s own
+     * `socket.soTimeout = waitTimeoutMs` (during its own handshake read)
+     * `/socket.soTimeout = 0` (cleared once bridging -- which can legitimately
+     * run far longer -- begins) pattern on this side of the same handshake. A
+     * successful handshake write is treated as "the bridge attempt was made"
+     * -- the same "a successful TCP connect is treated as connected" posture
+     * [InternetPeerConnection.connectTo] already takes for a direct dial,
+     * where liveness likewise isn't separately proven before the receive loop
+     * starts. An attempt that never actually gets matched by `RelayNode`
+     * (e.g. the target peer never dials in) is NOT silently left open
+     * forever: `RelayNode` itself closes an unmatched connection after its
+     * own [com.hop.relaynode.RelayNode.DEFAULT_WAIT_TIMEOUT_MS] wait, which
+     * surfaces on this side as an ordinary [java.io.EOFException] from
+     * [PeerChannel.receiveEnvelope] once [internetPeerConnection.receiveLoop]
+     * starts reading -- the exact same dead-connection path every other
+     * failure in this class already takes (`onClosed` fires, the registry
+     * entry is removed), no new failure-detection logic needed for it.
+     *
+     * Returns the connected, handshake-written [PeerChannel] on success, or
+     * `null` (logged) if the relay dial itself fails ([PeerDialException]) or
+     * the handshake write fails (any [Exception] on the raw socket write) --
+     * the socket is closed before returning `null` in either case, never
+     * leaked.
+     */
+    private fun bridgeViaRelay(relayAddress: PeerAddress, ownId: NodeId, targetId: NodeId): PeerChannel? {
+        val socket = try {
+            PeerDialer.dial(listOf(relayAddress))
+        } catch (e: PeerDialException) {
+            onLog("Failed to dial a volunteer relay for bridging: ${e.message}")
+            return null
+        }
+        return try {
+            socket.soTimeout = relayBridgeTimeoutMs.toInt()
+            val handshake = ByteBuffer.allocate(NodeId.SIZE_BYTES * 2).apply {
+                put(ownId.bytes)
+                put(targetId.bytes)
+            }.array()
+            socket.getOutputStream().write(handshake)
+            socket.getOutputStream().flush()
+            // Bridging itself can legitimately run far longer than
+            // relayBridgeTimeoutMs (an ordinary chat/relay session, possibly
+            // idle for stretches) -- cleared before this socket is handed off
+            // to the ordinary receive loop, mirroring RelayNode's own
+            // handshake-read-then-clear pattern on the other side of this
+            // same handshake.
+            socket.soTimeout = 0
+            PeerChannel(socket)
+        } catch (e: Exception) {
+            onLog("Relay handshake failed while bridging to a target peer: ${e.message}")
+            try {
+                socket.close()
+            } catch (closeError: Exception) {
+                // Best-effort cleanup; the original handshake failure is what matters.
+            }
+            null
         }
     }
 
@@ -455,5 +746,16 @@ class InternetPeerConnectionManager(
          * fanout, not a tuned capacity number.
          */
         const val MAX_NEW_CONNECTIONS_PER_CALL = 3
+
+        /**
+         * Default for [relayBridgeTimeoutMs] -- see that parameter's own doc
+         * for exactly what this bounds (the relay TCP connect + handshake
+         * write only, not a "wait for a live match" timeout). Mirrors
+         * [com.hop.relaynode.RelayNode.DEFAULT_WAIT_TIMEOUT_MS]'s own ~30s
+         * order of magnitude, per this slice's own guidance -- unmeasured
+         * placeholder, same posture as every other timeout constant in this
+         * codebase.
+         */
+        const val DEFAULT_RELAY_BRIDGE_TIMEOUT_MS = 30_000L
     }
 }

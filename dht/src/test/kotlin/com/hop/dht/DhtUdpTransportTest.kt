@@ -517,7 +517,7 @@ class DhtUdpTransportTest {
             }
         }
         val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
-        targetTransport.onIntroductionReceived = { fromId, claimedAddress ->
+        targetTransport.onIntroductionReceived = { fromId, claimedAddress, _, _ ->
             receivedFromId = fromId
             receivedClaimedAddress = claimedAddress
         }
@@ -527,7 +527,11 @@ class DhtUdpTransportTest {
         targetTransport.start()
         try {
             val result = aTransport.introduce(contactFor(rSocket, rId), targetId, ownReflectedAddress)
-            assertEquals(targetKnownAddress, result, "introduce() must return R's found address for the target")
+            requireNotNull(result) { "introduce() must return a result for a found target" }
+            assertEquals(targetKnownAddress, result.targetAddress, "introduce() must return R's found address for the target")
+            assertEquals(null, result.relayId, "R has no RelayDirectory entries wired here, so no relay should be suggested")
+            assertEquals(null, result.relayId)
+            assertEquals(null, result.relayAddress)
 
             // R's fire-and-forget INTRODUCTION to the target is sent
             // independently of the INTRODUCE_RESPONSE reaching a -- give the
@@ -544,6 +548,126 @@ class DhtUdpTransportTest {
                 receivedClaimedAddress,
                 "the target must receive A's self-reported ownAddress, relayed through by R unmodified",
             )
+        } finally {
+            aTransport.stop()
+            rTransport.stop()
+            targetTransport.stop()
+        }
+    }
+
+    /**
+     * The actual property that matters for the relay-fallback-coordination
+     * fix: when R's RelayDirectory has a live relay, BOTH A's
+     * INTRODUCE_RESPONSE and B's INTRODUCTION carry the IDENTICAL relay
+     * id/address -- not merely "each independently got some relay," which
+     * would still leave A and B free to converge on two different relays.
+     * Asserts equality between what A received and what B received
+     * directly, per this slice's own stated bar.
+     */
+    @Test
+    fun `introduce and the resulting INTRODUCTION carry the IDENTICAL relay suggestion when R's RelayDirectory has a live relay`() = runBlocking {
+        val aId = nodeId(1)
+        val rId = nodeId(2)
+        val targetId = nodeId(3)
+        val relayId = nodeId(4)
+        val aSocket = loopbackSocket()
+        val rSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+        val targetKnownAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort)
+        val relayKnownAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 44444)
+
+        var receivedRelayId: NodeId? = null
+        var receivedRelayAddress: PeerAddress? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        rTransport.onIntroduceRequested = { requestedTargetId ->
+            if (requestedTargetId == targetId) Contact(id = targetId, address = targetKnownAddress.encode(), lastSeenAtMs = 0L) else null
+        }
+        rTransport.onRelayQueryRequested = {
+            listOf(Contact(id = relayId, address = relayKnownAddress.encode(), lastSeenAtMs = 0L))
+        }
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        targetTransport.onIntroductionReceived = { _, _, relayIdReceived, relayAddressReceived ->
+            receivedRelayId = relayIdReceived
+            receivedRelayAddress = relayAddressReceived
+        }
+
+        aTransport.start()
+        rTransport.start()
+        targetTransport.start()
+        try {
+            val result = aTransport.introduce(contactFor(rSocket, rId), targetId, ownReflectedAddress)
+            requireNotNull(result) { "introduce() must return a result for a found target" }
+
+            withTimeout(2000) {
+                while (receivedRelayId == null) {
+                    delay(20)
+                }
+            }
+
+            assertEquals(relayId, result.relayId, "A's INTRODUCE_RESPONSE must carry the relay R picked")
+            assertEquals(relayKnownAddress, result.relayAddress)
+
+            // The actual property under test: A's and B's relay suggestions
+            // must be equal, not merely both non-null.
+            assertEquals(result.relayId, receivedRelayId, "A and B must receive the IDENTICAL relayId")
+            assertEquals(result.relayAddress, receivedRelayAddress, "A and B must receive the IDENTICAL relayAddress")
+        } finally {
+            aTransport.stop()
+            rTransport.stop()
+            targetTransport.stop()
+        }
+    }
+
+    @Test
+    fun `introduce and the resulting INTRODUCTION both carry no relay suggestion when R's RelayDirectory has none`() = runBlocking {
+        val aId = nodeId(1)
+        val rId = nodeId(2)
+        val targetId = nodeId(3)
+        val aSocket = loopbackSocket()
+        val rSocket = loopbackSocket()
+        val targetSocket = loopbackSocket()
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+        val targetKnownAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort)
+
+        var receivedFromId: NodeId? = null
+        var receivedRelayId: NodeId? = null
+        var receivedRelayAddress: PeerAddress? = null
+
+        val aTransport = DhtUdpTransport(aSocket, aId, onMessageObserved = {})
+        val rTransport = DhtUdpTransport(rSocket, rId, onMessageObserved = {})
+        rTransport.onIntroduceRequested = { requestedTargetId ->
+            if (requestedTargetId == targetId) Contact(id = targetId, address = targetKnownAddress.encode(), lastSeenAtMs = 0L) else null
+        }
+        // onRelayQueryRequested deliberately left at its default (empty list) -- R knows of no relay.
+        val targetTransport = DhtUdpTransport(targetSocket, targetId, onMessageObserved = {})
+        targetTransport.onIntroductionReceived = { fromId, _, relayIdReceived, relayAddressReceived ->
+            receivedFromId = fromId
+            receivedRelayId = relayIdReceived
+            receivedRelayAddress = relayAddressReceived
+        }
+
+        aTransport.start()
+        rTransport.start()
+        targetTransport.start()
+        try {
+            val result = aTransport.introduce(contactFor(rSocket, rId), targetId, ownReflectedAddress)
+            requireNotNull(result) { "introduce() must return a result for a found target" }
+            assertEquals(null, result.relayId, "no relay was ever announced to R, so none must be suggested")
+            assertEquals(null, result.relayAddress)
+
+            withTimeout(2000) {
+                while (receivedFromId == null) {
+                    delay(20)
+                }
+            }
+
+            assertEquals(null, receivedRelayId, "B must not receive a bogus/placeholder relay suggestion when R has none")
+            assertEquals(null, receivedRelayAddress)
         } finally {
             aTransport.stop()
             rTransport.stop()

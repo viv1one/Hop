@@ -223,4 +223,53 @@ internal object DhtMessageHeader {
         } catch (e: PeerAddressDecodeException) {
             throw DhtMessageDecodeException("Malformed $fieldName in $messageTypeName: ${e.message}")
         }
+
+    /**
+     * Reads exactly ONE [PeerAddress] entry starting at [buffer]'s current
+     * position, advancing the buffer past that entry only -- unlike
+     * [decodePeerAddress], which consumes an entire caller-supplied
+     * [ByteArray] and requires every byte in it to belong to that one
+     * address (only correct when the address is the last field in a
+     * message). Needed as of Phase 4's relay-fallback-coordination slice:
+     * [IntroduceResponseMessage.address]/[IntroductionMessage.claimedAddress]
+     * are no longer necessarily the last field once an optional trailing
+     * relay suggestion follows them, so "consume everything left in the
+     * buffer" is no longer a valid way to bound the address's own bytes.
+     *
+     * Relies on [PeerAddress]'s own self-delimiting wire shape (its leading
+     * family byte alone determines whether the whole entry is
+     * [PeerAddress.MIN_WIRE_SIZE] (7, IPv4) or `1 + PeerAddress.IPV6_SIZE + 2`
+     * (19, IPv6) bytes -- the same fact [PeerAddress.decodeList] already
+     * relies on to walk a concatenated list of entries): peeks that one
+     * leading byte (via [ByteBuffer.get(index)][java.nio.ByteBuffer.get],
+     * which does NOT advance the buffer's position), decides the entry's
+     * total length from it, then reads exactly that many bytes and decodes
+     * them via [decodePeerAddress].
+     *
+     * Throws [DhtMessageDecodeException] if [buffer] has no bytes remaining
+     * for even the leading family byte, an unrecognized family byte, or
+     * fewer bytes remaining than the family byte's declared entry length
+     * requires -- same rejection posture as every other malformed-input case
+     * in this module, rewrapped from [PeerAddressDecodeException] exactly
+     * like [decodePeerAddress] already does.
+     */
+    fun decodePeerAddressFromBuffer(buffer: ByteBuffer, fieldName: String, messageTypeName: String): PeerAddress {
+        if (!buffer.hasRemaining()) {
+            throw DhtMessageDecodeException("Truncated $fieldName in $messageTypeName: no bytes remaining for the leading family byte")
+        }
+        val family = buffer.get(buffer.position()).toInt() and 0xFF
+        val ipSize = when (family) {
+            PeerAddress.FAMILY_IPV4 -> PeerAddress.IPV4_SIZE
+            PeerAddress.FAMILY_IPV6 -> PeerAddress.IPV6_SIZE
+            else -> throw DhtMessageDecodeException("Unknown PeerAddress family in $fieldName of $messageTypeName: $family")
+        }
+        val entrySize = 1 + ipSize + 2
+        if (buffer.remaining() < entrySize) {
+            throw DhtMessageDecodeException(
+                "Truncated $fieldName in $messageTypeName: family $family needs $entrySize bytes, only ${buffer.remaining()} remain"
+            )
+        }
+        val entryBytes = ByteArray(entrySize).also { buffer.get(it) }
+        return decodePeerAddress(entryBytes, fieldName = fieldName, messageTypeName = messageTypeName)
+    }
 }

@@ -162,7 +162,7 @@ class RendezvousNodeTest {
         var receivedFromId: NodeId? = null
         var receivedClaimedAddress: PeerAddress? = null
         val targetTransport = DhtUdpTransport(targetSocket, targetId)
-        targetTransport.onIntroductionReceived = { fromId, claimedAddress ->
+        targetTransport.onIntroductionReceived = { fromId, claimedAddress, _, _ ->
             receivedFromId = fromId
             receivedClaimedAddress = claimedAddress
         }
@@ -183,7 +183,7 @@ class RendezvousNodeTest {
             requireNotNull(result) { "the rendezvous node must answer found=true for a target it has genuinely observed" }
             assertEquals(
                 PeerAddress.from(InetAddress.getLoopbackAddress(), targetSocket.localPort),
-                result,
+                result.targetAddress,
                 "the returned address must be the target's genuinely observed address",
             )
 
@@ -228,6 +228,66 @@ class RendezvousNodeTest {
         } finally {
             rendezvous.stop()
             aTransport.stop()
+        }
+    }
+
+    @Test
+    fun `INTRODUCE_REQUEST through a RendezvousNode hands A and the target the IDENTICAL relay suggestion when one was announced`() = runBlocking {
+        // The actual property that matters, at this module's own layer: a
+        // real RendezvousNode -- not just the bare DhtUdpTransport it sits
+        // on -- must expose the coordination fix end to end, since it's the
+        // one wiring RELAY_ANNOUNCE/RELAY_QUERY to its own RelayDirectory
+        // (see this class's own doc).
+        val rendezvousSocket = loopbackSocket()
+        val rendezvousId = nodeId(1)
+        val rendezvous = RendezvousNode(rendezvousSocket, rendezvousId)
+
+        val aSocket = loopbackSocket()
+        val aId = nodeId(2)
+        val aTransport = DhtUdpTransport(aSocket, aId)
+
+        val targetSocket = loopbackSocket()
+        val targetId = nodeId(3)
+        var receivedRelayId: NodeId? = null
+        var receivedRelayAddress: PeerAddress? = null
+        val targetTransport = DhtUdpTransport(targetSocket, targetId)
+        targetTransport.onIntroductionReceived = { _, _, relayId, relayAddress ->
+            receivedRelayId = relayId
+            receivedRelayAddress = relayAddress
+        }
+
+        val relaySocket = loopbackSocket()
+        val relayId = nodeId(4)
+        val relayTransport = DhtUdpTransport(relaySocket, relayId)
+        val selfReportedBridgeAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 44444)
+
+        val ownReflectedAddress = PeerAddress.from(InetAddress.getLoopbackAddress(), 54321)
+
+        rendezvous.start()
+        aTransport.start()
+        targetTransport.start()
+        relayTransport.start()
+        try {
+            assertTrue(targetTransport.ping(contactFor(rendezvousSocket, rendezvousId)))
+            assertTrue(relayTransport.announceRelay(contactFor(rendezvousSocket, rendezvousId), selfReportedBridgeAddress))
+
+            val result = aTransport.introduce(contactFor(rendezvousSocket, rendezvousId), targetId, ownReflectedAddress)
+            requireNotNull(result) { "the rendezvous node must answer found=true for a target it has genuinely observed" }
+
+            val deadlineMs = System.currentTimeMillis() + 2000
+            while (receivedRelayId == null && System.currentTimeMillis() < deadlineMs) {
+                Thread.sleep(20)
+            }
+
+            assertEquals(relayId, result.relayId, "A's INTRODUCE_RESPONSE must carry the announced relay")
+            assertEquals(selfReportedBridgeAddress, result.relayAddress)
+            assertEquals(result.relayId, receivedRelayId, "A and the target must receive the IDENTICAL relayId")
+            assertEquals(result.relayAddress, receivedRelayAddress, "A and the target must receive the IDENTICAL relayAddress")
+        } finally {
+            rendezvous.stop()
+            aTransport.stop()
+            targetTransport.stop()
+            relayTransport.stop()
         }
     }
 

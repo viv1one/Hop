@@ -79,8 +79,14 @@ class DhtNode(
      * real consumer today is `com.hop.app.dht.DhtNodeManager`, which forwards
      * this into `com.hop.transport.InternetPeerConnectionManager` to actually
      * attempt a connection to the introduced peer.
+     *
+     * [relayId]/[relayAddress] are Phase 4's relay-fallback-coordination
+     * addition (see [IntroduceResponseMessage]'s own doc): the same relay
+     * suggestion R also handed to A in the paired INTRODUCE_RESPONSE, both
+     * `null` together if R had none to suggest.
      */
-    onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
+    onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress, relayId: NodeId?, relayAddress: PeerAddress?) -> Unit =
+        { _, _, _, _ -> },
     /**
      * Backs [transport]'s [DhtUdpTransport.onRelayAnnounceRequested]/
      * [DhtUdpTransport.onRelayQueryRequested] -- Phase 4's volunteer-relay-

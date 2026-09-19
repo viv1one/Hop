@@ -276,4 +276,15 @@ dependencies {
     // onto a deterministic test dispatcher in a plain JVM unit test, where no
     // real Android Main-thread Looper exists.
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // Phase 4's relay-fallback-coordination slice: InternetPeerConnectionManagerTest
+    // drives a REAL tools/relay-node/ RelayNode instance over real loopback
+    // sockets (this codebase's established "drive real production classes
+    // over real sockets" convention -- see DhtUdpTransportTest/RelayNodeTest)
+    // rather than hand-rolling a stand-in socket server that merely mimics
+    // RelayNode's 64-byte handshake shape. Test-only: :relay-node depends
+    // only on :dht (see tools/relay-node/build.gradle.kts's own comment) and
+    // :app already depends on :dht, so this creates no dependency cycle and
+    // no production-code coupling -- :app's own main source set never
+    // imports com.hop.relaynode.*, only this test source set does.
+    testImplementation(project(":relay-node"))
 }

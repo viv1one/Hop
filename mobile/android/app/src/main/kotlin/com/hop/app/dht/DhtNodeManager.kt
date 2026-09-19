@@ -7,6 +7,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.hop.dht.Contact
 import com.hop.dht.DhtNode
 import com.hop.dht.DhtUdpTransport
+import com.hop.dht.IntroduceResult
 import com.hop.dht.NodeId
 import com.hop.dht.PeerAddress
 import com.hop.dht.RoutingTable
@@ -96,14 +97,19 @@ class DhtNodeManager(
      * introduction naming this device's peer and its self-reported address
      * (see `IntroductionMessage.kt`'s own file doc in `dht/`). In production
      * (see [com.hop.app.AppContainer]) this is
-     * `InternetPeerConnectionManager.connectToDiscoveredHolders` -- a
-     * received introduction is treated as just another way of learning about
-     * a [Contact] worth trying, same entry point a DHT topic browse result
-     * already uses, deduped/capped there exactly the same way. Defaults to a
-     * no-op for tests that have no [com.hop.transport.InternetPeerConnectionManager]
-     * to hand it.
+     * `InternetPeerConnectionManager.connectToIntroducedPeer` -- a received
+     * introduction is treated as just another way of learning about a
+     * [Contact] worth trying, same dedup/cap posture a DHT topic browse
+     * result already uses via `connectToDiscoveredHolders`. [relayId]/
+     * [relayAddress] are Phase 4's relay-fallback-coordination addition
+     * (see [IntroduceResult]'s own doc): the same relay suggestion R handed
+     * this device alongside the introduction itself, both `null` together
+     * if R had none to suggest -- passed straight through so the direct-dial
+     * fallback can attempt a relay bridge without a second round trip to R.
+     * Defaults to a no-op for tests that have no
+     * [com.hop.transport.InternetPeerConnectionManager] to hand it.
      */
-    private val connectToIntroducedPeer: suspend (Contact) -> Unit = {},
+    private val connectToIntroducedPeer: suspend (contact: Contact, relayId: NodeId?, relayAddress: PeerAddress?) -> Unit = { _, _, _ -> },
     registerWithProcessLifecycle: Boolean = true,
 ) : DefaultLifecycleObserver {
 
@@ -122,6 +128,33 @@ class DhtNodeManager(
      * `rendezvous/` node to join through (see `DhtNodeManagerTest`).
      */
     @Volatile var ownAddress: PeerAddress? = null
+        private set
+
+    /**
+     * This device's own [NodeId], once [start] has finished (or `null`
+     * before then / after [stop]). Phase 4's relay-fallback-coordination
+     * addition: `com.hop.transport.InternetPeerConnectionManager` needs this
+     * device's own id for the `[32B ownId][32B bridgeToId]` handshake a
+     * volunteer relay (`tools/relay-node/`'s `RelayNode`) expects -- see
+     * that class's own "Wire shape" doc.
+     */
+    @Volatile var ownNodeId: NodeId? = null
+        private set
+
+    /**
+     * The one rendezvous/DHT contact this device knows how to introduce
+     * through, once [maybeBootstrap] has (successfully) run -- `null` before
+     * that, if bootstrap is disabled (every production build today -- see
+     * [maybeBootstrap]'s own doc), or if it failed. **This is the answer to
+     * "which contact do we introduce through" for
+     * `InternetPeerConnectionManager.connectToDiscoveredHolders`'s own
+     * relay-fallback trigger (Phase 4): reuse the same bootstrap node
+     * [maybeBootstrap] already joins via, captured as a real [Contact] here,
+     * rather than inventing a second, separate "known rendezvous contacts"
+     * concept.** See [maybeBootstrap]'s own doc for exactly how this is
+     * captured -- no new `dht/` lookup primitive was needed for it.
+     */
+    @Volatile var rendezvousContact: Contact? = null
         private set
 
     init {
@@ -172,7 +205,7 @@ class DhtNodeManager(
                     dhtTransport,
                     scope,
                     listOf(boundAddress),
-                    onIntroductionReceived = { fromId, claimedAddress ->
+                    onIntroductionReceived = { fromId, claimedAddress, relayId, relayAddress ->
                         // Fires synchronously from DhtUdpTransport's receive
                         // thread, not a coroutine -- scope.launch is required
                         // to call the suspend connectToIntroducedPeer lambda
@@ -183,7 +216,7 @@ class DhtNodeManager(
                             address = claimedAddress.encode(),
                             lastSeenAtMs = System.currentTimeMillis(),
                         )
-                        scope.launch { connectToIntroducedPeer(contact) }
+                        scope.launch { connectToIntroducedPeer(contact, relayId, relayAddress) }
                     },
                 )
                 dhtTransport.start()
@@ -192,6 +225,7 @@ class DhtNodeManager(
                 transport = dhtTransport
                 node = dhtNode
                 ownAddress = boundAddress
+                ownNodeId = ownId
 
                 maybeBootstrap(dhtNode)
 
@@ -237,6 +271,23 @@ class DhtNodeManager(
      * up standalone. This is deliberately biased toward the low-density,
      * near-broken-chain case (no peer to join through at all) over the
      * dense-venue happy path.
+     *
+     * **Also captures [rendezvousContact] on success** -- Phase 4's relay-
+     * fallback-coordination slice's answer to "which contact do we introduce
+     * through" (see that property's own doc). [DhtNode.bootstrapJoin]'s own
+     * PING step already causes [DhtUdpTransport.onMessageObserved] (wired to
+     * [DhtNode.observe] in [DhtNode]'s own `init` block) to record a
+     * correctly-id'd [RoutingTable] entry for the bootstrap node itself --
+     * keyed under its REAL [NodeId], not the zero-id placeholder
+     * [DhtNode.bootstrapJoin] only ever hands to [DhtUdpTransport.ping] --
+     * strictly before that PING call can return (`handlePacket`'s `PONG`
+     * case calls `observe` before completing the pending request). Scanning
+     * [DhtNode.routingTable] for the one entry whose stored address matches
+     * the bootstrap address just dialed recovers that real [Contact] with
+     * zero new `dht/` lookup-by-address primitive -- [RoutingTable.findClosest]
+     * is already public and, at a large enough `count`, simply returns every
+     * known contact sorted by XOR distance to the id supplied (that id's
+     * own identity is irrelevant here; only the full result list is used).
      */
     private suspend fun maybeBootstrap(dhtNode: DhtNode) {
         if (bootstrapHost.isBlank() || bootstrapPort == 0) {
@@ -247,9 +298,39 @@ class DhtNodeManager(
             val address = PeerAddress.from(InetAddress.getByName(bootstrapHost), bootstrapPort)
             val discovered = dhtNode.bootstrapJoin(address)
             Log.d(TAG, "Bootstrap join via $bootstrapHost:$bootstrapPort discovered ${discovered.size} contact(s)")
+
+            val addressBytes = address.encode()
+            rendezvousContact = dhtNode.routingTable
+                .findClosest(dhtNode.routingTable.ownId, Int.MAX_VALUE)
+                .firstOrNull { it.address.contentEquals(addressBytes) }
         } catch (e: Exception) {
             Log.e(TAG, "Bootstrap join failed -- continuing without one", e)
         }
+    }
+
+    /**
+     * Phase 4's client-side relay-fallback trigger's rendezvous-introduce
+     * primitive: asks [rendezvousContact] to introduce this device to
+     * [targetId], returning whatever [IntroduceResult] comes back (the
+     * target's address plus, per [IntroduceResult]'s own doc, whatever relay
+     * suggestion the rendezvous node chose to pair with it) -- or `null`,
+     * logged and swallowed, whenever this device has no [rendezvousContact]
+     * to ask (every production build today, per [maybeBootstrap]'s own
+     * doc -- this always returns `null` in production until a real
+     * `rendezvous/` node is actually deployed, a real, current, already-
+     * flagged limitation, not something this slice solves), the DHT node
+     * hasn't finished starting yet, or [DhtUdpTransport.reflectOwnAddress]
+     * doesn't get an answer back from [rendezvousContact] in time.
+     *
+     * Called by `com.hop.transport.InternetPeerConnectionManager` as its own
+     * relay-fallback trigger's rendezvous-introduce step -- see that class's
+     * own doc.
+     */
+    suspend fun introduceViaRendezvous(targetId: NodeId): IntroduceResult? {
+        val dhtTransport = transport ?: return null
+        val via = rendezvousContact ?: return null
+        val ownReflectedAddress = dhtTransport.reflectOwnAddress(via) ?: return null
+        return dhtTransport.introduce(via, targetId, ownReflectedAddress)
     }
 
     /**
@@ -285,6 +366,8 @@ class DhtNodeManager(
         topicSubscription = null
         nodeScope = null
         ownAddress = null
+        ownNodeId = null
+        rendezvousContact = null
     }
 
     companion object {

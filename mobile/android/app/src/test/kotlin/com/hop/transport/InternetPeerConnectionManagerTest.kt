@@ -12,9 +12,11 @@ import com.hop.data.PostEntity
 import com.hop.data.RelayQueueDao
 import com.hop.data.RelayQueueEntity
 import com.hop.dht.Contact
+import com.hop.dht.IntroduceResult
 import com.hop.dht.NodeId
 import com.hop.dht.PeerAddress
 import com.hop.p2p.PeerChannel
+import com.hop.relaynode.RelayNode
 import com.hop.protocol.ContentType
 import com.hop.protocol.DontRelayFlagEnvelope
 import com.hop.protocol.EncryptedFrameCodec
@@ -34,6 +36,7 @@ import com.hop.repository.PostRepository
 import com.hop.repository.RelayRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
@@ -41,6 +44,7 @@ import org.junit.rules.TemporaryFolder
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -80,6 +84,9 @@ class InternetPeerConnectionManagerTest {
         dontRelayFlagDao: DontRelayFlagDao = FakeDontRelayFlagDao(),
         pendingMessageDao: PendingMessageDao = FakePendingMessageDao(),
         bundleQueueDao: BundleQueueDao = FakeBundleQueueDao(),
+        getOwnNodeId: () -> NodeId? = { null },
+        introduceViaRendezvous: suspend (NodeId) -> IntroduceResult? = { null },
+        relayBridgeTimeoutMs: Long = 3_000L,
         onLog: (String) -> Unit = {},
     ): InternetPeerConnectionManager = InternetPeerConnectionManager(
         postRepository = PostRepository(FakePostDao(), DecayKeyStore()),
@@ -98,6 +105,9 @@ class InternetPeerConnectionManagerTest {
         getOwnPeerId = { "me" },
         pendingTierKeyRequests = PendingTierKeyRequests(),
         postsDir = tempFolder.newFolder("posts-${System.nanoTime()}"),
+        getOwnNodeId = getOwnNodeId,
+        introduceViaRendezvous = introduceViaRendezvous,
+        relayBridgeTimeoutMs = relayBridgeTimeoutMs,
         onLog = onLog,
     )
 
@@ -992,6 +1002,202 @@ class InternetPeerConnectionManagerTest {
         )
         // Reaching this line without an exception is the assertion -- there is
         // nothing else observable with zero open connections.
+    }
+
+    // -- Phase 4's relay-fallback-coordination slice: connectToIntroducedPeer/
+    // connectToDiscoveredHolders each fall back to a volunteer relay ONLY
+    // after their own direct dial has already failed. Real com.hop.relaynode.RelayNode
+    // instance (tools/relay-node/, added as a test-only dependency -- see
+    // app/build.gradle.kts's own comment on why) reused unmodified, bridging
+    // two simulated InternetPeerConnectionManager instances -- the most
+    // valuable test here is the end-to-end one: content genuinely flows
+    // through the bridge and dispatches correctly on the far side, not just
+    // "a channel got registered." --
+
+    /** A real, started [RelayNode] bound to loopback + an ephemeral port, torn down via [close]. */
+    private class TestRelay {
+        private val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        val address: PeerAddress = PeerAddress.from(InetAddress.getByName("127.0.0.1"), serverSocket.localPort)
+        private val relayNode = RelayNode(serverSocket, waitTimeoutMs = 3_000L)
+        init {
+            relayNode.start()
+        }
+        fun close() {
+            relayNode.stop()
+        }
+    }
+
+    @Test
+    fun `connectToIntroducedPeer falls back to a real volunteer relay when direct dial fails, and content flows end-to-end through the bridge and dispatches on the far side`() = runBlocking {
+        val relay = TestRelay()
+        // Any NodeId works here -- RelayNode's own handshake never carries a
+        // "relay id" concept, only the two peers' ids (see bridgeViaRelay's
+        // own doc for why relayId itself is diagnostic-only, not part of the
+        // wire handshake).
+        val relayId = nodeId(99)
+        val idA = nodeId(10)
+        val idB = nodeId(20)
+
+        val relayQueueDaoB = FakeRelayQueueDao()
+        val managerA = newManager(getOwnNodeId = { idA })
+        val managerB = newManager(relayQueueDao = relayQueueDaoB, getOwnNodeId = { idB })
+
+        // Each side's "introduced peer" contact claims an address nothing is
+        // listening on -- guarantees the direct dial each manager attempts
+        // FIRST genuinely fails fast (connection refused), so the relay
+        // fallback is what's actually under test here, not a lucky direct
+        // connect.
+        val unreachableA = loopbackContact(idA, unlistenedPort())
+        val unreachableB = loopbackContact(idB, unlistenedPort())
+
+        try {
+            // Both sides attempt concurrently, exactly as two independent
+            // devices would -- neither waits for the other.
+            val jobA = launch { managerA.connectToIntroducedPeer(unreachableB, relayId, relay.address) }
+            val jobB = launch { managerB.connectToIntroducedPeer(unreachableA, relayId, relay.address) }
+            jobA.join()
+            jobB.join()
+
+            val frameBytes = encodedFrameBytes("relay-bridged-post")
+            val clipHashHex = Frame.decode(frameBytes).clipHash.joinToString(separator = "") { "%02x".format(it) }
+
+            // A's own broadcastPost is pure fanout (see that method's own
+            // doc) -- it writes to whatever open connection it has for B,
+            // which by now must be the relay-bridged channel, not a direct
+            // one (the direct dial above was guaranteed to fail).
+            managerA.broadcastPost(frameBytes)
+
+            // The actual property under test: this must reach B and dispatch
+            // through B's own real EnvelopeDispatcher/ReceivedFrameStore
+            // pipeline -- proven the same way every other live-relay test in
+            // this file proves it, via the receiving side's own repository
+            // state, not a raw socket read.
+            var tookCustody = false
+            repeat(40) {
+                if (relayQueueDaoB.getAll().any { it.clipHash == clipHashHex }) {
+                    tookCustody = true
+                    return@repeat
+                }
+                Thread.sleep(100)
+            }
+            assertTrue(tookCustody, "content sent by A after the relay bridge formed must reach B and dispatch through its real receive pipeline")
+        } finally {
+            relay.close()
+        }
+    }
+
+    @Test
+    fun `connectToDiscoveredHolders falls back to introduceViaRendezvous, then bridges via the returned relay suggestion, when direct dial fails`() = runBlocking {
+        val relay = TestRelay()
+        val relayId = nodeId(99)
+        val idA = nodeId(11)
+        val idTarget = nodeId(21)
+
+        var introduceCalledWith: NodeId? = null
+        val managerA = newManager(
+            getOwnNodeId = { idA },
+            introduceViaRendezvous = { targetId ->
+                introduceCalledWith = targetId
+                IntroduceResult(targetAddress = PeerAddress.from(InetAddress.getByName("127.0.0.1"), unlistenedPort()), relayId = relayId, relayAddress = relay.address)
+            },
+        )
+
+        // A "discovered holder" whose claimed address is unreachable -- the
+        // direct dial connectToDiscoveredHolders always attempts first must
+        // fail before introduceViaRendezvous is ever consulted.
+        val unreachableTarget = loopbackContact(idTarget, unlistenedPort())
+
+        // The target side of the bridge, played by a bare TCP client here
+        // (not a second InternetPeerConnectionManager) -- this test's own
+        // focus is proving connectToDiscoveredHolders calls
+        // introduceViaRendezvous and bridges via ITS returned suggestion,
+        // not re-proving end-to-end dispatch (already covered above).
+        val targetSocket = Socket()
+        try {
+            managerA.connectToDiscoveredHolders(listOf(unreachableTarget))
+
+            assertEquals(idTarget, introduceCalledWith, "connectToDiscoveredHolders must ask introduceViaRendezvous about the target whose direct dial just failed")
+
+            // Declares the MUTUAL reverse of what A's own bridgeViaRelay call
+            // just declared (ownId=idA, bridgeToId=idTarget) -- this is what
+            // makes RelayNode match the two and start forwarding. RelayNode
+            // itself CONSUMES each side's own handshake bytes (see
+            // RelayNode.readHandshake) rather than forwarding them onward --
+            // only bytes written AFTER the handshake are blind-forwarded.
+            targetSocket.connect(relay.address.toInetSocketAddress(), 2_000)
+            targetSocket.soTimeout = 3_000
+            val handshake = ByteBuffer.allocate(NodeId.SIZE_BYTES * 2).apply {
+                put(idTarget.bytes)
+                put(idA.bytes)
+            }.array()
+            targetSocket.getOutputStream().write(handshake)
+            targetSocket.getOutputStream().flush()
+
+            // A's own broadcastPost is pure fanout -- writes to whatever
+            // open connection it has for idTarget, which by now must be the
+            // relay-bridged channel bridgeViaRelay built from
+            // introduceViaRendezvous's returned relay suggestion (the direct
+            // dial above was guaranteed to fail). The actual property under
+            // test: this raw target-side socket -- reached only via the
+            // exact relay address introduceViaRendezvous supplied -- must
+            // receive it, proving the returned suggestion is what actually
+            // got dialed.
+            val frameBytes = encodedFrameBytes("introduce-fallback-post")
+            managerA.broadcastPost(frameBytes)
+
+            val received = PeerChannel(targetSocket).receiveEnvelope()
+            assertEquals(WirePayloadType.POST_FRAME, received.type)
+            assertContentEquals(frameBytes, received.payload)
+        } finally {
+            targetSocket.close()
+            relay.close()
+        }
+    }
+
+    @Test
+    fun `connectToIntroducedPeer with no relay suggestion and no rendezvous fallback gives up cleanly after a failed direct dial`() = runBlocking {
+        val idA = nodeId(12)
+        val idTarget = nodeId(22)
+        val logs = mutableListOf<String>()
+        val manager = newManager(
+            getOwnNodeId = { idA },
+            introduceViaRendezvous = { null },
+            onLog = { message -> synchronized(logs) { logs.add(message) } },
+        )
+        val unreachableTarget = loopbackContact(idTarget, unlistenedPort())
+
+        // Must not throw -- no relay suggestion, no rendezvous contact to ask
+        // (introduceViaRendezvous isn't even consulted by this entry point
+        // when no suggestion was supplied -- see connectToIntroducedPeer's
+        // own doc), so this is a clean give-up.
+        manager.connectToIntroducedPeer(unreachableTarget, relayId = null, relayAddress = null)
+
+        assertTrue(
+            logs.any { it.contains("No relay suggestion available", ignoreCase = true) },
+            "a failed direct dial with no relay suggestion at all must log and give up cleanly: $logs",
+        )
+    }
+
+    @Test
+    fun `a relay bridge attempt against an unreachable relay address is logged and gives up cleanly, no crash`() = runBlocking {
+        val idA = nodeId(13)
+        val idTarget = nodeId(23)
+        val relayId = nodeId(98)
+        val deadRelayAddress = PeerAddress.from(InetAddress.getByName("127.0.0.1"), unlistenedPort())
+        val logs = mutableListOf<String>()
+        val manager = newManager(
+            getOwnNodeId = { idA },
+            onLog = { message -> synchronized(logs) { logs.add(message) } },
+        )
+        val unreachableTarget = loopbackContact(idTarget, unlistenedPort())
+
+        // Must not throw.
+        manager.connectToIntroducedPeer(unreachableTarget, relayId = relayId, relayAddress = deadRelayAddress)
+
+        assertTrue(
+            logs.any { it.contains("Failed to dial a volunteer relay", ignoreCase = true) },
+            "a relay dial failure must be logged, never thrown: $logs",
+        )
     }
 
     // -- Minimal hand-rolled fakes, matching InternetPeerConnectionTest's own established pattern. --

@@ -20,6 +20,24 @@ sealed class FindValueOutcome {
 }
 
 /**
+ * [introduce]'s success return -- [targetAddress] is exactly what the old
+ * bare-[PeerAddress]-or-`null` return used to carry; [relayId]/[relayAddress]
+ * are Phase 4's relay-fallback-coordination addition (see
+ * [IntroduceResponseMessage]'s own doc for the full reasoning): the SAME
+ * relay R also handed to the target via the paired [IntroductionMessage],
+ * or both `null` together if R's own `RelayDirectory` had nothing to
+ * suggest. Never partially populated -- [IntroduceResponseMessage]'s own
+ * `init` block already enforces `relayId`/`relayAddress` agree with each
+ * other on the wire; this type just carries that same pairing through to
+ * this function's caller.
+ */
+data class IntroduceResult(
+    val targetAddress: PeerAddress,
+    val relayId: NodeId?,
+    val relayAddress: PeerAddress?,
+)
+
+/**
  * The Kademlia RPCs this slice speaks over UDP: liveness (PING/PONG, Slice 3),
  * FIND_NODE (Slice 4), STORE/FIND_VALUE (Slice 5) -- the announce/
  * get-peers primitive [DhtStore] backs -- and, as of Phase 4's NAT
@@ -146,8 +164,19 @@ class DhtUdpTransport(
      * connection in response (e.g. `InternetPeerConnection.connectTo`) is
      * explicitly out of scope here; see `IntroductionMessage.kt`'s own file
      * doc.
+     *
+     * [relayId]/[relayAddress] are Phase 4's relay-fallback-coordination
+     * addition: the same relay suggestion R (whichever rendezvous/DHT
+     * contact sent this INTRODUCTION) also handed to A in the paired
+     * INTRODUCE_RESPONSE, both `null` together if R had none to suggest --
+     * see [IntroduceResponseMessage]'s own doc. This slice still goes no
+     * further than firing this callback with the wider field set; actually
+     * dialing (directly, or falling back to bridging through the suggested
+     * relay) is app-layer, client-side work -- see
+     * `com.hop.transport.InternetPeerConnectionManager`.
      */
-    var onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress) -> Unit = { _, _ -> },
+    var onIntroductionReceived: (fromId: NodeId, claimedAddress: PeerAddress, relayId: NodeId?, relayAddress: PeerAddress?) -> Unit =
+        { _, _, _, _ -> },
     /**
      * Answers an inbound RELAY_ANNOUNCE: [relayId] is the announcing relay's
      * own [NodeId] and [relayAddress] is its self-reported TCP bridge
@@ -338,12 +367,14 @@ class DhtUdpTransport(
      * Sends an INTRODUCE_REQUEST to [via] (a rendezvous/DHT contact this
      * device already talks to) asking it to introduce this device to
      * [targetId], and suspends until either a matching INTRODUCE_RESPONSE
-     * arrives or [requestTimeoutMs] elapses. Returns the found [PeerAddress]
-     * on a `found=true` response; returns `null` on timeout, a `found=false`
-     * response, a malformed response, or a response that doesn't decode as
-     * an INTRODUCE_RESPONSE -- never trusts payload shape from the
-     * transaction id match alone, and never throws for any of these cases
-     * (same posture as every other RPC above).
+     * arrives or [requestTimeoutMs] elapses. Returns an [IntroduceResult]
+     * (the found [PeerAddress], plus whatever relay suggestion [via] chose
+     * to pair with it -- see that type's own doc) on a `found=true`
+     * response; returns `null` on timeout, a `found=false` response, a
+     * malformed response, or a response that doesn't decode as an
+     * INTRODUCE_RESPONSE -- never trusts payload shape from the transaction
+     * id match alone, and never throws for any of these cases (same posture
+     * as every other RPC above).
      *
      * [ownReflectedAddress] should be this device's own address as learned
      * via [reflectOwnAddress] -- it's carried inside the request so [via]
@@ -356,10 +387,11 @@ class DhtUdpTransport(
      * `IntroductionMessage.kt`'s own file doc for the full design (why this
      * shape, not simultaneous-open TCP hole punching) and its scope (this
      * function and [via]'s own [handlePacket] handling are the entire
-     * mechanism; nothing here or in [onIntroductionReceived] attempts an
-     * actual connection).
+     * wire-level mechanism; actually dialing -- directly, or falling back to
+     * the suggested relay -- is app-layer, client-side work; see
+     * `com.hop.transport.InternetPeerConnectionManager`).
      */
-    suspend fun introduce(via: Contact, targetId: NodeId, ownReflectedAddress: PeerAddress): PeerAddress? {
+    suspend fun introduce(via: Contact, targetId: NodeId, ownReflectedAddress: PeerAddress): IntroduceResult? {
         val transactionId = TransactionId.random()
         val message = IntroduceRequestMessage(
             transactionId = transactionId,
@@ -371,7 +403,15 @@ class DhtUdpTransport(
         val responseBytes = sendAndAwait(destination, transactionId, message.encode()) ?: return null
         return try {
             val response = IntroduceResponseMessage.decode(responseBytes)
-            if (response.found) response.address else null
+            if (response.found) {
+                IntroduceResult(
+                    targetAddress = response.address!!,
+                    relayId = response.relayId,
+                    relayAddress = response.relayAddress,
+                )
+            } else {
+                null
+            }
         } catch (e: DhtMessageDecodeException) {
             null
         }
@@ -680,8 +720,45 @@ class DhtUdpTransport(
                 // empty/malformed address blob: that's treated the same as
                 // "not found" rather than crashing this handler.
                 val targetAddress = target?.let { PeerAddress.decodeList(it.address).firstOrNull() }
+
+                // Phase 4's relay-fallback-coordination fix (see
+                // IntroduceResponseMessage's own doc): pick ONE relay from
+                // this device's own RelayDirectory -- via the exact same
+                // onRelayQueryRequested callback RELAY_QUERY already answers
+                // from below, not a second directory instance -- and hand
+                // the IDENTICAL choice to both A (the INTRODUCE_RESPONSE
+                // sent back below) and B (the INTRODUCTION sent further
+                // below). This is the one decision point that makes A and B
+                // converge on the same relay. Only computed when the target
+                // was actually found: a not-found answer has no B to
+                // coordinate a relay choice with, so nothing is queried in
+                // that case. Deterministic-enough choice: the first live
+                // relay onRelayQueryRequested() returns -- that callback's
+                // own answer is already a bounded, shuffled subset (see its
+                // own doc), so "first" here is a pick from an
+                // already-randomized short list, not an unbounded/biased
+                // scan. A relay entry whose stored address is empty/
+                // malformed is treated the same as "no relay known" --
+                // relayId and relayAddress are only ever populated together.
+                var relayId: NodeId? = null
+                var relayAddress: PeerAddress? = null
+                if (targetAddress != null) {
+                    val relayCandidate = onRelayQueryRequested().firstOrNull()
+                    val candidateAddress = relayCandidate?.let { PeerAddress.decodeList(it.address).firstOrNull() }
+                    if (relayCandidate != null && candidateAddress != null) {
+                        relayId = relayCandidate.id
+                        relayAddress = candidateAddress
+                    }
+                }
+
                 val response = if (targetAddress != null) {
-                    IntroduceResponseMessage.found(transactionId = message.transactionId, senderId = ownId, address = targetAddress)
+                    IntroduceResponseMessage.found(
+                        transactionId = message.transactionId,
+                        senderId = ownId,
+                        address = targetAddress,
+                        relayId = relayId,
+                        relayAddress = relayAddress,
+                    )
                 } else {
                     IntroduceResponseMessage.notFound(transactionId = message.transactionId, senderId = ownId)
                 }
@@ -693,13 +770,18 @@ class DhtUdpTransport(
                 // self-reported address THROUGH, unmodified -- see
                 // IntroduceRequestMessage.ownAddress's own doc for why this
                 // device (R) has no way to independently verify that address
-                // either. If not found, nothing is sent to anyone.
+                // either. If not found, nothing is sent to anyone. Carries
+                // the SAME relayId/relayAddress just computed above and sent
+                // to A -- see this case's own doc above.
                 if (targetAddress != null) {
                     val introduction = IntroductionMessage(
                         transactionId = TransactionId.random(),
                         senderId = ownId,
                         fromId = message.senderId,
                         claimedAddress = message.ownAddress,
+                        relayFound = relayId != null,
+                        relayId = relayId,
+                        relayAddress = relayAddress,
                     )
                     sendUnsolicited(targetAddress, introduction.encode())
                 }
@@ -718,7 +800,7 @@ class DhtUdpTransport(
                 // they're handed to onIntroductionReceived below instead, never
                 // fed into observe().
                 observe(message.senderId, observedAddress)
-                onIntroductionReceived(message.fromId, message.claimedAddress)
+                onIntroductionReceived(message.fromId, message.claimedAddress, message.relayId, message.relayAddress)
             }
             DhtMessageType.RELAY_ANNOUNCE -> {
                 val message = RelayAnnounceRequestMessage.decode(payload)

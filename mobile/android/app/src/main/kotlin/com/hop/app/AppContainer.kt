@@ -262,6 +262,20 @@ class AppContainer(applicationContext: Context) {
         onPreKeyBundleReceived = messageRepository::cachePeerBundle,
         onMessageCiphertextReceived = messageRepository::onEnvelopeReceived,
         postsDir = java.io.File(applicationContext.filesDir, "posts"),
+        // Phase 4's relay-fallback-coordination slice: both capabilities are
+        // forward references to `dhtNodeManager` below, deferred inside a
+        // lambda -- safe because neither is ever invoked until well after
+        // this whole container has finished constructing (the earliest
+        // either could fire is a later direct-dial failure inside
+        // connectToDiscoveredHolders/connectToIntroducedPeer, never during
+        // construction itself). `dhtNodeManager` itself has the mirror-image
+        // forward reference (to this val) in its own `connectToIntroducedPeer`
+        // wiring below, for the identical reason -- once
+        // InternetPeerConnectionManager also needs something from
+        // DhtNodeManager, the two now depend on each other, so ONE direction
+        // has to be a forward reference; this is that one.
+        getOwnNodeId = { dhtNodeManager.ownNodeId },
+        introduceViaRendezvous = { targetId -> dhtNodeManager.introduceViaRendezvous(targetId) },
     )
 
     /**
@@ -297,7 +311,17 @@ class AppContainer(applicationContext: Context) {
         getOwnNodeIdSeed = { settingsRepository.getOrCreateStableSenderDeviceId() },
         bootstrapHost = BuildConfig.DHT_BOOTSTRAP_HOST,
         bootstrapPort = BuildConfig.DHT_BOOTSTRAP_PORT,
-        connectToIntroducedPeer = { contact -> internetPeerConnectionManager.connectToDiscoveredHolders(listOf(contact)) },
+        // Phase 4's relay-fallback-coordination slice: a received
+        // introduction now also carries a relay suggestion (see
+        // com.hop.dht.IntroduceResponseMessage's own doc) -- delegates to
+        // InternetPeerConnectionManager.connectToIntroducedPeer, NOT
+        // connectToDiscoveredHolders as before, since that method direct-
+        // dials-then-falls-back-to-relay using the suggestion carried
+        // alongside the introduction itself, rather than having to ask a
+        // rendezvous contact for one a second time.
+        connectToIntroducedPeer = { contact, relayId, relayAddress ->
+            internetPeerConnectionManager.connectToIntroducedPeer(contact, relayId, relayAddress)
+        },
     )
 
     val transportManager: TransportManager = TransportManager(
