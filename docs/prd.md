@@ -35,7 +35,9 @@ Hop is a serverless, short-form photo/video and messaging app. A "post" — a ph
 
 ### 4.1 Post & Watch (core feed)
 
-A post is either a short video (target: under 60 seconds) or a photo. In v1, users **upload** an existing photo/video from their device's media library — no in-app camera. On posting, the app tags the post with a geohash of the current location and the sender's chosen reach setting.
+A post is either a short video (max: ~15 seconds) or a photo. In v1, users **upload** an existing photo/video from their device's media library — no in-app camera. On posting, the app tags the post with a geohash of the current location and the sender's chosen reach setting.
+
+**Settled via real-device spike (BUILD_PLAN.md open decision #3):** an earlier "under 60 seconds" target conflicted with real measurement — real phone camera output runs ~20-22 Mbps native, so a 60s clip (~150-165MB) would transfer in ~9-11s over WiFi Direct at this repo's own measured real-world throughput, missing §7's "low single-digit seconds" NFR. A ~15s cap measures inside the NFR and is what the v1 posting flow's media-pick step actually enforces (rejecting a picked video that exceeds it at upload time, not by transcoding). This replaces the earlier 60s target rather than sitting alongside it.
 
 - User story: As a user, I can upload a photo or video from my device and post it with one tap, choosing how far it should reach before posting
 - User story: As a user, I see a full-screen, swipeable feed of photo and video posts reachable at my current location and radius setting — the same radius set at first-run setup (§4.2), not a separate browse control
@@ -130,4 +132,4 @@ Recap from the monetization design — included here for completeness against th
 - What's the relay-message retention window (§4.4) — tied to the same decay-window parameters as content, or set independently for messages?
 - What's the default display duration for a photo post in the feed (§4.1)? Stories-style conventions typically use ~5 seconds — reasonable starting default, but worth a UX call rather than treating it as settled here.
 - When in-app camera capture ships (post-v1, §4.1), does it replace the upload picker or sit alongside it? Worth deciding before building the UI, not after.
-- §4.1's "under 60 seconds" video target conflicts with real measurement (BUILD_PLAN.md open decision #3): real phone camera output runs ~20-22 Mbps native, so a 60s clip (~150-165MB) transfers in ~9-11s over WiFi Direct at this repo's own measured real-world throughput — missing §7's "low single-digit seconds" NFR. A ~15s cap measured inside the NFR. Needs a product call: shorten the stated target, or accept slower transfer for longer clips, before Phase 1 locks the posting flow.
+- ~~§4.1's "under 60 seconds" video target conflicts with real measurement~~ — **Resolved:** §4.1 now states the ~15s cap the v1 posting flow actually enforces, matching the real-device WiFi Direct throughput measurement (BUILD_PLAN.md open decision #3). Revisit only if a future codec/compression change materially changes the transfer-time math.
