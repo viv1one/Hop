@@ -1,0 +1,1 @@
+HOP. Built a phone-to-phone social network with no company server, no accounts, and messages no one but you can read. Ever.

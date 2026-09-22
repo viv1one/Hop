@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>HOP — There is no server</title>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      :root {
+        --hop-bg: #121218;
+        --hop-fg: #f2f2f5;
+        --hop-fg-dim: #a9a9b4;
+        --hop-accent: #9c93ff;
+        --hop-accent-deep: #5b4fe8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--hop-bg);
+        color: var(--hop-fg);
+      }
+
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--hop-bg);
+        font-family: "JetBrains Mono", monospace;
+      }
+
+      /* ---------- persistent background layer ---------- */
+
+      .bg-layer {
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+      }
+
+      .bg-glow {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 1400px;
+        height: 1400px;
+        transform: translate(-50%, -50%);
+        background: radial-gradient(circle, rgba(156, 147, 255, 0.16) 0%, rgba(91, 79, 232, 0.07) 38%, rgba(18, 18, 24, 0) 68%);
+      }
+
+      .bg-grid {
+        position: absolute;
+        inset: 0;
+        background-image: radial-gradient(rgba(242, 242, 245, 0.05) 1.4px, transparent 1.4px);
+        background-size: 64px 64px;
+        opacity: 0.4;
+      }
+
+      /* ---------- clip / scene shell ---------- */
+
+      .clip {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1;
+      }
+
+      .stage {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 28px;
+        padding: 0 160px;
+        text-align: center;
+      }
+
+      /* ---------- typography ---------- */
+
+      .slam {
+        font-family: "Archivo Black", sans-serif;
+        font-weight: 400;
+        font-size: 132px;
+        line-height: 0.98;
+        letter-spacing: -0.03em;
+        color: var(--hop-fg);
+        margin: 0;
+      }
+
+      .support {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 400;
+        font-size: 34px;
+        letter-spacing: -0.01em;
+        color: var(--hop-fg-dim);
+        margin: 0;
+      }
+
+      .wordmark {
+        font-family: "Archivo Black", sans-serif;
+        font-weight: 400;
+        font-size: 220px;
+        letter-spacing: -0.02em;
+        color: var(--hop-fg);
+        margin: 0;
+        text-shadow: 0 0 90px rgba(156, 147, 255, 0.55);
+      }
+
+      .tagline {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 30px;
+        color: var(--hop-accent);
+        letter-spacing: 0.01em;
+        margin: 0;
+      }
+
+      .caption {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 28px;
+        color: var(--hop-fg-dim);
+        letter-spacing: 0.02em;
+        margin: 0;
+      }
+
+      .mesh-caption {
+        font-family: "Archivo Black", sans-serif;
+        font-weight: 400;
+        font-size: 56px;
+        color: var(--hop-fg);
+        margin: 0;
+        letter-spacing: -0.01em;
+      }
+
+      .mesh-subcaption {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 26px;
+        color: var(--hop-accent);
+        margin: 0;
+      }
+
+      .punch-line {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 0 160px;
+        font-family: "Archivo Black", sans-serif;
+        font-weight: 400;
+        font-size: 92px;
+        letter-spacing: -0.02em;
+        color: var(--hop-fg);
+        margin: 0;
+        opacity: 0;
+      }
+
+      /* ---------- scene 3: reach-tier picker ---------- */
+
+      .picker-row {
+        display: flex;
+        gap: 24px;
+        margin-top: 12px;
+      }
+
+      .pill {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 30px;
+        color: var(--hop-fg-dim);
+        border: 2px solid rgba(242, 242, 245, 0.22);
+        border-radius: 999px;
+        padding: 18px 40px;
+        opacity: 0;
+      }
+
+      .pill.selected {
+        color: var(--hop-bg);
+        background: var(--hop-accent);
+        border-color: var(--hop-accent);
+      }
+
+      .post-card {
+        position: absolute;
+        width: 190px;
+        height: 240px;
+        border-radius: 20px;
+        background: linear-gradient(160deg, var(--hop-accent-deep), var(--hop-accent));
+        box-shadow: 0 24px 60px rgba(91, 79, 232, 0.35);
+        opacity: 0;
+        top: 68%;
+        left: 82%;
+        margin-left: -95px;
+      }
+
+      /* ---------- scene 4: mesh ---------- */
+
+      .mesh-wrap {
+        position: absolute;
+        inset: 0;
+      }
+
+      .mesh-core-anchor {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .mesh-core {
+        display: flex;
+        align-items: center;
+        gap: 90px;
+      }
+
+      .phone {
+        width: 96px;
+        height: 180px;
+        border-radius: 18px;
+        border: 3px solid var(--hop-fg-dim);
+        opacity: 0;
+      }
+
+      .connect-line {
+        stroke: var(--hop-accent);
+        stroke-width: 3;
+        fill: none;
+        stroke-dasharray: 4 10;
+      }
+
+      .node-dot {
+        position: absolute;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--hop-accent);
+        opacity: 0;
+      }
+
+      .mesh-text-wrap {
+        position: absolute;
+        bottom: 150px;
+        left: 0;
+        right: 0;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      #mesh-caption,
+      #mesh-subcaption {
+        opacity: 0;
+      }
+
+      .lock-badge {
+        position: absolute;
+        top: 30%;
+        left: 50%;
+        margin-left: -46px;
+        margin-top: -46px;
+        width: 92px;
+        height: 92px;
+        border-radius: 20px;
+        background: rgba(18, 18, 24, 0.9);
+        border: 2px solid var(--hop-accent);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+      }
+
+      /* ---------- scene 5: punchline stack ---------- */
+
+      .final-lockup {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 20px;
+        opacity: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="hop-brag" data-width="1920" data-height="1080" data-duration="23">
+      <div class="bg-layer">
+        <div class="bg-glow" id="bg-glow"></div>
+        <div class="bg-grid"></div>
+      </div>
+
+      <!-- ============ SCENE 1 — HOOK — 0-3s ============ -->
+      <section id="scene-1-hook" class="clip" data-start="0" data-duration="3">
+        <div class="stage">
+          <h1 class="slam" id="hook-line1">THERE IS NO SERVER.</h1>
+          <p class="support" id="hook-line2">Because we never built one.</p>
+        </div>
+      </section>
+
+      <!-- ============ SCENE 2 — REVEAL — 3-6s ============ -->
+      <section id="scene-2-reveal" class="clip" data-start="3" data-duration="3">
+        <div class="stage">
+          <div class="wordmark" id="wordmark">HOP</div>
+          <p class="tagline" id="tagline">Serverless. No accounts. Proximity-first.</p>
+        </div>
+      </section>
+
+      <!-- ============ SCENE 3 — THE FLOW — 6-11s ============ -->
+      <section id="scene-3-flow" class="clip" data-start="6" data-duration="5">
+        <div class="stage">
+          <p class="caption" id="flow-caption">Choose how far it goes.</p>
+          <div class="picker-row">
+            <div class="pill" id="pill-1">Locality</div>
+            <div class="pill" id="pill-2">Town</div>
+            <div class="pill" id="pill-3">City</div>
+            <div class="pill" id="pill-4">Country</div>
+          </div>
+        </div>
+        <div class="post-card" id="post-card"></div>
+      </section>
+
+      <!-- ============ SCENE 4 — THE MESH — 11-17s ============ -->
+      <section id="scene-4-mesh" class="clip" data-start="11" data-duration="6">
+        <div class="mesh-wrap">
+          <div class="mesh-core-anchor">
+            <div class="mesh-core" id="mesh-core">
+              <div class="phone" id="phone-a"></div>
+              <div class="phone" id="phone-b"></div>
+            </div>
+          </div>
+          <svg class="mesh-wrap" viewBox="0 0 1920 1080" preserveAspectRatio="none">
+            <line class="connect-line" id="connect-line" x1="887" y1="540" x2="1033" y2="540" pathLength="1" style="stroke-dashoffset: 1; stroke-dasharray: 1 1" />
+          </svg>
+
+          <div class="node-dot" id="node-1" style="top: 22%; left: 18%"></div>
+          <div class="node-dot" id="node-2" style="top: 30%; left: 78%"></div>
+          <div class="node-dot" id="node-3" style="top: 68%; left: 14%"></div>
+          <div class="node-dot" id="node-4" style="top: 76%; left: 84%"></div>
+          <div class="node-dot" id="node-5" style="top: 16%; left: 46%"></div>
+          <div class="node-dot" id="node-6" style="top: 82%; left: 52%"></div>
+          <div class="node-dot" id="node-7" style="top: 44%; left: 8%"></div>
+          <div class="node-dot" id="node-8" style="top: 50%; left: 92%"></div>
+          <div class="node-dot" id="node-9" style="top: 12%; left: 66%"></div>
+          <div class="node-dot" id="node-10" style="top: 88%; left: 30%"></div>
+
+          <div class="lock-badge" id="lock-badge">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none">
+              <rect x="5" y="11" width="14" height="10" rx="2" stroke="#9c93ff" stroke-width="2" />
+              <path d="M8 11V7a4 4 0 0 1 8 0v4" stroke="#9c93ff" stroke-width="2" />
+            </svg>
+          </div>
+
+          <div class="mesh-text-wrap">
+            <p class="mesh-caption" id="mesh-caption">Phone to phone. Then anywhere.</p>
+            <p class="mesh-subcaption" id="mesh-subcaption">Not even the relay can read it.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SCENE 5 — PUNCHLINE — 17-23s ============ -->
+      <section id="scene-5-punchline" class="clip" data-start="17" data-duration="6">
+        <p class="punch-line" id="punch-1">No server to subpoena.</p>
+        <p class="punch-line" id="punch-2">No server to breach.</p>
+        <p class="punch-line" id="punch-3">No server to sell.</p>
+        <p class="punch-line" id="punch-4">Because it doesn't exist.</p>
+        <div class="final-lockup" id="final-lockup">
+          <div class="wordmark" style="font-size: 160px">HOP</div>
+          <p class="tagline">Serverless. Yours.</p>
+        </div>
+      </section>
+
+      <!-- ============ AUDIO ============ -->
+      <audio
+        id="music"
+        src="assets/music/happy-beats-business-moves-vol-1-by-ende-dot-app.mp3"
+        data-start="0"
+        data-duration="23"
+        data-media-start="0"
+        data-volume="1"
+        data-automation='{"version":1,"lanes":[{"target":"volume","points":[
+          {"t":0,"v":0.05},
+          {"t":2.8,"v":0.08},
+          {"t":3.3,"v":0.35},
+          {"t":6.0,"v":0.5},
+          {"t":11.0,"v":0.7},
+          {"t":16.0,"v":0.85},
+          {"t":16.8,"v":0.85},
+          {"t":17.0,"v":0.12},
+          {"t":20.6,"v":0.12},
+          {"t":21.0,"v":0.3},
+          {"t":22.4,"v":0.15},
+          {"t":23.0,"v":0.0}
+        ]}]}'
+      ></audio>
+
+      <audio id="sfx-hook-hit" src="assets/sfx/hook-hit.ogg" data-start="0.3" data-duration="1.48" data-volume="0.8"></audio>
+      <audio id="sfx-pill-1" src="assets/sfx/pill-tick.ogg" data-start="6.03" data-duration="0.06" data-volume="0.7"></audio>
+      <audio id="sfx-pill-2" src="assets/sfx/pill-tick.ogg" data-start="6.52" data-duration="0.06" data-volume="0.7"></audio>
+      <audio id="sfx-pill-3" src="assets/sfx/pill-tick.ogg" data-start="7.02" data-duration="0.06" data-volume="0.7"></audio>
+      <audio id="sfx-pill-4" src="assets/sfx/pill-tick.ogg" data-start="7.52" data-duration="0.06" data-volume="0.7"></audio>
+      <audio id="sfx-select" src="assets/sfx/lock-click.ogg" data-start="8.2" data-duration="0.1" data-volume="0.75"></audio>
+      <audio id="sfx-post-lift" src="assets/sfx/post-lift.ogg" data-start="9.0" data-duration="0.32" data-volume="0.75"></audio>
+      <audio id="sfx-pullback" src="assets/sfx/hook-hit.ogg" data-start="12.5" data-duration="1.48" data-volume="0.4"></audio>
+      <audio id="sfx-lock" src="assets/sfx/lock-click.ogg" data-start="16.02" data-duration="0.1" data-volume="0.85"></audio>
+      <audio id="sfx-final" src="assets/sfx/final-hit.ogg" data-start="20.0" data-duration="0.66" data-volume="0.85"></audio>
+    </div>
+
+    <script>
+      document.fonts.ready.then(() => {
+        const tl = gsap.timeline({ paused: true });
+
+        // ---------- persistent background breathing (whole video) ----------
+        tl.to("#bg-glow", { scale: 1.08, opacity: 0.75, duration: 3, ease: "sine.inOut", yoyo: true, repeat: 3 }, 0);
+
+        // ============ SCENE 1 — HOOK (0-3s) ============
+        tl.fromTo(
+          "#hook-line1",
+          { scale: 1.4, filter: "blur(16px)", opacity: 0 },
+          { scale: 1, filter: "blur(0px)", opacity: 1, duration: 0.5, ease: "power4.out" },
+          0.3,
+        );
+        tl.fromTo("#hook-line2", { y: 30, opacity: 0 }, { y: 0, opacity: 1, duration: 0.5, ease: "circ.out" }, 1.5);
+
+        // ============ SCENE 2 — REVEAL (3-6s) ============
+        tl.fromTo("#wordmark", { scale: 0.9, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.6, ease: "power3.out" }, 3.3);
+        tl.fromTo("#tagline", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.5, ease: "power2.out" }, 4.2);
+
+        // ============ SCENE 3 — THE FLOW (6-11s) ============
+        tl.fromTo("#flow-caption", { y: 16, opacity: 0 }, { y: 0, opacity: 1, duration: 0.4, ease: "power2.out" }, 6.15);
+
+        // beat-grid: pill 1 at 6.03s, pill 2 at 6.52s, pill 3 at 7.02s, pill 4 at 7.52s
+        tl.fromTo("#pill-1", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35, ease: "back.out(1.6)" }, 6.03);
+        tl.fromTo("#pill-2", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35, ease: "back.out(1.6)" }, 6.52);
+        tl.fromTo("#pill-3", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35, ease: "back.out(1.6)" }, 7.02);
+        tl.fromTo("#pill-4", { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.35, ease: "back.out(1.6)" }, 7.52);
+
+        // selection: Country pill highlights at 8.2s
+        tl.to("#pill-4", { backgroundColor: "#9c93ff", borderColor: "#9c93ff", color: "#121218", scale: 1.06, duration: 0.3, ease: "power2.out" }, 8.2);
+        tl.to("#pill-4", { scale: 1, duration: 0.25, ease: "power2.out" }, 8.5);
+
+        // post-card lifts toward top-right at 9.0s, implying it's posting
+        tl.fromTo(
+          "#post-card",
+          { opacity: 0, y: 0, scale: 0.85 },
+          { opacity: 1, y: -260, scale: 1, duration: 0.9, ease: "power3.out" },
+          9.0,
+        );
+        tl.to("#post-card", { opacity: 0, y: -420, x: 60, scale: 0.6, duration: 0.6, ease: "power2.in" }, 10.0);
+
+        // ============ SCENE 4 — THE MESH (11-17s) ============
+        // two devices arrive, connect
+        tl.fromTo("#phone-a", { opacity: 0, x: -20 }, { opacity: 1, x: 0, duration: 0.4, ease: "power2.out" }, 11.2);
+        tl.fromTo("#phone-b", { opacity: 0, x: 20 }, { opacity: 1, x: 0, duration: 0.4, ease: "power2.out" }, 11.35);
+        tl.fromTo("#connect-line", { strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 0.5, ease: "power2.out" }, 11.6);
+
+        // pull back: mesh-core scales down from 1.6 to 1, peripheral nodes fade in
+        tl.set("#mesh-core", { scale: 1.6 }, 11.0);
+        tl.to("#mesh-core", { scale: 1, duration: 1.6, ease: "power2.inOut" }, 12.5);
+        const nodeIds = ["#node-1", "#node-2", "#node-3", "#node-4", "#node-5", "#node-6", "#node-7", "#node-8", "#node-9", "#node-10"];
+        nodeIds.forEach((id, i) => {
+          tl.fromTo(id, { opacity: 0, scale: 0.4 }, { opacity: 0.85, scale: 1, duration: 0.5, ease: "power2.out" }, 12.6 + i * 0.06);
+        });
+        // gentle ambient drift on the whole mesh during its hold
+        tl.to("#mesh-core", { y: -6, duration: 2.4, ease: "sine.inOut", yoyo: true, repeat: 1 }, 14.2);
+
+        tl.fromTo("#mesh-caption", { y: 24, opacity: 0 }, { y: 0, opacity: 1, duration: 0.5, ease: "power3.out" }, 14.3);
+
+        // lock snap at 16.02s (beat-locked: matches the strongCue cluster start in the bundled cue preset)
+        // beat-locked: 16.02s
+        tl.fromTo(
+          "#lock-badge",
+          { opacity: 0, scale: 0.4, rotation: -8 },
+          { opacity: 1, scale: 1, rotation: 0, duration: 0.35, ease: "back.out(2.2)" },
+          16.02,
+        );
+        tl.fromTo("#mesh-subcaption", { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 16.15);
+
+        // ============ SCENE 5 — PUNCHLINE (17-23s) ============
+        // hard-cut card chain: instant swaps, no crossfade transition entry
+        tl.set("#punch-1", { opacity: 1 }, 17.0);
+        tl.set("#punch-1", { opacity: 0 }, 18.0);
+        tl.set("#punch-2", { opacity: 1 }, 18.0);
+        tl.set("#punch-2", { opacity: 0 }, 19.0);
+        tl.set("#punch-3", { opacity: 1 }, 19.0);
+        tl.set("#punch-3", { opacity: 0 }, 20.0);
+        tl.set("#punch-4", { opacity: 1 }, 20.0);
+        tl.set("#punch-4", { opacity: 0 }, 21.0);
+
+        // final wordmark lockup settles and holds
+        tl.fromTo("#final-lockup", { opacity: 0, scale: 0.95 }, { opacity: 1, scale: 1, duration: 0.6, ease: "power3.out" }, 21.0);
+
+        window.__timelines["hop-brag"] = tl;
+      });
+    </script>
+  </body>
+</html>
