@@ -3,3 +3,8 @@
 *.iml
 .idea/
 .DS_Store
+
+# RendezvousCli's persisted identity seed (see RendezvousCli.kt's own doc) --
+# an operator's real deployment secret, generated at runtime, never a
+# repo-tracked artifact.
+rendezvous-node-seed.bin

@@ -50,3 +50,15 @@ java {
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
     kotlinOptions.jvmTarget = "17"
 }
+
+// RendezvousCli's real main() entry point, so a third-party operator can run
+// ADR 0002's bootstrap/rendezvous node as `./gradlew :rendezvous:run --args=...`
+// without hand-assembling a classpath. Matches tools/preseed/build.gradle.kts's
+// own `run` task shape -- see RendezvousCli.kt's own doc for why this must be
+// run by a volunteer/third-party operator, never HOP itself.
+tasks.register<JavaExec>("run") {
+    group = "application"
+    description = "Runs the bootstrap/rendezvous node CLI (com.hop.rendezvous.RendezvousCli)."
+    mainClass.set("com.hop.rendezvous.RendezvousCliKt")
+    classpath = sourceSets["main"].runtimeClasspath
+}
