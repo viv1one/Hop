@@ -3,3 +3,8 @@
 *.iml
 .idea/
 .DS_Store
+
+# RelayNodeCli's persisted identity seed (see RelayNodeCli.kt's own doc) --
+# an operator's real deployment artifact, generated at runtime, never a
+# repo-tracked file.
+relay-node-seed.bin

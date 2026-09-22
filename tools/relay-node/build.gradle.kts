@@ -58,3 +58,15 @@ java {
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
     kotlinOptions.jvmTarget = "17"
 }
+
+// RelayNodeCli's real main() entry point, so a volunteer/third-party operator
+// can run the relay-node fallback as `./gradlew :relay-node:run --args=...`
+// without hand-assembling a classpath. Matches tools/preseed/build.gradle.kts's
+// own `run` task shape -- see RelayNodeCli.kt's own doc for why this must be
+// run by a volunteer/third-party operator, never HOP itself.
+tasks.register<JavaExec>("run") {
+    group = "application"
+    description = "Runs the volunteer relay-node CLI (com.hop.relaynode.RelayNodeCli)."
+    mainClass.set("com.hop.relaynode.RelayNodeCliKt")
+    classpath = sourceSets["main"].runtimeClasspath
+}
