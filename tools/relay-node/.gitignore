@@ -8,3 +8,4 @@
 # an operator's real deployment artifact, generated at runtime, never a
 # repo-tracked file.
 relay-node-seed.bin
+/bin/

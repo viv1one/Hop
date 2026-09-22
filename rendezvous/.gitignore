@@ -8,3 +8,4 @@
 # an operator's real deployment secret, generated at runtime, never a
 # repo-tracked artifact.
 rendezvous-node-seed.bin
+/bin/
