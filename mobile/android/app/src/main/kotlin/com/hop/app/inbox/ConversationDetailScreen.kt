@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -115,7 +116,11 @@ fun ConversationDetailScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding),
+                .padding(innerPadding)
+                // Without this the soft keyboard covered the input row and
+                // the newest messages outright -- you typed into a field you
+                // could not see. Found on device, not by any ViewModel test.
+                .imePadding(),
         ) {
             if (hasIdentityChangeWarning) {
                 IdentityChangeWarningBanner(onContinue = viewModel::trustChangedIdentity)
@@ -130,7 +135,7 @@ fun ConversationDetailScreen(
                 // which don't exercise actual Compose layout).
                 Box(Modifier.weight(1f).fillMaxWidth().padding(HopSpacing.lg), contentAlignment = Alignment.Center) {
                     Text(
-                        text = "No messages yet -- say hello.",
+                        text = "No messages yet \u2014 say hello.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -188,7 +193,8 @@ fun ConversationDetailScreen(
                         containerColor = MaterialTheme.colorScheme.primary,
                         contentColor = MaterialTheme.colorScheme.onPrimary,
                     ),
-                    modifier = Modifier.padding(start = HopSpacing.sm).size(44.dp),
+                    // 48dp, Android's minimum touch target -- this was 44dp.
+                    modifier = Modifier.padding(start = HopSpacing.sm).size(48.dp),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
