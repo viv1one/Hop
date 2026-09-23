@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon (Android 13+ "Material You") layer, referenced by
+     <monochrome> in mipmap-anydpi-v26/ic_launcher.xml. Same geometry and same
+     safe-zone placement as ic_launcher_foreground, but flat black: the system
+     discards these colors and re-tints the layer from the user's wallpaper
+     palette, so only the silhouette and the per-path alpha survive. A
+     separate file rather than reusing the foreground because the foreground's
+     white fills would be a confusing thing to hand a tinting pass. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- The hop arc. -->
+    <path
+        android:pathData="M32.055,62.415 C45.255,30.735 65.055,30.735 78.255,62.415"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="5.94"
+        android:strokeLineCap="round" />
+
+    <!-- Origin node, full strength. -->
+    <path
+        android:pathData="M32.055,52.515 A9.9,9.9 0 1,1 32.055,72.315 A9.9,9.9 0 1,1 32.055,52.515 Z"
+        android:fillColor="#FF000000" />
+
+    <!-- Destination node: smaller and faded — reach decays with each hop. -->
+    <path
+        android:pathData="M78.255,54.825 A7.59,7.59 0 1,1 78.255,70.005 A7.59,7.59 0 1,1 78.255,54.825 Z"
+        android:fillColor="#FF000000"
+        android:fillAlpha="0.6" />
+</vector>

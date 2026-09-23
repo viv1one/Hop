@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive-icon foreground: the same mark as drawable/ic_hop_logo.xml
+     (node, hop arc, faded node), scaled 3.3x and centered so the drawn
+     content lands inside the 66x66 safe zone of this 108x108 viewport.
+     Anything outside that zone can be clipped by the launcher's mask, so
+     these coordinates are not free to drift.
+
+     White, because this layer always sits on ic_launcher_background's brand
+     gradient — it is not theme-tinted the way the in-app mark is. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- The hop arc. -->
+    <path
+        android:pathData="M32.055,62.415 C45.255,30.735 65.055,30.735 78.255,62.415"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5.94"
+        android:strokeLineCap="round" />
+
+    <!-- Origin node, full strength. -->
+    <path
+        android:pathData="M32.055,52.515 A9.9,9.9 0 1,1 32.055,72.315 A9.9,9.9 0 1,1 32.055,52.515 Z"
+        android:fillColor="#FFFFFFFF" />
+
+    <!-- Destination node: smaller and faded — reach decays with each hop. -->
+    <path
+        android:pathData="M78.255,54.825 A7.59,7.59 0 1,1 78.255,70.005 A7.59,7.59 0 1,1 78.255,54.825 Z"
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.6" />
+</vector>

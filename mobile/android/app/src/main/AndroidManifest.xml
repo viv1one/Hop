@@ -41,6 +41,8 @@
         android:name=".HopApplication"
         android:allowBackup="false"
         android:label="HOP"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.Hop">
 
         <!-- ".MainActivity" resolves against the namespace (com.hop.app, see
