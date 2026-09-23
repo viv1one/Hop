@@ -101,7 +101,7 @@ fun GroupCreateScreen(
 
             Text(
                 text = "Two members who haven't met each other in person yet may not get each other's " +
-                    "group messages right away -- this usually sorts itself out once your phones have " +
+                    "group messages right away — this usually sorts itself out once your phones have " +
                     "both been near other group members a few times.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -111,7 +111,7 @@ fun GroupCreateScreen(
             if (availableContacts.isEmpty()) {
                 Box(Modifier.fillMaxSize().padding(HopSpacing.lg), contentAlignment = Alignment.Center) {
                     Text(
-                        text = "You don't have anyone to add yet -- message someone from a post first.",
+                        text = "You don't have anyone to add yet — message someone from a post first.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center,

@@ -297,7 +297,7 @@ class PostComposerViewModel(
                 // testing until this fix added it.
                 android.util.Log.e("PostComposerViewModel", "Failed to post", e)
                 _uiState.update {
-                    it.copy(isPosting = false, errorMessage = "Couldn't post that -- try again.")
+                    it.copy(isPosting = false, errorMessage = "Couldn't post that — try again.")
                 }
             }
         }

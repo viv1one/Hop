@@ -4,9 +4,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.FloatingActionButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
@@ -22,6 +25,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavHostController
@@ -202,7 +206,25 @@ private fun MainScreen(
             // Inbox tab: the one entry point into group creation (Phase 2
             // Slice 4) -- no separate menu/CTA duplicates it.
             when (selectedTab) {
-                0 -> FloatingActionButton(onClick = onNavigateToComposer) {
+                0 -> FloatingActionButton(
+                    onClick = onNavigateToComposer,
+                    // White on black, to sit on the feed rather than on the
+                    // theme surface it is not actually over.
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF17171F),
+                    // Zero tonal elevation, or M3 blends `primary` into the
+                    // container colour and the result renders lavender
+                    // (#EEECFD, measured on device) instead of the white
+                    // asked for above -- visibly a different colour from the
+                    // white CTA on the same screen. A drop shadow is also
+                    // pointless against solid black.
+                    elevation = FloatingActionButtonDefaults.elevation(
+                        defaultElevation = 0.dp,
+                        pressedElevation = 0.dp,
+                        focusedElevation = 0.dp,
+                        hoveredElevation = 0.dp,
+                    ),
+                ) {
                     Icon(Icons.Filled.Add, contentDescription = "New post")
                 }
                 1 -> FloatingActionButton(onClick = onNavigateToGroupCreate) {
@@ -211,32 +233,60 @@ private fun MainScreen(
             }
         },
         bottomBar = {
-            NavigationBar {
+            // The Feed is a black full-bleed surface, so the bar goes dark
+            // with it. Leaving the light-mode bar under an immersive black
+            // feed put a bright slab across the bottom of every photo and
+            // video -- visible immediately on device, and the reason this
+            // isn't just `NavigationBar {}` any more. Every other tab is
+            // ordinary themed content and keeps the theme's own bar.
+            val onFeed = selectedTab == 0
+            val barColor = if (onFeed) Color.Black else MaterialTheme.colorScheme.surfaceContainer
+            val itemColors = if (onFeed) {
+                NavigationBarItemDefaults.colors(
+                    selectedIconColor = Color.Black,
+                    selectedTextColor = Color.White,
+                    indicatorColor = Color.White,
+                    unselectedIconColor = Color.White.copy(alpha = 0.60f),
+                    unselectedTextColor = Color.White.copy(alpha = 0.60f),
+                )
+            } else {
+                NavigationBarItemDefaults.colors()
+            }
+
+            NavigationBar(containerColor = barColor) {
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
                     icon = { Icon(Icons.Filled.Home, contentDescription = null) },
                     label = { Text("Feed") },
+                    colors = itemColors,
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
                     icon = { Icon(Icons.Filled.MailOutline, contentDescription = null) },
                     label = { Text("Inbox") },
+                    colors = itemColors,
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Filled.Star, contentDescription = null) },
                     label = { Text("Points") },
+                    colors = itemColors,
                 )
             }
         },
     ) { innerPadding ->
+        // The Feed is deliberately NOT inset by innerPadding: it is a
+        // full-bleed media surface, so it draws edge to edge and runs under
+        // the bottom bar, and is handed the insets instead so its own
+        // overlay chrome can clear them. Insetting it the way the other tabs
+        // are inset left a band of app background below every photo and
+        // video. Every other tab is ordinary scrolling content and stays
+        // inset.
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding),
+            modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
         ) {
             when (selectedTab) {
@@ -244,13 +294,18 @@ private fun MainScreen(
                     container = container,
                     onComposeClick = onNavigateToComposer,
                     onMessageClick = onNavigateToConversation,
+                    contentPadding = innerPadding,
                 )
-                1 -> ConversationListScreen(
-                    container = container,
-                    onConversationClick = onNavigateToConversation,
-                    onGroupClick = onNavigateToGroupConversation,
-                )
-                else -> PointsScreen(container = container)
+                1 -> Box(Modifier.padding(innerPadding)) {
+                    ConversationListScreen(
+                        container = container,
+                        onConversationClick = onNavigateToConversation,
+                        onGroupClick = onNavigateToGroupConversation,
+                    )
+                }
+                else -> Box(Modifier.padding(innerPadding)) {
+                    PointsScreen(container = container)
+                }
             }
         }
     }

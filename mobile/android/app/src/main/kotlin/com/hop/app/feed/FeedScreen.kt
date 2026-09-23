@@ -1,15 +1,22 @@
 package com.hop.app.feed
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -20,6 +27,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -28,6 +38,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
+import com.hop.app.R
+import com.hop.app.theme.HopSpacing
 import com.hop.protocol.Geohash
 import com.hop.protocol.ReachTier
 import com.hop.protocol.ReachTierGeohash
@@ -74,6 +86,7 @@ fun FeedScreen(
     container: AppContainer,
     onComposeClick: () -> Unit = {},
     onMessageClick: (peerId: String) -> Unit = {},
+    contentPadding: PaddingValues = PaddingValues(),
 ) {
     val viewModel: FeedViewModel = viewModel(
         factory = viewModelFactory {
@@ -172,15 +185,25 @@ fun FeedScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            // The feed is full-bleed media, so its backdrop is black rather
+            // than the theme surface: in light mode, any clip that does not
+            // exactly match the screen aspect ratio was letterboxed against
+            // white.
+            .background(Color.Black)
             .nestedScroll(pullToRefreshState.nestedScrollConnection),
     ) {
         if (posts.isEmpty()) {
-            EmptyFeed(onComposeClick = onComposeClick)
+            EmptyFeed(onComposeClick = onComposeClick, contentPadding = contentPadding)
         } else {
             val pagerState = rememberPagerState(pageCount = { posts.size })
 
             VerticalPager(
                 state = pagerState,
+                // Stable per-post key. Without it, a post filtering itself
+                // out mid-view (reported/blocked) shifts every later page's
+                // identity by one, so the already-composed decrypt state and
+                // ExoPlayer instance get reused for the wrong post.
+                key = { index -> posts.getOrNull(index)?.clipHash ?: index },
                 modifier = Modifier.fillMaxSize(),
             ) { pageIndex ->
                 // posts can shrink out from under an already-composed pager (e.g. the
@@ -196,6 +219,7 @@ fun FeedScreen(
                     onReport = { viewModel.reportPost(post.clipHash) },
                     onMessage = { onMessageClick(post.senderDeviceId) },
                     onDontRelay = { viewModel.flagDontRelay(post) },
+                    contentPadding = contentPadding,
                 )
             }
         }
@@ -208,7 +232,7 @@ fun FeedScreen(
 }
 
 @Composable
-private fun EmptyFeed(onComposeClick: () -> Unit) {
+private fun EmptyFeed(onComposeClick: () -> Unit, contentPadding: PaddingValues) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -223,21 +247,55 @@ private fun EmptyFeed(onComposeClick: () -> Unit) {
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(HopSpacing.md),
+            modifier = Modifier
+                .padding(contentPadding)
+                .padding(horizontal = HopSpacing.xl, vertical = HopSpacing.lg),
         ) {
+            // The brand mark carries the empty state rather than a generic
+            // glyph. This is the first screen a new user lands on after
+            // setup, and it was previously two lines of text on a blank
+            // field.
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.07f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_hop_logo),
+                    contentDescription = null,
+                    tint = Color.White.copy(alpha = 0.55f),
+                    modifier = Modifier.size(48.dp),
+                )
+            }
+
             Text(
                 text = "Nothing nearby yet",
                 style = MaterialTheme.typography.headlineSmall,
+                color = Color.White,
                 textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = HopSpacing.sm),
             )
             Text(
-                text = "Posts from people around you will show up here. Be the first to share something.",
+                text = "Posts from people around you show up here, then fade. Be the first to share something.",
                 style = MaterialTheme.typography.bodyMedium,
+                color = Color.White.copy(alpha = 0.66f),
                 textAlign = TextAlign.Center,
-                modifier = Modifier.padding(top = 8.dp, bottom = 24.dp),
+                modifier = Modifier.padding(bottom = HopSpacing.sm),
             )
-            Button(onClick = onComposeClick) {
-                Text("Post something")
+            Button(
+                onClick = onComposeClick,
+                // The feed backdrop is always black, so this button cannot
+                // inherit the theme's light-mode scheme and stay readable.
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF17171F),
+                ),
+                contentPadding = PaddingValues(horizontal = HopSpacing.lg, vertical = 14.dp),
+            ) {
+                Text("Post something", style = MaterialTheme.typography.titleSmall)
             }
         }
     }

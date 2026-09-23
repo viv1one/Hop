@@ -6,6 +6,36 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.height
+import com.hop.app.theme.ReachOptionGroup
+import com.hop.app.theme.HopSpacing
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.Alignment
+import androidx.compose.runtime.produceState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
+import android.graphics.BitmapFactory
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -150,7 +180,7 @@ fun PostComposerScreen(
             else -> null
         }
         if (contentType == null) {
-            pickErrorMessage = "That file type isn't supported -- pick a photo or video."
+            pickErrorMessage = "That file type isn't supported — pick a photo or video."
             return@rememberLauncherForActivityResult
         }
 
@@ -169,7 +199,7 @@ fun PostComposerScreen(
                 retriever.release()
             }
             if (durationMs == null) {
-                pickErrorMessage = "Couldn't read that video's length -- try a different one."
+                pickErrorMessage = "Couldn't read that video's length — try a different one."
                 return@rememberLauncherForActivityResult
             }
             if (durationMs > MAX_VIDEO_DURATION_MS) {
@@ -201,57 +231,101 @@ fun PostComposerScreen(
             TopAppBar(
                 title = { Text("New post") },
                 navigationIcon = {
-                    TextButton(onClick = onCancel) { Text("Cancel") }
+                    // An icon, not a "Cancel" text button: the navigation
+                    // slot is icon-sized, and the label was cramped against
+                    // the title. aria equivalent supplied for the icon.
+                    IconButton(onClick = onCancel) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancel")
+                    }
                 },
             )
         },
         snackbarHost = {
             SnackbarHost(snackbarHostState) { data -> Snackbar { Text(data.visuals.message) } }
         },
+        bottomBar = {
+            // Pinned rather than scrolling with the content: the primary
+            // action should not be somewhere below the fold on a short
+            // screen, and it sits in the thumb zone here.
+            Surface(
+                tonalElevation = 3.dp,
+                shadowElevation = 8.dp,
+            ) {
+                Button(
+                    onClick = {
+                        val currentUri = pendingUri
+                        val currentContentType = pendingContentType
+                        if (currentUri == null || currentContentType == null) return@Button
+                        isReadingMedia = true
+                        scope.launch {
+                            val bytes = withContext(Dispatchers.IO) {
+                                context.contentResolver.openInputStream(currentUri)?.use { it.readBytes() }
+                            }
+                            isReadingMedia = false
+                            if (bytes == null || bytes.isEmpty()) {
+                                pickErrorMessage = "Couldn't read that file — try again."
+                                return@launch
+                            }
+                            viewModel.post(bytes = bytes, contentType = currentContentType)
+                        }
+                    },
+                    enabled = pendingUri != null && pendingContentType != null &&
+                        !uiState.isPosting && !isReadingMedia,
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(vertical = 16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .padding(horizontal = HopSpacing.lg, vertical = HopSpacing.sm),
+                ) {
+                    val busy = uiState.isPosting || isReadingMedia
+                    if (busy) {
+                        // A label change alone left the button looking
+                        // simply disabled while a large video was read and
+                        // encrypted.
+                        CircularProgressIndicator(
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier
+                                .padding(end = HopSpacing.sm)
+                                .size(18.dp),
+                        )
+                    }
+                    Text(
+                        text = if (busy) "Posting..." else "Post",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+        },
     ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = HopSpacing.lg, vertical = HopSpacing.md),
+            verticalArrangement = Arrangement.spacedBy(HopSpacing.lg),
         ) {
             val uri = pendingUri
             val contentType = pendingContentType
 
-            if (uri == null || contentType == null) {
-                Button(
-                    onClick = {
-                        pickMediaLauncher.launch(
-                            PickVisualMediaRequest(
-                                mediaType = ActivityResultContracts.PickVisualMedia.ImageAndVideo,
-                            ),
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Choose photo or video")
-                }
-            } else {
-                Text(
-                    text = when (contentType) {
-                        ContentType.PHOTO -> "Photo selected"
-                        ContentType.VIDEO -> "Video selected"
-                    },
-                    style = MaterialTheme.typography.titleMedium,
+            val launchPicker = {
+                pickMediaLauncher.launch(
+                    PickVisualMediaRequest(
+                        mediaType = ActivityResultContracts.PickVisualMedia.ImageAndVideo,
+                    ),
                 )
-                OutlinedButton(
-                    onClick = {
-                        pickMediaLauncher.launch(
-                            PickVisualMediaRequest(
-                                mediaType = ActivityResultContracts.PickVisualMedia.ImageAndVideo,
-                            ),
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Choose a different one")
-                }
+            }
+
+            // The composer previously showed only the words "Photo
+            // selected" -- you could not see what you were about to post.
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                MediaPreview(
+                    uri = uri,
+                    contentType = contentType,
+                    onPick = launchPicker,
+                )
             }
 
             Text(
@@ -259,66 +333,175 @@ fun PostComposerScreen(
                 style = MaterialTheme.typography.titleMedium,
             )
 
-            Column(Modifier.selectableGroup()) {
-                REACH_OPTIONS.forEach { (tier, label, description) ->
-                    val selected = uiState.selectedReachTier == tier
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = selected,
-                                onClick = { viewModel.onReachTierSelected(tier) },
-                                role = Role.RadioButton,
-                            )
-                            .padding(vertical = 8.dp),
-                    ) {
-                        RadioButton(selected = selected, onClick = null)
-                        Column(modifier = Modifier.padding(start = 8.dp)) {
-                            Text(text = label, style = MaterialTheme.typography.bodyLarge)
-                            Text(text = description, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
-
-            Button(
-                onClick = {
-                    val currentUri = pendingUri
-                    val currentContentType = pendingContentType
-                    if (currentUri == null || currentContentType == null) return@Button
-                    isReadingMedia = true
-                    scope.launch {
-                        val bytes = withContext(Dispatchers.IO) {
-                            context.contentResolver.openInputStream(currentUri)?.use { it.readBytes() }
-                        }
-                        isReadingMedia = false
-                        if (bytes == null || bytes.isEmpty()) {
-                            pickErrorMessage = "Couldn't read that file -- try again."
-                            return@launch
-                        }
-                        viewModel.post(bytes = bytes, contentType = currentContentType)
-                    }
-                },
-                enabled = uri != null && contentType != null && !uiState.isPosting && !isReadingMedia,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(if (uiState.isPosting || isReadingMedia) "Posting..." else "Post")
-            }
+            ReachOptionGroup(
+                selectedTier = uiState.selectedReachTier,
+                onTierSelected = viewModel::onReachTierSelected,
+            )
         }
     }
 }
 
-private data class ReachOption(val tier: ReachTier, val label: String, val description: String)
+/**
+ * The picked photo/video, or a tappable empty slot when nothing is picked.
+ *
+ * 4:5 is the tallest portrait ratio the feed renders without heavy cropping,
+ * so it is the honest frame to review a pick in. Decoding happens off the
+ * main thread and downsampled -- a full-resolution camera photo decoded in
+ * composition is tens of megabytes and janks the screen open.
+ */
+@Composable
+private fun MediaPreview(
+    uri: Uri?,
+    contentType: ContentType?,
+    onPick: () -> Unit,
+) {
+    val context = LocalContext.current
+    val shape = RoundedCornerShape(18.dp)
 
-// Matches FirstRunScreen's exact labels/copy for the same four tiers -- no
-// separate wording invented here, and no exposed technical language
-// (geohash/tier/DHT/mesh) per PRD §5.
-private val REACH_OPTIONS = listOf(
-    ReachOption(ReachTier.LOCALITY, "Just around me", "The people physically near you right now"),
-    ReachOption(ReachTier.TOWN, "My town", "Everyone in your town"),
-    ReachOption(ReachTier.CITY, "My city", "Everyone in your city"),
-    ReachOption(ReachTier.COUNTRY, "My country", "Everyone in your country"),
-)
+    val preview by produceState<ImageBitmap?>(initialValue = null, key1 = uri, key2 = contentType) {
+        val currentUri = uri
+        value = if (currentUri == null || contentType == null) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                runCatching { loadPreviewBitmap(context, currentUri, contentType) }.getOrNull()
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            // Height-capped rather than full-width 4:5. At full width the
+            // preview was taller than the viewport on a normal phone, which
+            // pushed "Who should see this?" -- the actual decision on this
+            // screen -- entirely below the fold. matchHeightConstraintsFirst
+            // keeps the 4:5 frame honest by deriving width from this height.
+            .height(PREVIEW_HEIGHT)
+            .aspectRatio(4f / 5f, matchHeightConstraintsFirst = true)
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+            .clickable(onClick = onPick),
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            uri == null || contentType == null -> EmptyPickSlot()
+
+            preview != null -> {
+                Image(
+                    bitmap = preview!!,
+                    contentDescription = when (contentType) {
+                        ContentType.PHOTO -> "Selected photo"
+                        ContentType.VIDEO -> "Selected video"
+                    },
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                // Change affordance, over a scrim so it reads on any frame.
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(HopSpacing.sm)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .padding(horizontal = HopSpacing.md, vertical = HopSpacing.sm),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Change",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Color.White,
+                    )
+                }
+                if (contentType == ContentType.VIDEO) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(HopSpacing.sm)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.Black.copy(alpha = 0.55f))
+                            .padding(horizontal = HopSpacing.sm, vertical = 4.dp),
+                    ) {
+                        Text(
+                            text = "Video",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                        )
+                    }
+                }
+            }
+
+            // Picked, but the frame has not decoded yet.
+            else -> CircularProgressIndicator(strokeWidth = 2.dp)
+        }
+    }
+}
+
+@Composable
+private fun EmptyPickSlot() {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(HopSpacing.sm),
+    ) {
+        Icon(
+            Icons.Filled.Add,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(34.dp),
+        )
+        Text(
+            text = "Choose photo or video",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = "From your device",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * Decodes a downsampled preview frame. Photos decode bounds-first so a
+ * full-resolution image is never held in memory; videos take their first
+ * frame via [MediaMetadataRetriever], the same class the duration cap above
+ * already uses.
+ */
+private fun loadPreviewBitmap(
+    context: android.content.Context,
+    uri: Uri,
+    contentType: ContentType,
+): ImageBitmap? = when (contentType) {
+    ContentType.VIDEO -> {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, uri)
+            retriever.frameAtTime?.asImageBitmap()
+        } finally {
+            retriever.release()
+        }
+    }
+
+    ContentType.PHOTO -> {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        var sample = 1
+        while (bounds.outWidth / sample > PREVIEW_TARGET_WIDTH_PX) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, opts)?.asImageBitmap()
+        }
+    }
+}
+
+/** Tall enough to judge a pick, short enough to leave the reach choice on screen. */
+private val PREVIEW_HEIGHT = 300.dp
+
+/** Preview slot is at most a phone width; decoding beyond that is wasted memory. */
+private const val PREVIEW_TARGET_WIDTH_PX = 1080
 
 // Settled by real-device measurement -- see BUILD_PLAN.md open decision #3
 // and the matching constant in com.hop.spike.MainActivity.

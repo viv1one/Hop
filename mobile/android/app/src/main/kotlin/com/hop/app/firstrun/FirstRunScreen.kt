@@ -1,6 +1,13 @@
 package com.hop.app.firstrun
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.border
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,6 +35,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.hop.app.AppContainer
+import com.hop.app.theme.HopSpacing
+import com.hop.app.theme.ReachOptionGroup
+import com.hop.app.theme.HopWordmark
 import com.hop.protocol.ReachTier
 
 /**
@@ -78,6 +88,11 @@ fun FirstRunScreen(
                 .padding(24.dp),
             verticalArrangement = Arrangement.Center,
         ) {
+            // First-run is the one screen that should introduce the app by
+            // name -- the feed is full-bleed media with no chrome to hang a
+            // wordmark on, so this is HOP's only in-app branding moment.
+            HopWordmark(modifier = Modifier.padding(bottom = HopSpacing.xl))
+
             Text(
                 text = "How far should your posts reach?",
                 style = MaterialTheme.typography.headlineSmall,
@@ -88,51 +103,25 @@ fun FirstRunScreen(
                 modifier = Modifier.padding(top = 8.dp, bottom = 24.dp),
             )
 
-            Column(Modifier.selectableGroup()) {
-                REACH_OPTIONS.forEach { (tier, label, description) ->
-                    val selected = uiState.selectedTier == tier
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .selectable(
-                                selected = selected,
-                                onClick = { viewModel.onTierSelected(tier) },
-                                role = Role.RadioButton,
-                            )
-                            .padding(vertical = 12.dp),
-                    ) {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(2.dp),
-                        ) {
-                            RadioButton(selected = selected, onClick = null)
-                            Text(text = label, style = MaterialTheme.typography.titleMedium)
-                            Text(text = description, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
+            ReachOptionGroup(
+                selectedTier = uiState.selectedTier,
+                onTierSelected = viewModel::onTierSelected,
+            )
 
             Button(
                 onClick = { viewModel.onContinueClicked() },
                 enabled = !uiState.isSubmitting,
+                shape = RoundedCornerShape(14.dp),
+                contentPadding = PaddingValues(vertical = 16.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 24.dp),
+                    .padding(top = HopSpacing.lg),
             ) {
-                Text(if (uiState.isSubmitting) "Setting up..." else "Continue")
+                Text(
+                    text = if (uiState.isSubmitting) "Setting up..." else "Continue",
+                    style = MaterialTheme.typography.titleMedium,
+                )
             }
         }
     }
 }
-
-private data class ReachOption(val tier: ReachTier, val label: String, val description: String)
-
-// Plain product-language labels, deliberately not "final marketing copy" --
-// no exposed technical language (geohash/tier/DHT/mesh) per PRD §5.
-private val REACH_OPTIONS = listOf(
-    ReachOption(ReachTier.LOCALITY, "Just around me", "The people physically near you right now"),
-    ReachOption(ReachTier.TOWN, "My town", "Everyone in your town"),
-    ReachOption(ReachTier.CITY, "My city", "Everyone in your city"),
-    ReachOption(ReachTier.COUNTRY, "My country", "Everyone in your country"),
-)

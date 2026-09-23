@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon only, with no mipmap-{m,h,xh,xxh,xxxh}dpi PNG fallback:
+     :app's minSdk is 26 (app/build.gradle.kts), which is exactly the API
+     level adaptive icons landed in, so every device that can install this
+     build resolves this file. Adding legacy raster fallbacks would be dead
+     weight. <monochrome> is API 33+; older launchers ignore the tag. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+</adaptive-icon>

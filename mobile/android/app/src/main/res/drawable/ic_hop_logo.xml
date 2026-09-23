@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HOP's brand mark, in-app size (24dp). One origin node, a hop arc, and a
+     second, smaller node at reduced opacity: a single phone-to-phone hop that
+     loses reach as it travels (the decay primitive, CLAUDE.md / PRD §4.2).
+
+     Deliberately single-color (fillAlpha carries the decay cue, not a second
+     hue) so it tints cleanly against either color scheme via
+     MaterialTheme.colorScheme — see theme/HopLogo.kt, which is the only thing
+     that should reference this directly.
+
+     The arch is wide and shallow on purpose. Taller, narrower versions were
+     rendered and rejected: at 24dp they read as a horseshoe, and the
+     destination node collapses into the arc's descending leg instead of
+     staying legible as a second node.
+
+     ic_launcher_foreground.xml and ic_launcher_monochrome.xml are this exact
+     geometry scaled 3.3x into a 108x108 adaptive viewport. If this mark
+     changes, change all three. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- The hop itself. Stroked (not filled) with round caps so the ends tuck
+         invisibly under the two node dots drawn on top of it. -->
+    <path
+        android:pathData="M5.4,14.6 C9.4,5.0 15.4,5.0 19.4,14.6"
+        android:strokeColor="#FF5B4FE8"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round" />
+
+    <!-- Origin node, full strength. -->
+    <path
+        android:pathData="M5.4,11.6 A3.0,3.0 0 1,1 5.4,17.6 A3.0,3.0 0 1,1 5.4,11.6 Z"
+        android:fillColor="#FF5B4FE8" />
+
+    <!-- Destination node: smaller and faded — reach decays with each hop. -->
+    <path
+        android:pathData="M19.4,12.3 A2.3,2.3 0 1,1 19.4,16.9 A2.3,2.3 0 1,1 19.4,12.3 Z"
+        android:fillColor="#FF5B4FE8"
+        android:fillAlpha="0.6" />
+</vector>

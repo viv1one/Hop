@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -106,12 +107,15 @@ fun GroupConversationDetailScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding),
+                .padding(innerPadding)
+                // Same keyboard-overlap fix as ConversationDetailScreen: the
+                // soft keyboard covered this screen's input row too.
+                .imePadding(),
         ) {
             if (messages.isEmpty()) {
                 Box(Modifier.weight(1f).fillMaxWidth().padding(HopSpacing.lg), contentAlignment = Alignment.Center) {
                     Text(
-                        text = "No messages yet -- say hello.",
+                        text = "No messages yet — say hello.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -155,7 +159,8 @@ fun GroupConversationDetailScreen(
                         containerColor = MaterialTheme.colorScheme.primary,
                         contentColor = MaterialTheme.colorScheme.onPrimary,
                     ),
-                    modifier = Modifier.padding(start = HopSpacing.sm).size(44.dp),
+                    // 48dp, Android's minimum touch target.
+                    modifier = Modifier.padding(start = HopSpacing.sm).size(48.dp),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
